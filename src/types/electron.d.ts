@@ -52,14 +52,6 @@ export interface ElectronAPI {
   getLogFilePath(): Promise<string>;
   /** Retrieves ten most recent errors from the game's log file */
   getRecentErrors(): Promise<ErrorLog[]>;
-
-  /**
-   * @deprecated you shouldn't be fucking using this...
-   */
-  getLicenseKey(): Promise<string | null>;
-  removeLicenseKey(): Promise<void>;
-  getVersion(): Promise<string>;
-  getIsBeta(): Promise<boolean>;
 }
 
 export interface ElectronAPIExtended {
