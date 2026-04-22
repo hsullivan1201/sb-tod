@@ -91,6 +91,9 @@ export const storage = {
   delete(key: string): Promise<void> {
     return getRaw().storage.delete(key);
   },
+  keys(): Promise<string[]> {
+    return (getRaw().storage as any).keys?.() ?? Promise.resolve([]);
+  },
 };
 
 export const ui = {

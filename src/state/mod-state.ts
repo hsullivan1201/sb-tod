@@ -62,8 +62,15 @@ export interface ModStateStats {
   demandChangeEvents: number;
   dayTicks: number;
   lastDay: number | null;
+  /** true if set() resolved AND the immediate readback matched. */
   lastPersistOk: boolean | null;
   lastPersistAt: number | null;
+  /**
+   * Explicit round-trip detection — `null` until the first persist attempt,
+   * then `true` if `get()` returned the exact payload we just wrote,
+   * `false` if set() silently dropped (the probe-1 flake).
+   */
+  storageRoundTripOk: boolean | null;
   pointsTracked: number;
   popsTracked: number;
   pointsWithDeltas: number;
@@ -126,6 +133,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let lastDay: number | null = null;
   let lastPersistOk: boolean | null = null;
   let lastPersistAt: number | null = null;
+  let storageRoundTripOk: boolean | null = null;
   let lastHydrate: HydrateReport | null = null;
   let initPromise: Promise<boolean> | null = null;
 
@@ -138,17 +146,28 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     mutator = createMutator(d);
 
     let persisted: PersistedState | null = null;
+    let storageKeys: string[] = [];
     try {
       persisted = await backend.get<PersistedState | null>(STORAGE_KEY, null);
     } catch (err) {
       console.warn('[sb-tod] storage.get threw during init:', err);
       persisted = null;
     }
+    try {
+      storageKeys = await ((backend as StorageLike & { keys?: () => Promise<string[]> }).keys?.() ?? Promise.resolve([]));
+    } catch {
+      storageKeys = [];
+    }
 
     if (persisted && persisted.version === 1) {
       lastHydrate = applyPersisted(mutator, d, persisted);
+      console.log(
+        `[sb-tod] Hydrated from storage (saved ${new Date(persisted.savedAt).toISOString()}): preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}. Storage keys: [${storageKeys.join(', ')}]`
+      );
     } else {
-      // Fresh game (or first run). Capture baselines from live demand.
+      // Fresh game (or first run, or persisted state was dropped). Capture
+      // baselines from live demand. Record the reason so the panel can
+      // show it explicitly rather than just silently showing zero deltas.
       mutator.captureBaselines();
       lastHydrate = {
         perPoint: new Map(),
@@ -158,6 +177,9 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         missingPoint: 0,
         fromStorage: false,
       };
+      console.log(
+        `[sb-tod] No persisted state found at "${STORAGE_KEY}". Captured ${mutator.snapshot().baselineDemand.size} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install).`
+      );
     }
 
     initialized = true;
@@ -210,6 +232,25 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     };
     try {
       await backend.set(STORAGE_KEY, payload);
+      // Immediate round-trip verify. Probe 1 caught a case where set()
+      // resolved but get() returned undefined — silent drop. If that's
+      // happening here, surface it loudly; persistence is effectively
+      // broken and we need to know before the user counts on a reload.
+      let readback: PersistedState | null = null;
+      try {
+        readback = await backend.get<PersistedState | null>(STORAGE_KEY, null);
+      } catch (e) {
+        console.warn('[sb-tod] readback during persist verify threw:', e);
+      }
+      const matches = !!readback && readback.savedAt === payload.savedAt;
+      storageRoundTripOk = matches;
+      if (!matches) {
+        console.warn(
+          `[sb-tod] storage round-trip MISMATCH after set("${STORAGE_KEY}"): wrote savedAt=${payload.savedAt} but readback=${readback ? `savedAt=${readback.savedAt}` : 'null'}. Data will not survive restart. (Browser mode? Known game flake? Check Electron / api.storage.)`
+        );
+        lastPersistOk = false;
+        return false;
+      }
       lastPersistOk = true;
       lastPersistAt = payload.savedAt;
       dirty = false;
@@ -217,6 +258,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     } catch (err) {
       console.warn('[sb-tod] storage.set failed:', err);
       lastPersistOk = false;
+      storageRoundTripOk = false;
       return false;
     }
   }
@@ -279,6 +321,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         lastDay,
         lastPersistOk,
         lastPersistAt,
+        storageRoundTripOk,
         pointsTracked: snap?.baselineDemand.size ?? 0,
         popsTracked: snap?.baselinePopSizes.size ?? 0,
         pointsWithDeltas: snap?.cumulativeDeltas.size ?? 0,

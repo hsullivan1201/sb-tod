@@ -20,6 +20,7 @@ import {
 import { clearHighlight, setHighlight } from './mapHighlight';
 import { getModState } from '../state/mod-state';
 import { findWalkshed } from '../scoring/walkshed';
+import { storage } from '../api';
 
 const HIGHLIGHT_RADIUS_M = 500;
 
@@ -927,7 +928,7 @@ function DebugTodSection({
         </Button>
       </div>
 
-      <div style={{ display: 'flex', gap: 6 }}>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
         <Button variant="secondary" onClick={persistNow}>
           Persist now
         </Button>
@@ -936,6 +937,29 @@ function DebugTodSection({
         </Button>
         <Button variant="secondary" onClick={refreshStats}>
           Refresh stats
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={async () => {
+            try {
+              const keys = await storage.keys();
+              const raw = await storage.get<unknown>('sb-tod:state:v1', null);
+              const summary =
+                raw == null
+                  ? 'null'
+                  : typeof raw === 'object' && raw !== null
+                  ? `{ version: ${(raw as any).version}, savedAt: ${(raw as any).savedAt}, points: ${(raw as any).baselineDemand?.length ?? '?'}, pops: ${(raw as any).baselinePopSizes?.length ?? '?'}, deltas: ${(raw as any).cumulativeDeltas?.length ?? '?'} }`
+                  : String(raw);
+              setLast(
+                `storage.keys: [${keys.join(', ') || '<empty>'}]\nstorage.get("sb-tod:state:v1"): ${summary}`
+              );
+            } catch (e: any) {
+              setLast(`storage check threw: ${e?.message ?? e}`);
+            }
+            refreshStats();
+          }}
+        >
+          Check storage
         </Button>
       </div>
 
@@ -950,13 +974,17 @@ function DebugTodSection({
         <br />
         baselines: {stats.pointsTracked}p / {stats.popsTracked}pop · with deltas: {stats.pointsWithDeltas}
         <br />
-        demandChange events: {stats.demandChangeEvents} · last persist: {stats.lastPersistOk == null ? '—' : stats.lastPersistOk ? 'ok' : 'FAIL'}
-        {stats.lastHydrate?.fromStorage && (
-          <>
-            <br />
-            hydrate: preserved {stats.lastHydrate.preserved} · replayed {stats.lastHydrate.replayed} · shifted {stats.lastHydrate.baselineShift}
-          </>
-        )}
+        demandChange events: {stats.demandChangeEvents}
+        <br />
+        last persist: {stats.lastPersistOk == null ? '—' : stats.lastPersistOk ? 'ok' : 'FAIL'}
+        {' · '}
+        round-trip: {stats.storageRoundTripOk == null ? '—' : stats.storageRoundTripOk ? 'ok' : 'FAIL (data lost)'}
+        <br />
+        hydrate: {stats.lastHydrate == null
+          ? '—'
+          : stats.lastHydrate.fromStorage
+          ? `from-storage · preserved ${stats.lastHydrate.preserved} · replayed ${stats.lastHydrate.replayed} · shifted ${stats.lastHydrate.baselineShift}`
+          : 'fresh (no persisted state found — either first run, game reset mod storage, or storage backend broken)'}
       </div>
     </div>
   );
