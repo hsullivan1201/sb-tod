@@ -1,10 +1,13 @@
 {
-  "id": "com.author.modname",
-  "name": "My Mod",
-  "description": "Description of your mod",
-  "version": "1.0.0",
+  "id": "dev.hazel.sb-tod",
+  "name": "SB TOD",
+  "description": "Transit-Oriented Development for Subway Builder. Adds a feedback loop from transit service to land use: station areas with good service grow, underserved areas don't. Stage 0 — scaffolding.",
+  "version": "0.1.0",
   "author": {
-    "name": "Your Name"
+    "name": "hazel"
   },
-  "main": "index.js"
+  "dependencies": {
+    "subway-builder": ">=1.0.0"
+  },
+  "main": "dist/index.js"
 }

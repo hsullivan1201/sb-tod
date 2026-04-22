@@ -1,51 +1,47 @@
 /**
- * My Subway Builder Mod
- * Entry point for the mod.
+ * SB TOD — entry point
+ *
+ * Stage 0: register a toolbar panel that opens the Hello TOD view.
+ * UI registration happens inside `onMapReady` (per AA's debugging
+ * notes). Guard against double-init: the hook can fire more than
+ * once on save load.
  */
 
-import { ExamplePanel } from './ui/ExamplePanel';
+import { hooks, ui, apiVersion } from './api';
+import { HelloTodPanel } from './ui/HelloTodPanel';
+import { initMapHighlight } from './ui/mapHighlight';
 
-const MOD_ID = 'com.author.modname';
-const MOD_VERSION = '1.0.0';
-const TAG = '[MyMod]';
+const MOD_ID = 'dev.hazel.sb-tod';
+const MOD_VERSION = '0.1.0';
+const TAG = '[sb-tod]';
 
-const api = window.SubwayBuilderAPI;
+console.log(`${TAG} v${MOD_VERSION} loading | API v${apiVersion}`);
 
-if (!api) {
-  console.error(`${TAG} SubwayBuilderAPI not found!`);
-} else {
-  console.log(`${TAG} v${MOD_VERSION} | API v${api.version}`);
+let initialized = false;
 
-  // Guard against double initialization (onMapReady can fire multiple times)
-  let initialized = false;
+hooks.onMapReady(() => {
+  if (initialized) return;
+  initialized = true;
 
-  // Initialize mod when map is ready
-  api.hooks.onMapReady((_map) => {
-    if (initialized) return;
-    initialized = true;
+  try {
+    ui.addToolbarPanel({
+      id: 'sb-tod-panel',
+      icon: 'Building2',
+      tooltip: 'Transit-Oriented Development',
+      title: 'TOD',
+      width: 420,
+      render: HelloTodPanel,
+    });
 
+    initMapHighlight();
+
+    console.log(`${TAG} Initialized.`);
+  } catch (err) {
+    console.error(`${TAG} Init failed:`, err);
     try {
-      // Example: Add a floating panel with a React component
-      api.ui.addFloatingPanel({
-        id: 'my-mod-panel',
-        title: 'My Mod',
-        icon: 'Puzzle',
-        render: ExamplePanel,
-      });
-
-      // Example: Add a button to the escape menu
-      api.ui.addButton('escape-menu', {
-        id: 'my-mod-button',
-        label: 'My Mod Button',
-        onClick: () => {
-          api.ui.showNotification('Hello from My Mod!', 'info');
-        },
-      });
-
-      console.log(`${TAG} Initialized successfully.`);
-    } catch (err) {
-      console.error(`${TAG} Failed to initialize:`, err);
-      api.ui.showNotification(`${MOD_ID} failed to load. Check console for details.`, 'error');
+      ui.showNotification(`${MOD_ID} failed to load — check console.`, 'error');
+    } catch {
+      // notification can also fail mid-init; swallow
     }
-  });
-}
+  }
+});
