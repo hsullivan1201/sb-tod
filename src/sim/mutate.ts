@@ -100,8 +100,10 @@ export interface MutatorOptions {
   minFloor?: number;
   /**
    * When a pop's scaled size exceeds this, clone it into N sub-pops so
-   * each one boards atomically. Default 200 — comfortably below typical
-   * train capacity. Set to Infinity to disable splitting (legacy
+   * each one boards atomically. Default 200 — matches the game's own
+   * pop granularity (every game-authored Pop has size 200), so split
+   * children look indistinguishable from natural pops to the rest of
+   * the simulation. Set to Infinity to disable splitting (legacy
    * single-pop behavior).
    */
   splitThreshold?: number;
