@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
-    "build": "vite build",
+    "build": "vite build && tsx scripts/copy-to-parent.ts",
+    "build:no-copy": "vite build",
     "dev": "concurrently -k -n build,game -c blue,green \"vite build --watch\" \"tsx scripts/run.ts\"",
     "dev:link": "tsx scripts/link.ts",
     "dev:unlink": "tsx scripts/link.ts --unlink",

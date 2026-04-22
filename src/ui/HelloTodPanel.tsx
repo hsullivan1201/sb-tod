@@ -942,16 +942,39 @@ function DebugTodSection({
           variant="secondary"
           onClick={async () => {
             try {
-              const keys = await storage.keys();
-              const raw = await storage.get<unknown>('sb-tod:state:v1', null);
-              const summary =
+              // Probe BOTH backends so we can tell exactly which one
+              // has the data. The adaptive layer would hide this.
+              const apiKeys = await storage.keys().catch(() => [] as string[]);
+              const apiRaw = await storage.get<unknown>('sb-tod:state:v1', null).catch(() => null);
+              const lsAvailable = typeof localStorage !== 'undefined';
+              const lsKeys: string[] = [];
+              let lsRaw: unknown = null;
+              if (lsAvailable) {
+                for (let i = 0; i < localStorage.length; i++) {
+                  const k = localStorage.key(i);
+                  if (k != null) lsKeys.push(k);
+                }
+                const lsStr = localStorage.getItem('sb-tod:state:v1');
+                if (lsStr != null) {
+                  try {
+                    lsRaw = JSON.parse(lsStr);
+                  } catch {
+                    lsRaw = '<unparseable>';
+                  }
+                }
+              }
+              const summary = (raw: unknown) =>
                 raw == null
                   ? 'null'
                   : typeof raw === 'object' && raw !== null
                   ? `{ version: ${(raw as any).version}, savedAt: ${(raw as any).savedAt}, points: ${(raw as any).baselineDemand?.length ?? '?'}, pops: ${(raw as any).baselinePopSizes?.length ?? '?'}, deltas: ${(raw as any).cumulativeDeltas?.length ?? '?'} }`
                   : String(raw);
               setLast(
-                `storage.keys: [${keys.join(', ') || '<empty>'}]\nstorage.get("sb-tod:state:v1"): ${summary}`
+                `api.storage.keys: [${apiKeys.join(', ') || '<empty>'}]\n` +
+                  `api.storage.get("sb-tod:state:v1"): ${summary(apiRaw)}\n` +
+                  `localStorage available: ${lsAvailable}\n` +
+                  `localStorage keys: [${lsKeys.join(', ') || '<empty>'}]\n` +
+                  `localStorage["sb-tod:state:v1"]: ${summary(lsRaw)}`
               );
             } catch (e: any) {
               setLast(`storage check threw: ${e?.message ?? e}`);
@@ -979,6 +1002,8 @@ function DebugTodSection({
         last persist: {stats.lastPersistOk == null ? '—' : stats.lastPersistOk ? 'ok' : 'FAIL'}
         {' · '}
         round-trip: {stats.storageRoundTripOk == null ? '—' : stats.storageRoundTripOk ? 'ok' : 'FAIL (data lost)'}
+        {' · '}
+        backend: {stats.storageBackend}
         <br />
         hydrate: {stats.lastHydrate == null
           ? '—'

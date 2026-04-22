@@ -25,7 +25,7 @@
  * through JSON.
  */
 
-import { gameState, storage } from '../api';
+import { gameState } from '../api';
 import type { DemandData, DemandPoint, PointDelta } from '../types';
 import {
   createMutator,
@@ -34,6 +34,11 @@ import {
   type DemandDelta,
   type ApplyResult,
 } from '../sim/mutate';
+import {
+  createAdaptiveStorage,
+  type AdaptiveStorage,
+  type StorageBackendKind,
+} from './storage-adapter';
 
 const STORAGE_KEY = 'sb-tod:state:v1';
 const APPROX_TOLERANCE = 1.0;
@@ -71,6 +76,8 @@ export interface ModStateStats {
    * `false` if set() silently dropped (the probe-1 flake).
    */
   storageRoundTripOk: boolean | null;
+  /** Which backend (api / local / none) the last successful persist used. */
+  storageBackend: StorageBackendKind;
   pointsTracked: number;
   popsTracked: number;
   pointsWithDeltas: number;
@@ -120,7 +127,7 @@ export interface CreateModStateOptions {
 }
 
 export function createModState(options: CreateModStateOptions = {}): ModState {
-  let backend: StorageLike = options.storage ?? storage;
+  let backend: StorageLike = options.storage ?? createAdaptiveStorage();
   const getDemand = options.getDemand ?? (() => gameState.getDemandData() as DemandData | null);
   const persistEveryNDays = options.persistEveryNDays ?? 1;
 
@@ -314,6 +321,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     onGameLoadedFired,
     stats() {
       const snap = mutator?.snapshot();
+      const storageBackend: StorageBackendKind =
+        (backend as Partial<AdaptiveStorage>).lastBackend?.() ?? 'api';
       return {
         initialized,
         demandChangeEvents,
@@ -322,6 +331,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         lastPersistOk,
         lastPersistAt,
         storageRoundTripOk,
+        storageBackend,
         pointsTracked: snap?.baselineDemand.size ?? 0,
         popsTracked: snap?.baselinePopSizes.size ?? 0,
         pointsWithDeltas: snap?.cumulativeDeltas.size ?? 0,
