@@ -65,7 +65,7 @@ describe('mod state — fresh init', () => {
     const x = pop('x', 'P', 'P', 10);
     const demand = fixture([P], [x]);
     const storage = makeStorage();
-    const state = createModState({ storage, getDemand: () => demand });
+    const state = createModState({ mutatorOptions: {}, storage, getDemand: () => demand });
 
     expect(state.isReady()).toBe(false);
     const ok = await state.ensureInit();
@@ -80,7 +80,7 @@ describe('mod state — fresh init', () => {
 
   it('returns false from ensureInit when demand is unavailable', async () => {
     const storage = makeStorage();
-    const state = createModState({ storage, getDemand: () => null });
+    const state = createModState({ mutatorOptions: {}, storage, getDemand: () => null });
     expect(await state.ensureInit()).toBe(false);
     expect(state.isReady()).toBe(false);
   });
@@ -97,7 +97,7 @@ describe('mod state — persist roundtrip', () => {
     const A = point('P', 100, 1000);
     const xA = pop('x', 'P', 'P', 50);
     const demandA = fixture([A], [xA]);
-    const sessionA = createModState({ storage, getDemand: () => demandA });
+    const sessionA = createModState({ mutatorOptions: {}, storage, getDemand: () => demandA });
     await sessionA.ensureInit();
     sessionA.applyDensityDelta('P', { residents: 200 }, 'deals');
     expect(await sessionA.persist()).toBe(true);
@@ -107,7 +107,7 @@ describe('mod state — persist roundtrip', () => {
     const B = point('P', 100, 1000);
     const xB = pop('x', 'P', 'P', 50);
     const demandB = fixture([B], [xB]);
-    const sessionB = createModState({ storage, getDemand: () => demandB });
+    const sessionB = createModState({ mutatorOptions: {}, storage, getDemand: () => demandB });
     await sessionB.ensureInit();
 
     expect(sessionB.stats().lastHydrate?.fromStorage).toBe(true);
@@ -125,7 +125,7 @@ describe('mod state — persist roundtrip', () => {
     // Session 1: mutate + persist.
     const A = point('P', 100, 1000);
     const xA = pop('x', 'P', 'P', 50);
-    const sessionA = createModState({ storage, getDemand: () => fixture([A], [xA]) });
+    const sessionA = createModState({ mutatorOptions: {}, storage, getDemand: () => fixture([A], [xA]) });
     await sessionA.ensureInit();
     sessionA.applyDensityDelta('P', { residents: 200 }, 'deals');
     await sessionA.persist();
@@ -134,7 +134,7 @@ describe('mod state — persist roundtrip', () => {
     // already at the post-mutation values. Pop size is scaled.
     const B = point('P', 100, 1200);
     const xB = pop('x', 'P', 'P', 60);
-    const sessionB = createModState({ storage, getDemand: () => fixture([B], [xB]) });
+    const sessionB = createModState({ mutatorOptions: {}, storage, getDemand: () => fixture([B], [xB]) });
     await sessionB.ensureInit();
 
     expect(sessionB.stats().lastHydrate?.preserved).toBe(1);
@@ -171,7 +171,7 @@ describe('mod state — persist roundtrip', () => {
     // Live demand is at 800 — baseline shifted (game patch, edited save, etc.).
     const B = point('P', 100, 800);
     const xB = pop('x', 'P', 'P', 50);
-    const state = createModState({ storage, getDemand: () => fixture([B], [xB]) });
+    const state = createModState({ mutatorOptions: {}, storage, getDemand: () => fixture([B], [xB]) });
     await state.ensureInit();
 
     expect(state.stats().lastHydrate?.baselineShift).toBe(1);
@@ -196,7 +196,7 @@ describe('mod state — persist roundtrip', () => {
     const P = point('P', 100, 1000);
     const Q_new = point('Q-new', 50, 50); // didn't exist when we last saved
     const demand = fixture([P, Q_new], []);
-    const state = createModState({ storage, getDemand: () => demand });
+    const state = createModState({ mutatorOptions: {}, storage, getDemand: () => demand });
     await state.ensureInit();
 
     expect(state.mutator().getBaseline('Q-new')).toEqual({ jobs: 50, residents: 50 });
@@ -206,7 +206,7 @@ describe('mod state — persist roundtrip', () => {
     const storage = makeStorage();
     const A = point('P', 250, 1750);
     const xA = pop('x', 'P', 'P', 12.5);
-    const sessionA = createModState({ storage, getDemand: () => fixture([A], [xA]) });
+    const sessionA = createModState({ mutatorOptions: {}, storage, getDemand: () => fixture([A], [xA]) });
     await sessionA.ensureInit();
     sessionA.applyDensityDelta('P', { residents: 175, jobs: 50 }, 'deals');
     sessionA.applyDensityDelta('P', { residents: 50 }, 'organic');
@@ -231,6 +231,7 @@ describe('mod state — lifecycle hooks', () => {
     const A = point('P', 100, 1000);
     const x = pop('x', 'P', 'P', 50);
     const state = createModState({
+      mutatorOptions: {},
       storage,
       getDemand: () => fixture([A], [x]),
       persistEveryNDays: 1,
@@ -251,7 +252,7 @@ describe('mod state — lifecycle hooks', () => {
   it('does not persist when not dirty', async () => {
     const storage = makeStorage();
     const A = point('P', 100, 1000);
-    const state = createModState({ storage, getDemand: () => fixture([A], []) });
+    const state = createModState({ mutatorOptions: {}, storage, getDemand: () => fixture([A], []) });
     await state.ensureInit();
     state.onDayTick(1);
     state.onDayTick(2);
@@ -265,7 +266,7 @@ describe('mod state — lifecycle hooks', () => {
     const storage = makeStorage();
     const A = point('P', 100, 1000);
     const x = pop('x', 'P', 'P', 50);
-    const state = createModState({ storage, getDemand: () => fixture([A], [x]) });
+    const state = createModState({ mutatorOptions: {}, storage, getDemand: () => fixture([A], [x]) });
     await state.ensureInit();
 
     for (let i = 0; i < 49; i++) state.onDemandChangeFired();
@@ -286,7 +287,7 @@ describe('mod state — applyDensityDelta + revert', () => {
     const storage = makeStorage();
     const A = point('P', 100, 1000);
     const x = pop('x', 'P', 'P', 50);
-    const state = createModState({ storage, getDemand: () => fixture([A], [x]) });
+    const state = createModState({ mutatorOptions: {}, storage, getDemand: () => fixture([A], [x]) });
     await state.ensureInit();
 
     expect(await state.persist()).toBe(true);
@@ -306,6 +307,7 @@ describe('mod state — applyDensityDelta + revert', () => {
 
     // Session on save "alpha": +200 residents.
     const sessionAlpha = createModState({
+      mutatorOptions: {},
       storage,
       getDemand: () => fixture([A], [x]),
       initialSaveName: 'alpha',
@@ -320,6 +322,7 @@ describe('mod state — applyDensityDelta + revert', () => {
     const Bp = point('P', 100, 1000);
     const Bx = pop('x', 'P', 'P', 50);
     const sessionBeta = createModState({
+      mutatorOptions: {},
       storage,
       getDemand: () => fixture([Bp], [Bx]),
       initialSaveName: 'beta',
@@ -336,6 +339,7 @@ describe('mod state — applyDensityDelta + revert', () => {
     const Ap2 = point('P', 100, 1000);
     const Ax2 = pop('x', 'P', 'P', 50);
     const sessionAlpha2 = createModState({
+      mutatorOptions: {},
       storage,
       getDemand: () => fixture([Ap2], [Ax2]),
       initialSaveName: 'alpha',
@@ -349,6 +353,7 @@ describe('mod state — applyDensityDelta + revert', () => {
     const A = point('P', 100, 1000);
     const x = pop('x', 'P', 'P', 50);
     const state = createModState({
+      mutatorOptions: {},
       storage,
       getDemand: () => fixture([A], [x]),
       initialSaveName: 'alpha',
@@ -368,6 +373,7 @@ describe('mod state — applyDensityDelta + revert', () => {
     const A = point('P', 100, 1000);
     const x = pop('x', 'P', 'P', 50);
     const state = createModState({
+      mutatorOptions: {},
       storage,
       getDemand: () => fixture([A], [x]),
       initialSaveName: 'alpha',
@@ -385,7 +391,7 @@ describe('mod state — applyDensityDelta + revert', () => {
   it('does not mark dirty on failed mutation (ghost-town reject)', async () => {
     const storage = makeStorage();
     const A = point('P', 0, 0);
-    const state = createModState({ storage, getDemand: () => fixture([A], []) });
+    const state = createModState({ mutatorOptions: {}, storage, getDemand: () => fixture([A], []) });
     await state.ensureInit();
 
     const r = state.applyDensityDelta('P', { residents: 100 }, 'deals');

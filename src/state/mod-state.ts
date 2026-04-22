@@ -33,6 +33,7 @@ import {
   type DeltaSourceKind,
   type DemandDelta,
   type ApplyResult,
+  type MutatorOptions,
 } from '../sim/mutate';
 import {
   createAdaptiveStorage,
@@ -232,12 +233,25 @@ export interface CreateModStateOptions {
   persistEveryNDays?: number;
   /** Initial save name. Default null (uses the `_unsaved` slot). */
   initialSaveName?: string | null;
+  /**
+   * Options forwarded to the underlying mutator. Default
+   * `{ strictUnitSize: 200 }` — every pop produced is exactly 200 to
+   * match the game's natural pop granularity. Tests that need
+   * fractional behavior pass `{}` to opt out.
+   */
+  mutatorOptions?: MutatorOptions;
 }
 
 export function createModState(options: CreateModStateOptions = {}): ModState {
   let backend: StorageLike = options.storage ?? createAdaptiveStorage();
   const getDemand = options.getDemand ?? (() => gameState.getDemandData() as DemandData | null);
   const persistEveryNDays = options.persistEveryNDays ?? 1;
+  // Strict 200-sized pops by default: matches the game's natural Pop
+  // granularity (every game-authored Pop has size 200). Keeps split
+  // children indistinguishable from natural pops to the rest of the
+  // simulation and avoids fractional sizes (which the game's
+  // atomic-boarding model can't handle cleanly).
+  const mutatorOptions: MutatorOptions = options.mutatorOptions ?? { strictUnitSize: 200 };
 
   let mutator: DemandMutator | null = null;
   let demand: DemandData | null = null;
@@ -260,7 +274,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       return false;
     }
     demand = d;
-    mutator = createMutator(d);
+    mutator = createMutator(d, mutatorOptions);
 
     const storageKey = makeStorageKey(currentSaveName);
 

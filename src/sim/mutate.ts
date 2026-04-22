@@ -104,9 +104,22 @@ export interface MutatorOptions {
    * pop granularity (every game-authored Pop has size 200), so split
    * children look indistinguishable from natural pops to the rest of
    * the simulation. Set to Infinity to disable splitting (legacy
-   * single-pop behavior).
+   * single-pop behavior). Ignored when `strictUnitSize` is set.
    */
   splitThreshold?: number;
+  /**
+   * Force every pop produced by the mutator (originals + children) to
+   * exactly this size. Number of units per origin pop is
+   * `max(1, round(target / strictUnitSize))`, where target is the
+   * baseline-anchored continuous size. The DemandPoint aggregate stays
+   * tied to the user-requested cumulative delta — so sum-of-pop-sizes
+   * may differ from `point.residents` by up to ±strictUnitSize/2.
+   *
+   * Production passes 200 here so all pops match the game's natural
+   * granularity. Tests usually leave this unset to isolate the math
+   * from the rounding discipline.
+   */
+  strictUnitSize?: number;
 }
 
 export interface MutatorSnapshot {
@@ -202,6 +215,7 @@ export function createMutator(
   const ghostTownThreshold = options.ghostTownThreshold ?? 0;
   const minFloor = options.minFloor ?? 0;
   const splitThreshold = options.splitThreshold ?? 200;
+  const strictUnitSize = options.strictUnitSize; // undefined = fractional mode
 
   const baselineDemand = new Map<string, { jobs: number; residents: number }>();
   const baselinePopSizes = new Map<string, number>();
@@ -302,8 +316,25 @@ export function createMutator(
     targetTotalSize: number,
     baselineSize: number
   ): { created: number; removed: number } {
-    const effectiveThreshold = Math.max(splitThreshold, baselineSize);
-    const totalUnits = Math.max(1, Math.ceil(targetTotalSize / effectiveThreshold));
+    let totalUnits: number;
+    let perUnitSize: number;
+    if (strictUnitSize !== undefined && strictUnitSize > 0) {
+      // Strict mode: every pop is exactly strictUnitSize. Round the
+      // continuous target to the nearest integer multiple. A target of
+      // 0.5×strictUnitSize rounds to 1 unit (max(1, ...)) — we never
+      // delete the original pop entirely, even if a deep negative
+      // delta would suggest 0 units.
+      totalUnits = Math.max(1, Math.round(targetTotalSize / strictUnitSize));
+      perUnitSize = strictUnitSize;
+    } else {
+      // Fractional mode: distribute the continuous target across
+      // ceil(target / threshold) units. Ceiling on max(threshold,
+      // baseline) keeps us from fragmenting below the game's own
+      // baseline granularity (see split design comment above).
+      const effectiveThreshold = Math.max(splitThreshold, baselineSize);
+      totalUnits = Math.max(1, Math.ceil(targetTotalSize / effectiveThreshold));
+      perUnitSize = targetTotalSize / totalUnits;
+    }
     const desiredChildCount = totalUnits - 1;
 
     // Load existing children, dropping any that have since disappeared
@@ -346,14 +377,13 @@ export function createMutator(
     if (existing.length > 0) splitChildren.set(originalPop.id, existing);
     else splitChildren.delete(originalPop.id);
 
-    // Distribute the target size evenly. Even distribution keeps the
-    // math simple and matches the "no one pop is special" semantics:
-    // no child is any more real than any other.
-    const perUnit = targetTotalSize / totalUnits;
-    originalPop.size = perUnit;
+    // Apply per-unit size. In strict mode every unit (including the
+    // original pop) is set to exactly strictUnitSize. In fractional
+    // mode each unit gets target / totalUnits — see the branch above.
+    originalPop.size = perUnitSize;
     for (const id of existing) {
       const child = demand.popsMap.get(id);
-      if (child) child.size = perUnit;
+      if (child) child.size = perUnitSize;
     }
 
     return { created, removed };

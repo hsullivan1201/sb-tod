@@ -495,6 +495,82 @@ describe('pop splitting', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Strict unit-size mode — production setting where every pop is size 200
+// ---------------------------------------------------------------------------
+describe('strict unit-size mode', () => {
+  it('keeps every pop at exactly strictUnitSize regardless of scale', () => {
+    const P = point('P', 0, 600);
+    const pops = [
+      pop('a', 'P', 'P', 200),
+      pop('b', 'P', 'P', 200),
+      pop('c', 'P', 'P', 200),
+    ];
+    const demand = fixture([P], pops);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    // Scale residents by 3x: each pop's continuous target is 600,
+    // round(600/200) = 3 units of 200 each per origin. 3 origins × 3
+    // units = 9 pops total.
+    m.applyDensityDelta('P', { residents: 1200 }, 'deals');
+
+    expect(demand.popsMap.size).toBe(9);
+    for (const p of demand.popsMap.values()) {
+      expect(p.size).toBe(200);
+    }
+  });
+
+  it('rounds the per-origin unit count to nearest, never below 1', () => {
+    const P = point('P', 0, 600);
+    const pops = [pop('x', 'P', 'P', 200)];
+    const demand = fixture([P], pops);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    // +200 res on baseline 600 → ratio 1.333, target = 200 * 1.333 = 266.67
+    // round(266.67/200) = round(1.333) = 1 (round half up only kicks in
+    // at exact .5, and 1.333 rounds down). So we stay at 1 pop.
+    m.applyDensityDelta('P', { residents: 200 }, 'deals');
+    expect(demand.popsMap.size).toBe(1);
+    expect(demand.popsMap.get('x')!.size).toBe(200);
+
+    // +600 res → ratio 2.0, target = 400, round(2.0) = 2 units.
+    m.applyDensityDelta('P', { residents: 400 }, 'deals'); // cumulative now +600
+    expect(demand.popsMap.size).toBe(2);
+    for (const p of demand.popsMap.values()) expect(p.size).toBe(200);
+  });
+
+  it('reverts cleanly back to the single original pop at strictUnitSize', () => {
+    const P = point('P', 0, 200);
+    const pops = [pop('x', 'P', 'P', 200)];
+    const demand = fixture([P], pops);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    m.applyDensityDelta('P', { residents: 800 }, 'deals'); // 5x → 5 units
+    expect(demand.popsMap.size).toBe(5);
+
+    m.applyDensityDelta('P', { residents: -800 }, 'deals'); // back to baseline
+    expect(demand.popsMap.size).toBe(1);
+    expect(demand.popsMap.get('x')!.size).toBe(200);
+  });
+
+  it('never deletes the original pop, even on deep negative deltas', () => {
+    // ghostTownThreshold default = 0; minFloor default = 0. A -100 res
+    // delta on a baseline-200 point sets target to 100, which would
+    // round(100/200) to round(0.5) = 1 (round half-to-even gives 0 in
+    // some impls but Math.round in JS rounds .5 toward +Infinity → 1).
+    // Either way our max(1, ...) guards against zero.
+    const P = point('P', 0, 200);
+    const pops = [pop('x', 'P', 'P', 200)];
+    const demand = fixture([P], pops);
+    const m = createMutator(demand, { strictUnitSize: 200, minFloor: 0 });
+
+    m.applyDensityDelta('P', { residents: -100 }, 'deals');
+    expect(demand.popsMap.size).toBe(1);
+    expect(demand.popsMap.has('x')).toBe(true);
+    expect(demand.popsMap.get('x')!.size).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Surface checks
 // ---------------------------------------------------------------------------
 describe('mutator surface', () => {
