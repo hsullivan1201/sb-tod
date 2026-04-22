@@ -8,66 +8,88 @@
  */
 
 import type { DemandData, StationGroup } from './types';
+import type { ModdingAPI } from './types/api';
 
-const raw = window.SubwayBuilderAPI;
-
-if (!raw) {
-  throw new Error('[sb-tod] SubwayBuilderAPI not found on window');
+// Lazy lookup so test environments (no `window`) can import this module
+// without erroring at evaluation. The actual game enforces presence the
+// first time a wrapper method runs.
+function getRaw(): ModdingAPI {
+  const w = typeof window !== 'undefined' ? (window as any) : undefined;
+  const raw = w?.SubwayBuilderAPI as ModdingAPI | undefined;
+  if (!raw) {
+    throw new Error('[sb-tod] SubwayBuilderAPI not found on window');
+  }
+  return raw;
 }
 
-export const apiVersion: string = raw.version;
+export const apiVersion: string =
+  typeof window !== 'undefined' && (window as any).SubwayBuilderAPI
+    ? (window as any).SubwayBuilderAPI.version
+    : 'unset';
 
 export const gameState = {
   getDemandData(): DemandData {
-    return raw.gameState.getDemandData() as DemandData;
+    return getRaw().gameState.getDemandData() as DemandData;
   },
   getStations() {
-    return raw.gameState.getStations();
+    return getRaw().gameState.getStations();
   },
   getStationRidership(stationId: string) {
-    return raw.gameState.getStationRidership(stationId);
+    return getRaw().gameState.getStationRidership(stationId);
   },
   getCurrentDay(): number {
-    return raw.gameState.getCurrentDay();
+    return getRaw().gameState.getCurrentDay();
   },
   isPaused(): boolean {
-    return raw.gameState.isPaused();
+    return getRaw().gameState.isPaused();
   },
   // Group/transfer surface — bundled template types don't list these,
   // but probe-1 confirmed they exist and Debug DL confirmed shapes
   // (2026-04-22). Cast through `any` since the d.ts is stale.
   getStationGroups(): StationGroup[] {
-    const groups = (raw.gameState as any).getStationGroups?.();
+    const groups = (getRaw().gameState as any).getStationGroups?.();
     return Array.isArray(groups) ? (groups as StationGroup[]) : [];
   },
   getTransferStationIds(): string[] {
-    const ids = (raw.gameState as any).getTransferStationIds?.();
+    const ids = (getRaw().gameState as any).getTransferStationIds?.();
     return Array.isArray(ids) ? (ids as string[]) : [];
   },
   getSiblingStationIds(stationId: string): string[] {
-    const ids = (raw.gameState as any).getSiblingStationIds?.(stationId);
+    const ids = (getRaw().gameState as any).getSiblingStationIds?.(stationId);
     return Array.isArray(ids) ? (ids as string[]) : [];
   },
 };
 
 export const hooks = {
   onGameInit(cb: () => void): void {
-    raw.hooks.onGameInit(cb);
+    getRaw().hooks.onGameInit(cb);
   },
   onMapReady(cb: (map: unknown) => void): void {
-    raw.hooks.onMapReady(cb);
+    getRaw().hooks.onMapReady(cb);
   },
-  onGameLoaded(cb: () => void): void {
-    raw.hooks.onGameLoaded(cb);
+  onGameLoaded(cb: (saveName: string) => void): void {
+    getRaw().hooks.onGameLoaded(cb);
   },
-  onGameSaved(cb: () => void): void {
-    raw.hooks.onGameSaved(cb);
+  onGameSaved(cb: (saveName: string) => void): void {
+    getRaw().hooks.onGameSaved(cb);
   },
   onDayChange(cb: (day: number) => void): void {
-    raw.hooks.onDayChange(cb);
+    getRaw().hooks.onDayChange(cb);
   },
-  onDemandChange(cb: () => void): void {
-    raw.hooks.onDemandChange(cb);
+  onDemandChange(cb: (popCount: number) => void): void {
+    getRaw().hooks.onDemandChange(cb);
+  },
+};
+
+export const storage = {
+  set(key: string, value: unknown): Promise<void> {
+    return getRaw().storage.set(key, value);
+  },
+  get<T>(key: string, defaultValue: T): Promise<T> {
+    return getRaw().storage.get<T>(key, defaultValue);
+  },
+  delete(key: string): Promise<void> {
+    return getRaw().storage.delete(key);
   },
 };
 
@@ -80,10 +102,10 @@ export const ui = {
     width: number;
     render: () => unknown;
   }): void {
-    raw.ui.addToolbarPanel(config);
+    getRaw().ui.addToolbarPanel(config);
   },
   showNotification(message: string, level: 'info' | 'success' | 'warning' | 'error'): void {
-    raw.ui.showNotification(message, level);
+    getRaw().ui.showNotification(message, level);
   },
 };
 
@@ -92,7 +114,7 @@ export const map = {
     type: 'geojson';
     data: unknown;
   }): void {
-    raw.map.registerSource(id, config);
+    getRaw().map.registerSource(id, config);
   },
   registerLayer(config: {
     id: string;
@@ -101,16 +123,23 @@ export const map = {
     paint?: Record<string, unknown>;
     layout?: Record<string, unknown>;
   }): void {
-    raw.map.registerLayer(config);
+    getRaw().map.registerLayer(config);
   },
 };
 
-export const utils = raw.utils;
+export const utils: any = new Proxy(
+  {},
+  {
+    get(_, prop) {
+      return (getRaw().utils as any)[prop];
+    },
+  }
+);
 
 /** Live MapLibre instance, or null if not yet ready. */
 export function getMap(): any {
   try {
-    return (raw.utils as any).getMap?.() ?? null;
+    return (getRaw().utils as any).getMap?.() ?? null;
   } catch {
     return null;
   }

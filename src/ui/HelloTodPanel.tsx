@@ -18,6 +18,8 @@ import {
   type ScoredStation,
 } from '../scoring';
 import { clearHighlight, setHighlight } from './mapHighlight';
+import { getModState } from '../state/mod-state';
+import { findWalkshed } from '../scoring/walkshed';
 
 const HIGHLIGHT_RADIUS_M = 500;
 
@@ -217,6 +219,13 @@ export function HelloTodPanel() {
           Debug DL
         </Button>
       </div>
+
+      <DebugTodSection
+        highlightedId={highlightedId}
+        scored={snapshot.scored}
+        onAfter={() => setSnapshot(readSnapshot())}
+      />
+
 
       <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', lineHeight: 1.5 }}>
         Stage 1 · 500m walkshed · scores ranked relative to this map (auto-calibrated)
@@ -742,3 +751,213 @@ function shape(value: unknown, depth: number): unknown {
   return { __type: t };
 }
 
+// ---------------------------------------------------------------------------
+// Debug TOD section — manual mutation testing for stage 2.
+// Lets us verify the mutator + persistence path end-to-end in-game.
+// Removed once deals UI ships; for now it's the only entry point that
+// actually invokes a mutation.
+// ---------------------------------------------------------------------------
+function DebugTodSection({
+  highlightedId,
+  scored,
+  onAfter,
+}: {
+  highlightedId: string | null;
+  scored: ScoredStation[];
+  onAfter: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [last, setLast] = useState<string | null>(null);
+  const [stats, setStats] = useState(() => getModState().stats());
+
+  const refreshStats = useCallback(() => setStats(getModState().stats()), []);
+
+  const pinned = useMemo(
+    () => (highlightedId ? scored.find((s) => s.id === highlightedId) ?? null : null),
+    [highlightedId, scored]
+  );
+
+  const poke = useCallback(
+    async (kind: 'residents' | 'jobs', amount: number) => {
+      if (!pinned) {
+        setLast('No station pinned. Click a row first.');
+        return;
+      }
+      const state = getModState();
+      const ok = await state.ensureInit();
+      if (!ok) {
+        setLast('Mod state not ready (demand data unavailable yet).');
+        return;
+      }
+
+      const demand = gameState.getDemandData();
+      if (!demand) {
+        setLast('No demand data.');
+        return;
+      }
+      // Pick the heaviest-weighted point in the pinned station's walkshed
+      // for the dimension we're poking. If all points are zero in that
+      // dimension, the apply will fail with ghost-town and we report it.
+      const hits = findWalkshed([pinned.center[0], pinned.center[1]], demand.points.values(), {
+        radiusMeters: HIGHLIGHT_RADIUS_M,
+      });
+      if (hits.length === 0) {
+        setLast(`No DemandPoints in ${HIGHLIGHT_RADIUS_M}m of ${pinned.name}.`);
+        return;
+      }
+      const ranked = hits
+        .map((h) => ({
+          h,
+          score: (kind === 'residents' ? h.point.residents : h.point.jobs) * h.weight,
+        }))
+        .sort((a, b) => b.score - a.score);
+      const target = ranked[0].h;
+
+      const r = state.applyDensityDelta(
+        target.point.id,
+        kind === 'residents' ? { residents: amount } : { jobs: amount },
+        'deals'
+      );
+
+      if (r.ok) {
+        setLast(
+          `OK: ${kind} ${amount > 0 ? '+' : ''}${amount} on point ${target.point.id} (${pinned.name} walkshed). Affected ${r.affectedPops} pops. Cumulative now ${r.cumulativeDelta.jobs}j/${r.cumulativeDelta.residents}r.`
+        );
+        onAfter();
+      } else {
+        setLast(`FAIL (${r.reason}): ${r.message}`);
+      }
+      refreshStats();
+    },
+    [pinned, onAfter, refreshStats]
+  );
+
+  const persistNow = useCallback(async () => {
+    const ok = await getModState().persist();
+    setLast(ok ? 'Persisted to storage.' : 'Persist FAILED — check console.');
+    refreshStats();
+  }, [refreshStats]);
+
+  const revertAll = useCallback(() => {
+    const state = getModState();
+    if (!state.isReady()) {
+      setLast('Mod state not ready.');
+      return;
+    }
+    state.mutator().revertAll();
+    state.markDirty();
+    setLast('Reverted all mutations to baseline.');
+    onAfter();
+    refreshStats();
+  }, [onAfter, refreshStats]);
+
+  if (!open) {
+    return (
+      <div>
+        <button
+          type="button"
+          onClick={() => {
+            setOpen(true);
+            refreshStats();
+          }}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: 'rgba(255,255,255,0.4)',
+            fontSize: 10,
+            cursor: 'pointer',
+            padding: 0,
+          }}
+        >
+          ▸ Stage 2 debug · mutator
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        border: '1px dashed rgba(255,255,255,0.15)',
+        borderRadius: 4,
+        padding: 8,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6,
+        fontSize: 11,
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <strong style={{ fontSize: 11 }}>Stage 2 debug · mutator</strong>
+        <button
+          type="button"
+          onClick={() => setOpen(false)}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: 'rgba(255,255,255,0.5)',
+            fontSize: 11,
+            cursor: 'pointer',
+          }}
+        >
+          ▾
+        </button>
+      </div>
+
+      <div style={{ color: 'rgba(255,255,255,0.6)' }}>
+        {pinned ? (
+          <>Targets walkshed of: <strong>{pinned.name}</strong></>
+        ) : (
+          <em>Pin a station above to enable poking.</em>
+        )}
+      </div>
+
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        <Button onClick={() => poke('residents', 100)} disabled={!pinned}>
+          +100 res
+        </Button>
+        <Button onClick={() => poke('residents', -100)} disabled={!pinned}>
+          −100 res
+        </Button>
+        <Button onClick={() => poke('jobs', 100)} disabled={!pinned}>
+          +100 jobs
+        </Button>
+        <Button onClick={() => poke('jobs', -100)} disabled={!pinned}>
+          −100 jobs
+        </Button>
+      </div>
+
+      <div style={{ display: 'flex', gap: 6 }}>
+        <Button variant="secondary" onClick={persistNow}>
+          Persist now
+        </Button>
+        <Button variant="secondary" onClick={revertAll}>
+          Revert all
+        </Button>
+        <Button variant="secondary" onClick={refreshStats}>
+          Refresh stats
+        </Button>
+      </div>
+
+      {last && (
+        <div style={{ color: 'rgba(255,255,255,0.7)', whiteSpace: 'pre-wrap', fontFamily: 'monospace' }}>
+          {last}
+        </div>
+      )}
+
+      <div style={{ color: 'rgba(255,255,255,0.4)', fontFamily: 'monospace', lineHeight: 1.5 }}>
+        ready: {String(stats.initialized)} · day: {stats.lastDay ?? '—'} · ticks: {stats.dayTicks}
+        <br />
+        baselines: {stats.pointsTracked}p / {stats.popsTracked}pop · with deltas: {stats.pointsWithDeltas}
+        <br />
+        demandChange events: {stats.demandChangeEvents} · last persist: {stats.lastPersistOk == null ? '—' : stats.lastPersistOk ? 'ok' : 'FAIL'}
+        {stats.lastHydrate?.fromStorage && (
+          <>
+            <br />
+            hydrate: preserved {stats.lastHydrate.preserved} · replayed {stats.lastHydrate.replayed} · shifted {stats.lastHydrate.baselineShift}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

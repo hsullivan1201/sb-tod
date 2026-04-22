@@ -117,6 +117,20 @@ export interface DemandMutator {
 
   /** Read-only view for persistence and tests. */
   snapshot(): MutatorSnapshot;
+
+  /**
+   * Hydrate tracking state (baselines + cumulative deltas) from a
+   * previously-captured snapshot WITHOUT applying deltas to live
+   * demand. Use this when the game itself preserved our mutations
+   * across save/load — the aggregates and pop sizes are already
+   * correct in `demand`, we just need to re-establish our tracking.
+   * Clears any existing tracking state first (last-write-wins).
+   */
+  hydrateTracking(persisted: {
+    baselineDemand: Iterable<readonly [string, { jobs: number; residents: number }]>;
+    baselinePopSizes: Iterable<readonly [string, number]>;
+    cumulativeDeltas: Iterable<readonly [string, PointDelta]>;
+  }): void;
 }
 
 function emptyPointDelta(): PointDelta {
@@ -361,6 +375,23 @@ export function createMutator(
         baselinePopSizes,
         cumulativeDeltas,
       };
+    },
+    hydrateTracking(persisted) {
+      baselineDemand.clear();
+      baselinePopSizes.clear();
+      cumulativeDeltas.clear();
+      for (const [id, b] of persisted.baselineDemand) {
+        baselineDemand.set(id, { jobs: b.jobs, residents: b.residents });
+      }
+      for (const [id, s] of persisted.baselinePopSizes) {
+        baselinePopSizes.set(id, s);
+      }
+      for (const [id, d] of persisted.cumulativeDeltas) {
+        cumulativeDeltas.set(id, {
+          jobs: { fromDeals: d.jobs.fromDeals, fromOrganic: d.jobs.fromOrganic },
+          residents: { fromDeals: d.residents.fromDeals, fromOrganic: d.residents.fromOrganic },
+        });
+      }
     },
   };
 }

@@ -128,12 +128,12 @@ no room" while restoring meaningful headroom elsewhere.
    and treat missing as 0.
 
 ### Stage 2 status (in progress)
-Stage 2 closes the feedback loop. The mutator primitive
-(`src/sim/mutate.ts`, session 5) is landed and tested but not yet wired
-into the runtime — nothing currently *calls* it. Next up is mod-state
-scaffolding (baselines / deltas / deals) and hook wiring so the mutator
-actually runs on `onDayChange` and gets replayed on `onGameLoaded`. The
-hard part is persistence + replay correctness, not the mutation itself.
+Mutator (session 5) + mod-state with persistence + game-hook wiring +
+in-panel debug poke UI (session 6) all landed. End-to-end testable:
+pin a station, click "Stage 2 debug · mutator", poke residents/jobs,
+save the game, reload, see whether the mutation persisted, replayed,
+or got dropped as a baseline shift. No deal data model yet — that's
+the next slice.
 
 **The single most important design decision for stage 2 is 1a in
 ARCHITECTURE.md**: DemandPoint.jobs/residents are aggregates, but the
@@ -151,6 +151,45 @@ can't bootstrap density where no pops originate.
 - Template repo: https://github.com/Subway-Builder-Modded/template-mod
 - Reference mod (analytics + storage + UI patterns):
   https://github.com/stefanorigano/advanced_analytics
+
+---
+
+## Session 6 — 2026-04-22 — Stage 2 mod-state, hook wiring, debug poke UI
+
+### Built
+- **`src/state/mod-state.ts`** — the singleton holding the mutator + everything that has to survive across save/load. In-memory is the source of truth (probe 1 found storage round-trips occasionally fail); `api.storage` is persistence, not state. Serializes baselines + cumulative deltas as `PersistedState v1` (Maps → Arrays of tuples for JSON safety). `ensureInit()` is async and idempotent — first call hydrates, subsequent calls return the existing init promise.
+- **Per-point load reconciliation** — Decision 2 says we don't know whether the game preserves our writes through save/load (open question #4). Rather than guess globally, we check each persisted point: if live ≈ baseline + cumulative delta, the game preserved → just rehydrate tracking; if live ≈ baseline, game reset → replay deltas via the mutator (rescales pops); if neither, baseline shift → drop the stale delta and rebaseline to live. Approx tolerance 1.0 to swallow JSON float round-trip. Reported per-session as `lastHydrate.{preserved,replayed,baselineShift,missingPoint}` for visibility.
+- **Hook wiring in `main.ts`**: `onDayChange` calls `state.onDayTick(day)` (which lazily inits if needed and persists if dirty); `onDemandChange` increments a counter only (per ARCHITECTURE decision 4 — never mutate from this handler, ~49× per game day means a feedback loop hazard); `onGameSaved` flushes pending state; `onGameLoaded` resets and re-inits to pick up the new save's demand.
+- **`hydrateTracking()` on the mutator** — seeds baseline + delta maps without applying any mutation. Needed for the "preserved" load path so we don't double-mutate already-mutated game state.
+- **Debug poke UI in `HelloTodPanel`** — collapsible "Stage 2 debug · mutator" section. Pin a station → buttons +/-100 res, +/-100 jobs target the heaviest-weighted DemandPoint in that walkshed for the chosen dimension. Reports affected pop count, cumulative delta, ghost-town rejections, etc. Plus "Persist now" / "Revert all" / live stats (initialized, day, ticks, baselines, demandChange events, last hydrate report). This is the first thing in the mod that actually CALLS the mutator at runtime.
+- **`api.ts` made lazy** — `getRaw()` defers the `window.SubwayBuilderAPI` lookup so test environments (no `window`) can import `mod-state` without erroring at module evaluation. Added `storage` namespace to the wrapper. Fixed `onDemandChange` signature to accept `popCount: number` per the actual game API.
+- **`src/state/mod-state.test.ts`** — 12 vitest cases: fresh init, persist roundtrip with replay, preserved-case detection (no double-application), baseline-shift drop + rebaseline, new-point capture, JSON-roundtrip safety, day-tick persistence cadence, dirty-tracking, no-mutation-from-onDemandChange invariant, no-persist-on-failed-mutation. **57/57 tests passing total** (24 stage 1 + 21 mutator + 12 mod-state). Typecheck clean. Bundle 53.16 kB.
+
+### API edge cases discovered
+- **`window.SubwayBuilderAPI` lookup at module-eval was a test blocker.** The original `api.ts` threw at import time if the global was missing, which broke vitest the moment a test file transitively imported `api.ts`. Made the lookup lazy — first wrapper-method call is what enforces presence. `apiVersion` falls back to `'unset'` in test env.
+- **`onDemandChange` callback signature was wrong** in the wrapper (`() => void`) — actual game passes `popCount: number`. Fixed.
+- **`getDemandData()` is typed `DemandData | null`** in the bundled API; the wrapper hides the null for ergonomics, and consumers do their own defensive null check (mod-state.doInit and the panel both do).
+- No new instances of stale-bundled-`.d.ts` this session (still 4 total).
+
+### Blocked / uncertain
+- **Don't yet know** which save/load case the game actually does (preserved vs reset). The reconciliation logic handles both; load it in-game and the debug panel's `lastHydrate` line will report which path fired. **This is the biggest thing to verify in-game next.**
+- **Pop sizes through save/load** — same uncertainty. If pops are preserved but DemandPoint aggregates are reset (or vice versa), the per-point preserved/reset detection could disagree with the per-pop reality. We treat the per-DemandPoint check as authoritative for now; if we see weird in-game results, add a per-pop sanity check.
+- **Mode-share fields and TOD scoring don't yet recompute after a mutation** — the scoring functions read `residentModeShare.transit` etc. as-is. After a Pop is rescaled, the underlying mode-share doesn't auto-update on the DemandPoint (those fields are aggregates the game maintains, not derived live). Probably fine for v1 since the proportional scaling assumption is "new residents look like existing" — mode share at the point is unchanged in proportion. Worth confirming in-game whether `residentModeShare` updates after a mutation, or stays frozen at city-load values.
+- **`utils` is now a Proxy** so it stays lazy and typed-`any` — the existing usage site (`utils.components.Button`) continues to work but TS won't catch typos. Fine for now.
+
+### Next session
+1. **Verify the load-replay path in-game.** Smoke procedure: load a save, pin a station, poke +500 residents three times, click Persist Now, save the game, restart the app, load the save, open the panel → `lastHydrate` should say `preserved 1` or `replayed 1` (and we'll know which case the game actually does). Also confirm the affected DemandPoint's residents and the rescaled pop sizes look right.
+2. **`src/sim/deals.ts`** — deal data model + lifecycle (housing / commercial / mixed; proposed → active → completed → cancelled). Daily delta distribution across walkshed points weighted by distance decay. Validity check (ghost-town rejection at proposal time, not just on apply). All deltas go through `state.applyDensityDelta` so the state-tracking + persistence wiring just works.
+3. **Deals tab UI** + propose-deal modal — only after the data model is in.
+4. **Optional**: a "what-if" preview mode that applies a deal in a SHADOW mutator (separate from the live one) so the player can see projected ridership impact before committing money. Stretch.
+
+### Followups (carried forward)
+- Upstream JSX runtime bug — still open.
+- Stale bundled `.d.ts` types — hit count still 4.
+- Visual differentiation of pin color (residential / commercial / risk) — deferred.
+- Approach B "slow transit" filter — deferred.
+- In-both-lists live-work badge — deferred.
+- Verify `residentModeShare` / `workerModeShare` update after a Pop-scaling mutation, or stay frozen at city-load values.
 
 ---
 
