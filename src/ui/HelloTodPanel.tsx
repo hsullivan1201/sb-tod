@@ -822,7 +822,7 @@ function DebugTodSection({
 
       if (r.ok) {
         setLast(
-          `OK: ${kind} ${amount > 0 ? '+' : ''}${amount} on point ${target.point.id} (${pinned.name} walkshed). Affected ${r.affectedPops} pops. Cumulative now ${r.cumulativeDelta.jobs}j/${r.cumulativeDelta.residents}r.`
+          `OK: ${kind} ${amount > 0 ? '+' : ''}${amount} on point ${target.point.id} (${pinned.name} walkshed). Affected ${r.affectedPops} pops. Splits: +${r.splitsCreated} / -${r.splitsRemoved}. Cumulative now ${r.cumulativeDelta.jobs}j/${r.cumulativeDelta.residents}r.`
         );
         onAfter();
       } else {

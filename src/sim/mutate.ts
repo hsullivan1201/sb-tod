@@ -18,6 +18,25 @@
  * floating point: applying +N then -N restores pop.size to baseline
  * bit-for-bit, with no compounding drift.
  *
+ * Pop splitting
+ * -------------
+ * The naïve version above produces pops of arbitrary size when deltas
+ * are large. The game's pop-as-atomic-boarding-unit model then breaks:
+ * a pop of 2000 commuters can't board any single train, so everyone
+ * just stacks up at the platform. We observed this in-game testing a
+ * mega-development (3 pops of size ~1967 on one point).
+ *
+ * Solution: when a pop's scaled size exceeds `splitThreshold`, clone
+ * the pop N times (same residenceId, jobId, timing, mode share, etc.),
+ * each with size = target / N. All N units board independently. The
+ * original pop stays in popsMap as one of the N units; we track the
+ * derived children in `splitChildren`.
+ *
+ * Reversal: setting the cumulative delta back to zero yields a target
+ * size at or below baseline, which is always ≤ threshold (we assume
+ * baselines are boardable — the game authored them that way). So
+ * splits collapse cleanly back to a single pop on revert.
+ *
  * Tagged writes: mutated DemandPoints are tracked in a WeakSet so the
  * `onDemandChange` handler can ignore self-emissions and avoid the
  * unbounded feedback loop that would result from reacting to our own
@@ -27,6 +46,8 @@
 import type { DemandData, DemandPoint, Pop, PointDelta } from '../types';
 
 export type DeltaSourceKind = 'deals' | 'organic';
+
+export const SPLIT_POP_PREFIX = 'sb-tod-split:';
 
 export interface DemandDelta {
   jobs?: number;
@@ -38,8 +59,12 @@ export interface ApplyOk {
   pointId: string;
   /** What this individual call added to the cumulative buckets. */
   appliedDelta: { jobs: number; residents: number };
-  /** Number of pops whose size was rescaled. */
+  /** Number of original pops whose group size was recomputed. */
   affectedPops: number;
+  /** Number of new split children created this call. */
+  splitsCreated: number;
+  /** Number of split children retired this call (due to delta shrinking). */
+  splitsRemoved: number;
   /** Total cumulative delta on this point after the call (sum of all sources). */
   cumulativeDelta: { jobs: number; residents: number };
 }
@@ -73,20 +98,30 @@ export interface MutatorOptions {
    * rejected wholesale (the mutation is rolled back). No silent clamping.
    */
   minFloor?: number;
+  /**
+   * When a pop's scaled size exceeds this, clone it into N sub-pops so
+   * each one boards atomically. Default 200 — comfortably below typical
+   * train capacity. Set to Infinity to disable splitting (legacy
+   * single-pop behavior).
+   */
+  splitThreshold?: number;
 }
 
 export interface MutatorSnapshot {
   baselineDemand: ReadonlyMap<string, { jobs: number; residents: number }>;
   baselinePopSizes: ReadonlyMap<string, number>;
   cumulativeDeltas: ReadonlyMap<string, PointDelta>;
+  /** originalPopId → list of split child pop IDs currently live in popsMap. */
+  splitChildren: ReadonlyMap<string, string[]>;
 }
 
 export interface DemandMutator {
   /**
    * Apply an incremental density delta to a point. Updates the point's
    * aggregates AND rescales every pop whose residence or job is at this
-   * point, baseline-anchored. Returns a result; does not throw on
-   * validation failures.
+   * point, baseline-anchored. May create or retire split children as
+   * the post-mutation size crosses `splitThreshold`. Returns a result;
+   * does not throw on validation failures.
    */
   applyDensityDelta(
     pointId: string,
@@ -109,9 +144,9 @@ export interface DemandMutator {
   captureBaselines(): void;
 
   /**
-   * Restore every touched point and pop to its captured baseline.
-   * Clears all cumulative deltas. Touched-but-since-deleted entities
-   * are silently skipped.
+   * Restore every touched point and pop to its captured baseline AND
+   * delete every split child from popsMap / DemandPoint.popIds. Clears
+   * all cumulative deltas.
    */
   revertAll(): void;
 
@@ -119,17 +154,19 @@ export interface DemandMutator {
   snapshot(): MutatorSnapshot;
 
   /**
-   * Hydrate tracking state (baselines + cumulative deltas) from a
-   * previously-captured snapshot WITHOUT applying deltas to live
-   * demand. Use this when the game itself preserved our mutations
-   * across save/load — the aggregates and pop sizes are already
-   * correct in `demand`, we just need to re-establish our tracking.
+   * Hydrate tracking state (baselines + cumulative deltas + split
+   * children) from a previously-captured snapshot WITHOUT applying
+   * deltas to live demand. Use this when the game itself preserved
+   * our mutations across save/load — the aggregates, pop sizes, and
+   * split pop entries are already correct in `demand`, we just need
+   * to re-establish our tracking.
    * Clears any existing tracking state first (last-write-wins).
    */
   hydrateTracking(persisted: {
     baselineDemand: Iterable<readonly [string, { jobs: number; residents: number }]>;
     baselinePopSizes: Iterable<readonly [string, number]>;
     cumulativeDeltas: Iterable<readonly [string, PointDelta]>;
+    splitChildren?: Iterable<readonly [string, string[]]>;
   }): void;
 }
 
@@ -152,16 +189,22 @@ const sourceField: Record<DeltaSourceKind, 'fromDeals' | 'fromOrganic'> = {
   organic: 'fromOrganic',
 };
 
+function isSplitChildId(id: string): boolean {
+  return id.startsWith(SPLIT_POP_PREFIX);
+}
+
 export function createMutator(
   demand: DemandData,
   options: MutatorOptions = {}
 ): DemandMutator {
   const ghostTownThreshold = options.ghostTownThreshold ?? 0;
   const minFloor = options.minFloor ?? 0;
+  const splitThreshold = options.splitThreshold ?? 200;
 
   const baselineDemand = new Map<string, { jobs: number; residents: number }>();
   const baselinePopSizes = new Map<string, number>();
   const cumulativeDeltas = new Map<string, PointDelta>();
+  const splitChildren = new Map<string, string[]>();
   const tagged = new WeakSet<DemandPoint>();
 
   function ensurePointBaseline(point: DemandPoint): { jobs: number; residents: number } {
@@ -207,6 +250,113 @@ export function createMutator(
     return (baseline.jobs + total) / baseline.jobs;
   }
 
+  function addPopIdToPoint(pointId: string, popId: string): void {
+    const pt = demand.points.get(pointId);
+    if (!pt) return;
+    if (!pt.popIds.includes(popId)) {
+      pt.popIds = [...pt.popIds, popId];
+      tagged.add(pt);
+    }
+  }
+
+  function removePopIdFromPoint(pointId: string, popId: string): void {
+    const pt = demand.points.get(pointId);
+    if (!pt) return;
+    if (pt.popIds.includes(popId)) {
+      pt.popIds = pt.popIds.filter((id) => id !== popId);
+      tagged.add(pt);
+    }
+  }
+
+  function nextChildId(originalId: string, takenIndex: number): string {
+    // Base format: sb-tod-split:<originalId>:<n>. If that's already
+    // in popsMap (shouldn't happen but we're defensive), bump.
+    let id = `${SPLIT_POP_PREFIX}${originalId}:${takenIndex}`;
+    let bump = 0;
+    while (demand.popsMap.has(id)) {
+      bump++;
+      id = `${SPLIT_POP_PREFIX}${originalId}:${takenIndex}:${bump}`;
+    }
+    return id;
+  }
+
+  /**
+   * Reconcile one pop's split group to a target total size.
+   *
+   * Total is distributed evenly across N units (original pop + N−1
+   * children). Children are created or retired as needed so live
+   * popsMap matches the desired N.
+   *
+   * The effective per-unit ceiling is `max(splitThreshold, baselineSize)`.
+   * Rationale: the game authored this pop at baselineSize, so we assume
+   * that size is already boardable (otherwise the base game is broken).
+   * Splitting below the game's own granularity creates churn on reverse:
+   * target = baseline at zero delta, and we'd otherwise fragment the
+   * original pop into a bunch of tiny pieces. With this ceiling, reverse
+   * always collapses cleanly back to 1 unit at exactly baselineSize.
+   */
+  function reconcilePopGroup(
+    originalPop: Pop,
+    targetTotalSize: number,
+    baselineSize: number
+  ): { created: number; removed: number } {
+    const effectiveThreshold = Math.max(splitThreshold, baselineSize);
+    const totalUnits = Math.max(1, Math.ceil(targetTotalSize / effectiveThreshold));
+    const desiredChildCount = totalUnits - 1;
+
+    // Load existing children, dropping any that have since disappeared
+    // from popsMap (game reset, manual deletion, etc.).
+    const existing = (splitChildren.get(originalPop.id) ?? []).filter((id) =>
+      demand.popsMap.has(id)
+    );
+
+    let created = 0;
+    let removed = 0;
+
+    // Shrink if too many.
+    while (existing.length > desiredChildCount) {
+      const childId = existing.pop()!;
+      demand.popsMap.delete(childId);
+      removePopIdFromPoint(originalPop.residenceId, childId);
+      if (originalPop.jobId !== originalPop.residenceId) {
+        removePopIdFromPoint(originalPop.jobId, childId);
+      }
+      removed++;
+    }
+
+    // Grow if too few.
+    while (existing.length < desiredChildCount) {
+      const childId = nextChildId(originalPop.id, existing.length);
+      const childPop: Pop = {
+        ...originalPop,
+        id: childId,
+        size: 0, // will be set below
+      };
+      demand.popsMap.set(childId, childPop);
+      addPopIdToPoint(originalPop.residenceId, childId);
+      if (originalPop.jobId !== originalPop.residenceId) {
+        addPopIdToPoint(originalPop.jobId, childId);
+      }
+      existing.push(childId);
+      created++;
+    }
+
+    if (existing.length > 0) splitChildren.set(originalPop.id, existing);
+    else splitChildren.delete(originalPop.id);
+
+    // Distribute the target size evenly. Even distribution keeps the
+    // math simple and matches the "no one pop is special" semantics:
+    // no child is any more real than any other.
+    const perUnit = targetTotalSize / totalUnits;
+    originalPop.size = perUnit;
+    for (const id of existing) {
+      const child = demand.popsMap.get(id);
+      if (child) child.size = perUnit;
+    }
+
+    return { created, removed };
+  }
+
   function applyDensityDelta(
     pointId: string,
     delta: DemandDelta,
@@ -245,6 +395,8 @@ export function createMutator(
         pointId,
         appliedDelta: { jobs: 0, residents: 0 },
         affectedPops: 0,
+        splitsCreated: 0,
+        splitsRemoved: 0,
         cumulativeDelta: totals,
       };
     }
@@ -297,20 +449,28 @@ export function createMutator(
       };
     }
 
-    // Rescale every pop whose residence OR job is at this point. A pop
-    // whose other side is at a different mutated point is recomputed as
-    // the full product over both ratios; non-mutated points contribute 1.
-    let affected = 0;
+    // First find the ORIGINAL pops affected by this mutation. Snapshot
+    // to an array so we don't reprocess split children we create during
+    // the loop (Map iteration includes entries added mid-iteration).
+    const affectedOriginals: Pop[] = [];
     for (const pop of demand.popsMap.values()) {
+      if (isSplitChildId(pop.id)) continue;
       const homeAtP = pop.residenceId === pointId;
       const jobAtP = pop.jobId === pointId;
       if (!homeAtP && !jobAtP) continue;
+      affectedOriginals.push(pop);
+    }
 
+    let totalCreated = 0;
+    let totalRemoved = 0;
+    for (const pop of affectedOriginals) {
       const baselineSize = ensurePopBaseline(pop);
       const rRatio = residentsRatioFor(pop.residenceId);
       const jRatio = jobsRatioFor(pop.jobId);
-      pop.size = baselineSize * rRatio * jRatio;
-      affected++;
+      const target = baselineSize * rRatio * jRatio;
+      const { created, removed } = reconcilePopGroup(pop, target, baselineSize);
+      totalCreated += created;
+      totalRemoved += removed;
     }
 
     point.jobs = nextJobs;
@@ -321,7 +481,9 @@ export function createMutator(
       ok: true,
       pointId,
       appliedDelta: { jobs: dJobs, residents: dRes },
-      affectedPops: affected,
+      affectedPops: affectedOriginals.length,
+      splitsCreated: totalCreated,
+      splitsRemoved: totalRemoved,
       cumulativeDelta: totals,
     };
   }
@@ -331,11 +493,30 @@ export function createMutator(
       ensurePointBaseline(point);
     }
     for (const pop of demand.popsMap.values()) {
+      // Skip our own split children if they're somehow in popsMap at
+      // capture time (shouldn't happen for a fresh init, but defensive).
+      if (isSplitChildId(pop.id)) continue;
       ensurePopBaseline(pop);
     }
   }
 
   function revertAll(): void {
+    // Tear down all split children first. We walk splitChildren rather
+    // than popsMap so we know which IDs are ours to delete.
+    for (const [originalId, childIds] of splitChildren) {
+      const original = demand.popsMap.get(originalId);
+      for (const childId of childIds) {
+        demand.popsMap.delete(childId);
+        if (original) {
+          removePopIdFromPoint(original.residenceId, childId);
+          if (original.jobId !== original.residenceId) {
+            removePopIdFromPoint(original.jobId, childId);
+          }
+        }
+      }
+    }
+    splitChildren.clear();
+
     for (const [pointId, baseline] of baselineDemand) {
       const point = demand.points.get(pointId);
       if (!point) continue;
@@ -374,12 +555,14 @@ export function createMutator(
         baselineDemand,
         baselinePopSizes,
         cumulativeDeltas,
+        splitChildren,
       };
     },
     hydrateTracking(persisted) {
       baselineDemand.clear();
       baselinePopSizes.clear();
       cumulativeDeltas.clear();
+      splitChildren.clear();
       for (const [id, b] of persisted.baselineDemand) {
         baselineDemand.set(id, { jobs: b.jobs, residents: b.residents });
       }
@@ -391,6 +574,11 @@ export function createMutator(
           jobs: { fromDeals: d.jobs.fromDeals, fromOrganic: d.jobs.fromOrganic },
           residents: { fromDeals: d.residents.fromDeals, fromOrganic: d.residents.fromOrganic },
         });
+      }
+      if (persisted.splitChildren) {
+        for (const [id, children] of persisted.splitChildren) {
+          if (children.length > 0) splitChildren.set(id, [...children]);
+        }
       }
     },
   };

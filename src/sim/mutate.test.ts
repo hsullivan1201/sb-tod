@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DemandData, DemandPoint, Pop } from '../types';
-import { createMutator } from './mutate';
+import { createMutator, SPLIT_POP_PREFIX } from './mutate';
 
 function point(
   id: string,
@@ -96,7 +96,9 @@ describe('proportional Pop scaling (decision 1a)', () => {
     const P = point('P', 1000, 1000);
     const pops = [pop('x', 'P', 'P', 100)]; // lives AND works at P
     const demand = fixture([P], pops);
-    const m = createMutator(demand);
+    // Use Infinity so this math test isolates the compound-ratio logic
+    // from the split logic. (Split behavior has its own tests below.)
+    const m = createMutator(demand, { splitThreshold: Infinity });
 
     // Add 50% residents and 50% jobs to P.
     m.applyDensityDelta('P', { residents: 500 }, 'deals');
@@ -344,6 +346,151 @@ describe('ghost-town rejection', () => {
     expect(r.reason).toBe('negative-result');
     expect(P.residents).toBe(1000); // rolled back
     expect(m.getCumulativeDeltaTotal('P')).toEqual({ jobs: 0, residents: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pop splitting — prevents mega-pops that exceed train capacity
+// ---------------------------------------------------------------------------
+describe('pop splitting', () => {
+  it('splits a pop into N units when scaled size crosses the threshold', () => {
+    // Baseline pop of 150, threshold 200. Scale to 3x → 450 → ceil(450/200) = 3 units of 150 each.
+    const P = point('P', 0, 100);
+    const x = pop('x', 'P', 'P', 150);
+    const demand = fixture([P], [x]);
+    const m = createMutator(demand, { splitThreshold: 200 });
+
+    const r = m.applyDensityDelta('P', { residents: 200 }, 'deals');
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.splitsCreated).toBe(2);
+    expect(r.splitsRemoved).toBe(0);
+
+    // Original plus 2 children, each 450/3 = 150.
+    expect(demand.popsMap.size).toBe(3);
+    expect(demand.popsMap.get('x')!.size).toBeCloseTo(150, 10);
+    const childIds = [...demand.popsMap.keys()].filter((id) => id !== 'x');
+    expect(childIds.length).toBe(2);
+    for (const id of childIds) {
+      expect(id.startsWith(SPLIT_POP_PREFIX)).toBe(true);
+      expect(demand.popsMap.get(id)!.size).toBeCloseTo(150, 10);
+      expect(demand.popsMap.get(id)!.residenceId).toBe('P');
+      expect(demand.popsMap.get(id)!.jobId).toBe('P');
+    }
+  });
+
+  it('adds child pop IDs to the residence AND job DemandPoint popIds arrays', () => {
+    const P = point('P', 200, 100); // residence for x
+    const Q = point('Q', 100, 100); // job for x
+    const x = pop('x', 'P', 'Q', 150);
+    const demand = fixture([P, Q], [x]);
+    const m = createMutator(demand, { splitThreshold: 200 });
+
+    m.applyDensityDelta('P', { residents: 200 }, 'deals');
+
+    const childIds = [...demand.popsMap.keys()].filter((id) => id !== 'x');
+    // Both P and Q should carry the child IDs in their popIds.
+    for (const cid of childIds) {
+      expect(P.popIds).toContain(cid);
+      expect(Q.popIds).toContain(cid);
+    }
+  });
+
+  it('retires splits when the delta is reduced back below the threshold', () => {
+    const P = point('P', 0, 100);
+    const x = pop('x', 'P', 'P', 150);
+    const demand = fixture([P], [x]);
+    const m = createMutator(demand, { splitThreshold: 200 });
+
+    m.applyDensityDelta('P', { residents: 200 }, 'deals'); // 3 units
+    expect(demand.popsMap.size).toBe(3);
+
+    const r = m.applyDensityDelta('P', { residents: -200 }, 'deals'); // back to baseline, 1 unit
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.splitsRemoved).toBe(2);
+    expect(demand.popsMap.size).toBe(1);
+    expect(demand.popsMap.get('x')!.size).toBe(150); // exact baseline
+  });
+
+  it('grows the split count when target scales further', () => {
+    const P = point('P', 0, 100);
+    const x = pop('x', 'P', 'P', 150);
+    const demand = fixture([P], [x]);
+    const m = createMutator(demand, { splitThreshold: 200 });
+
+    m.applyDensityDelta('P', { residents: 100 }, 'deals'); // 150 * 2 = 300 → ceil(300/200) = 2 units
+    expect(demand.popsMap.size).toBe(2);
+
+    const r = m.applyDensityDelta('P', { residents: 900 }, 'deals'); // now 150 * 11 = 1650 → ceil(1650/200) = 9 units
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(demand.popsMap.size).toBe(9);
+    // Each unit should be 1650 / 9 ≈ 183.33, well under threshold.
+    for (const p of demand.popsMap.values()) {
+      expect(p.size).toBeCloseTo(1650 / 9, 8);
+      expect(p.size).toBeLessThanOrEqual(200);
+    }
+  });
+
+  it('revertAll deletes all split children and restores the original pop size', () => {
+    const P = point('P', 0, 100);
+    const x = pop('x', 'P', 'P', 150);
+    const demand = fixture([P], [x]);
+    const m = createMutator(demand, { splitThreshold: 200 });
+
+    m.applyDensityDelta('P', { residents: 500 }, 'deals');
+    expect(demand.popsMap.size).toBeGreaterThan(1);
+    const prevChildIds = [...demand.popsMap.keys()].filter((id) => id !== 'x');
+    for (const cid of prevChildIds) expect(P.popIds).toContain(cid);
+
+    m.revertAll();
+
+    expect(demand.popsMap.size).toBe(1);
+    expect(demand.popsMap.has('x')).toBe(true);
+    expect(demand.popsMap.get('x')!.size).toBe(150);
+    // Child ids are gone from the DemandPoint popIds.
+    for (const cid of prevChildIds) expect(P.popIds).not.toContain(cid);
+  });
+
+  it('does not split when scaled size is at or below the threshold', () => {
+    const P = point('P', 0, 100);
+    const x = pop('x', 'P', 'P', 100);
+    const demand = fixture([P], [x]);
+    const m = createMutator(demand, { splitThreshold: 200 });
+
+    m.applyDensityDelta('P', { residents: 100 }, 'deals'); // 100 * 2 = 200 → exactly threshold, 1 unit
+    expect(demand.popsMap.size).toBe(1);
+    expect(demand.popsMap.get('x')!.size).toBeCloseTo(200, 10);
+  });
+
+  it('legacy behavior: splitThreshold Infinity disables splitting entirely', () => {
+    const P = point('P', 0, 100);
+    const x = pop('x', 'P', 'P', 100);
+    const demand = fixture([P], [x]);
+    const m = createMutator(demand, { splitThreshold: Infinity });
+
+    m.applyDensityDelta('P', { residents: 1000 }, 'deals'); // massive scale, would normally split
+    expect(demand.popsMap.size).toBe(1);
+    // With splitting disabled, the pop just carries the whole target size.
+    expect(demand.popsMap.get('x')!.size).toBeCloseTo(1100, 8);
+  });
+
+  it('snapshot().splitChildren reflects the live set; hydrateTracking round-trips it', () => {
+    const P = point('P', 0, 100);
+    const x = pop('x', 'P', 'P', 150);
+    const demand = fixture([P], [x]);
+    const m = createMutator(demand, { splitThreshold: 200 });
+
+    m.applyDensityDelta('P', { residents: 500 }, 'deals');
+    const snap = m.snapshot();
+    expect(snap.splitChildren.get('x')?.length).toBeGreaterThan(0);
+
+    // Build a fresh mutator over the same demand and hydrate it.
+    const m2 = createMutator(demand, { splitThreshold: 200 });
+    m2.hydrateTracking(snap);
+    const snap2 = m2.snapshot();
+    expect([...snap2.splitChildren.get('x')!]).toEqual([...snap.splitChildren.get('x')!]);
   });
 });
 

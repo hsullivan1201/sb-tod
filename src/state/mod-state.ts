@@ -66,6 +66,12 @@ export interface PersistedState {
   baselineDemand: Array<[string, { jobs: number; residents: number }]>;
   baselinePopSizes: Array<[string, number]>;
   cumulativeDeltas: Array<[string, PointDelta]>;
+  /**
+   * originalPopId → list of split child pop IDs. Present only when
+   * splits were created during the persisted session. Absent / empty
+   * arrays are equivalent to "no splits for that pop".
+   */
+  splitChildren?: Array<[string, string[]]>;
 }
 
 export interface ModStateStats {
@@ -361,6 +367,10 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
           },
         },
       ]),
+      splitChildren: [...snap.splitChildren.entries()].map(([id, children]) => [
+        id,
+        [...children],
+      ]),
     };
     const storageKey = makeStorageKey(currentSaveName);
     try {
@@ -612,6 +622,7 @@ function resetCumulativeFor(mutator: DemandMutator, pointId: string): void {
     baselineDemand: snap.baselineDemand,
     baselinePopSizes: snap.baselinePopSizes,
     cumulativeDeltas: nextDeltas,
+    splitChildren: snap.splitChildren,
   });
 }
 
@@ -625,6 +636,7 @@ function rebaselineTo(mutator: DemandMutator, point: DemandPoint): void {
     baselineDemand: nextBaselines,
     baselinePopSizes: snap.baselinePopSizes,
     cumulativeDeltas: nextDeltas,
+    splitChildren: snap.splitChildren,
   });
 }
 
