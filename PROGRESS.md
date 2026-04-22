@@ -127,15 +127,21 @@ no room" while restoring meaningful headroom elsewhere.
    no-traffic stations. Always wrap `getStationRidership(id)` in try/catch
    and treat missing as 0.
 
-### What "stage 2" means and why it's not started yet
-Stage 2 closes the feedback loop. The plan: snapshot baseline densities
-on first day, persist deltas via `api.storage`, mutate
-`DemandPoint.jobs` / `.residents` on `onDayChange` based on TOD scores,
-replay deltas on `onGameLoaded`. Probe 2 confirmed the mutation works
-(reference assignment persists across game days; see
-`probe-2-findings.md`). The hard part is the persistence + replay
-correctness, not the mutation itself. The user explicitly wants to
-hold off until we re-architect a bit; until then, Stage 1 is the ship.
+### Stage 2 status (in progress)
+Stage 2 closes the feedback loop. The mutator primitive
+(`src/sim/mutate.ts`, session 5) is landed and tested but not yet wired
+into the runtime — nothing currently *calls* it. Next up is mod-state
+scaffolding (baselines / deltas / deals) and hook wiring so the mutator
+actually runs on `onDayChange` and gets replayed on `onGameLoaded`. The
+hard part is persistence + replay correctness, not the mutation itself.
+
+**The single most important design decision for stage 2 is 1a in
+ARCHITECTURE.md**: DemandPoint.jobs/residents are aggregates, but the
+sim iterates Pops. Mutating the point alone is cosmetic; we must *also*
+rescale the relevant Pops. The mutator does this via proportional Pop
+scaling anchored on captured baselines (so reversal is bit-exact).
+Ghost-town points (zero baseline in a dimension) are rejected — we
+can't bootstrap density where no pops originate.
 
 ### Quick references
 - `HANDOFF.md`, `probe-1-findings.md`, `probe-2-findings.md` —
@@ -145,6 +151,39 @@ hold off until we re-architect a bit; until then, Stage 1 is the ship.
 - Template repo: https://github.com/Subway-Builder-Modded/template-mod
 - Reference mod (analytics + storage + UI patterns):
   https://github.com/stefanorigano/advanced_analytics
+
+---
+
+## Session 5 — 2026-04-22 — Stage 2 mutator primitive
+
+### Built
+- **`src/sim/mutate.ts`** — the `DemandMutator`, the single seam through which all TOD writes touch demand state. Implements ARCHITECTURE decision 1a: proportional Pop scaling, baseline-anchored. `applyDensityDelta(pointId, {jobs?, residents?}, source)` updates the point's aggregate fields AND rescales every pop whose `residenceId` or `jobId` is at that point, as `pop.size = pop.baselineSize × residenceRatio × jobRatio`. Ratios recomputed per call from captured baselines and cumulative deltas. No compound drift.
+- **Separate delta buckets** (`fromDeals` / `fromOrganic`) per point per dimension, matching the `PointDelta` type already in `types.ts`. Enables attribution in the eventual dashboard.
+- **Ghost-town guard**: positive residents delta rejected if baseline.residents ≤ threshold; same for jobs. Mixed deltas are atomic — if either dimension's guard fails, neither is applied. Configurable threshold (default 0).
+- **Negative-result floor**: a delta that would drive a count below 0 (configurable) is rejected wholesale and the cumulative bucket rolled back. No silent clamping.
+- **Reentrancy guard** via `WeakSet<DemandPoint>` of tagged writes; `isTaggedWrite(point)` tells the (future) `onDemandChange` handler to ignore self-emissions, blocking the feedback-loop scenario.
+- **`captureBaselines()` / `revertAll()` / `snapshot()`** — lifecycle hooks for first-day baseline capture, full rollback, and serialization. No live callers yet.
+- **`src/sim/mutate.test.ts`** — 21 new vitest cases covering the four required scenarios from the prompt (proportional scaling, reversal exactness, baseline anchoring, ghost-town rejection) plus surface checks. 45/45 tests passing overall (24 from stage 1 preserved).
+
+### API edge cases discovered
+None new this session. Mutator is pure-function-plus-Map-mutation over the `DemandData` shape already confirmed in probe-2; no API surface was exercised beyond reading/writing `DemandPoint.jobs`, `DemandPoint.residents`, and `Pop.size`.
+
+### Blocked / uncertain
+- **No runtime caller yet.** The mutator is a module plus tests. Nothing in `main.ts` or the UI invokes it. This is intentional — decision 3 says build it in isolation, then wire.
+- **Save/load behavior still unknown** (open question #4 from probe-2). The delta-not-absolute design in decision 2 is specifically defensive against this. Next session's mod-state module needs to persist deltas + baselines via `api.storage` and replay on `onGameLoaded`. This is where the storage-unreliability gotcha from probe 1 will matter.
+- **Performance on large maps.** Each mutation does a linear scan of `popsMap` looking for pops linked to the point. On a map with 100k pops and ~20 mutations per game day that's 2M pop-touches/day. Probably fine; if not, build a reverse index at baseline-capture time.
+
+### Next session
+1. **`src/state/mod-state.ts`** — in-memory mod state keyed off baseline-capture on first `onDayChange` (or first-day-ready hook). Persists snapshot to `api.storage` on `onGameSaved` and on day checkpoints. Replays deltas from storage on `onGameLoaded` by calling `mutator.captureBaselines()` then reapplying cumulative deltas via `applyDensityDelta`. In-memory is source of truth per gotcha #4 in the orientation.
+2. **A debug "poke density" button** in the existing Hello-TOD panel for manual in-game testing before we ship deals. One click applies a small residents delta to a chosen station's walkshed, prints a summary, and lets the user verify via the panel that ridership at that station's nearest stop responds over the next N game days. This is the fastest end-to-end smoke test of the mutator in-sim.
+3. **`src/sim/deals.ts`** deal data model (housing / commercial / mixed; lifecycle states; daily delta distribution across walkshed points) — only after the mutator is confirmed to work end-to-end in-game.
+
+### Followups (carried forward)
+- **Upstream JSX runtime bug** — still open.
+- **Stale bundled `.d.ts` types** — hit count still 4.
+- **Visual differentiation of pin color** (residential / commercial / risk) — deferred.
+- **Approach B "slow transit" filter** — deferred.
+- **In-both-lists live-work badge** — deferred.
 
 ---
 
