@@ -41,6 +41,7 @@ import {
 } from './storage-adapter';
 
 const STORAGE_KEY_PREFIX = 'sb-tod:state:v1:';
+const LEGACY_UNSEGMENTED_KEY = 'sb-tod:state:v1'; // pre-per-save key, cleaned up on init
 const UNSAVED_SLOT = '_unsaved';
 const APPROX_TOLERANCE = 1.0;
 
@@ -299,6 +300,18 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       console.log(
         `[sb-tod] No persisted state found at "${storageKey}". Captured ${mutator.snapshot().baselineDemand.size} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install or different save slot).`
       );
+    }
+
+    // One-shot cleanup: the pre-namespacing key sb-tod:state:v1 (no slot
+    // suffix) is orphan data that won't ever be read again. Best-effort
+    // delete from both backends; harmless to fail.
+    try {
+      await backend.delete(LEGACY_UNSEGMENTED_KEY).catch(() => {});
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(LEGACY_UNSEGMENTED_KEY);
+      }
+    } catch {
+      /* ignore */
     }
 
     initialized = true;
