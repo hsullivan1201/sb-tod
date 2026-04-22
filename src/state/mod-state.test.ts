@@ -166,7 +166,7 @@ describe('mod state — persist roundtrip', () => {
         ],
       ],
     };
-    await storage.set('sb-tod:state:v1', persisted);
+    await storage.set('sb-tod:state:v1:_unsaved', persisted);
 
     // Live demand is at 800 — baseline shifted (game patch, edited save, etc.).
     const B = point('P', 100, 800);
@@ -191,7 +191,7 @@ describe('mod state — persist roundtrip', () => {
       baselinePopSizes: [],
       cumulativeDeltas: [],
     };
-    await storage.set('sb-tod:state:v1', persisted);
+    await storage.set('sb-tod:state:v1:_unsaved', persisted);
 
     const P = point('P', 100, 1000);
     const Q_new = point('Q-new', 50, 50); // didn't exist when we last saved
@@ -213,7 +213,7 @@ describe('mod state — persist roundtrip', () => {
     await sessionA.persist();
 
     // Verify the stored value is JSON-roundtrippable.
-    const stored = storage._data.get('sb-tod:state:v1');
+    const stored = storage._data.get('sb-tod:state:v1:_unsaved');
     const cloned = JSON.parse(JSON.stringify(stored));
     expect(cloned.version).toBe(1);
     expect(cloned.baselineDemand[0][0]).toBe('P');
@@ -237,13 +237,13 @@ describe('mod state — lifecycle hooks', () => {
     });
     await state.ensureInit();
     state.applyDensityDelta('P', { residents: 50 }, 'deals');
-    expect(storage._data.has('sb-tod:state:v1')).toBe(false);
+    expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(false);
 
     state.onDayTick(5);
     // tick is sync but persist is async — wait a microtask.
     await Promise.resolve();
     await Promise.resolve();
-    expect(storage._data.has('sb-tod:state:v1')).toBe(true);
+    expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(true);
     expect(state.stats().lastDay).toBe(5);
     expect(state.stats().dayTicks).toBe(1);
   });
@@ -258,7 +258,7 @@ describe('mod state — lifecycle hooks', () => {
     state.onDayTick(3);
     await Promise.resolve();
     await Promise.resolve();
-    expect(storage._data.has('sb-tod:state:v1')).toBe(false);
+    expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(false);
   });
 
   it('counts onDemandChange events without ever mutating', async () => {
@@ -290,13 +290,96 @@ describe('mod state — applyDensityDelta + revert', () => {
     await state.ensureInit();
 
     expect(await state.persist()).toBe(true);
-    storage._data.delete('sb-tod:state:v1');
+    storage._data.delete('sb-tod:state:v1:_unsaved');
 
     state.applyDensityDelta('P', { residents: 100 }, 'deals');
     state.onDayTick(1);
     await Promise.resolve();
     await Promise.resolve();
-    expect(storage._data.has('sb-tod:state:v1')).toBe(true);
+    expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(true);
+  });
+
+  it('isolates state per save name (no cross-save bleed)', async () => {
+    const storage = makeStorage();
+    const A = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+
+    // Session on save "alpha": +200 residents.
+    const sessionAlpha = createModState({
+      storage,
+      getDemand: () => fixture([A], [x]),
+      initialSaveName: 'alpha',
+    });
+    await sessionAlpha.ensureInit();
+    sessionAlpha.applyDensityDelta('P', { residents: 200 }, 'deals');
+    await sessionAlpha.persist();
+    expect(storage._data.has('sb-tod:state:v1:alpha')).toBe(true);
+    expect(storage._data.has('sb-tod:state:v1:beta')).toBe(false);
+
+    // Fresh "beta" save with the same city — must NOT see alpha's deltas.
+    const Bp = point('P', 100, 1000);
+    const Bx = pop('x', 'P', 'P', 50);
+    const sessionBeta = createModState({
+      storage,
+      getDemand: () => fixture([Bp], [Bx]),
+      initialSaveName: 'beta',
+    });
+    await sessionBeta.ensureInit();
+    expect(sessionBeta.stats().lastHydrate?.fromStorage).toBe(false);
+    expect(sessionBeta.mutator().getCumulativeDeltaTotal('P')).toEqual({ jobs: 0, residents: 0 });
+    // Mutate beta; persist.
+    sessionBeta.applyDensityDelta('P', { residents: -50 }, 'deals');
+    await sessionBeta.persist();
+    expect(storage._data.has('sb-tod:state:v1:beta')).toBe(true);
+
+    // Re-open alpha — must still see +200, not -50.
+    const Ap2 = point('P', 100, 1000);
+    const Ax2 = pop('x', 'P', 'P', 50);
+    const sessionAlpha2 = createModState({
+      storage,
+      getDemand: () => fixture([Ap2], [Ax2]),
+      initialSaveName: 'alpha',
+    });
+    await sessionAlpha2.ensureInit();
+    expect(sessionAlpha2.mutator().getCumulativeDeltaTotal('P').residents).toBe(200);
+  });
+
+  it('switches to a new save via setCurrentSaveName, persisting old before re-init', async () => {
+    const storage = makeStorage();
+    const A = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const state = createModState({
+      storage,
+      getDemand: () => fixture([A], [x]),
+      initialSaveName: 'alpha',
+    });
+    await state.ensureInit();
+    state.applyDensityDelta('P', { residents: 100 }, 'deals');
+    // Switch saves WITHOUT explicit persist — setCurrentSaveName must save first.
+    await state.setCurrentSaveName('beta');
+    expect(storage._data.has('sb-tod:state:v1:alpha')).toBe(true);
+    expect(state.getCurrentSaveName()).toBe('beta');
+    // Beta starts fresh.
+    expect(state.mutator().getCumulativeDeltaTotal('P')).toEqual({ jobs: 0, residents: 0 });
+  });
+
+  it('onGameSavedFired with a new name updates the slot before persisting (save-as)', async () => {
+    const storage = makeStorage();
+    const A = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const state = createModState({
+      storage,
+      getDemand: () => fixture([A], [x]),
+      initialSaveName: 'alpha',
+    });
+    await state.ensureInit();
+    state.applyDensityDelta('P', { residents: 100 }, 'deals');
+    // Player did "save as alpha-copy". Game fires onGameSaved("alpha-copy").
+    state.onGameSavedFired('alpha-copy');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(state.getCurrentSaveName()).toBe('alpha-copy');
+    expect(storage._data.has('sb-tod:state:v1:alpha-copy')).toBe(true);
   });
 
   it('does not mark dirty on failed mutation (ghost-town reject)', async () => {
@@ -310,6 +393,6 @@ describe('mod state — applyDensityDelta + revert', () => {
     state.onDayTick(1);
     await Promise.resolve();
     await Promise.resolve();
-    expect(storage._data.has('sb-tod:state:v1')).toBe(false);
+    expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(false);
   });
 });

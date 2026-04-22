@@ -995,6 +995,8 @@ function DebugTodSection({
       <div style={{ color: 'rgba(255,255,255,0.4)', fontFamily: 'monospace', lineHeight: 1.5 }}>
         ready: {String(stats.initialized)} · day: {stats.lastDay ?? '—'} · ticks: {stats.dayTicks}
         <br />
+        save: {stats.currentSaveName ?? '<unsaved>'} · key: {stats.currentStorageKey}
+        <br />
         baselines: {stats.pointsTracked}p / {stats.popsTracked}pop · with deltas: {stats.pointsWithDeltas}
         <br />
         demandChange events: {stats.demandChangeEvents}
@@ -1013,11 +1015,17 @@ function DebugTodSection({
         {stats.initProbe && (
           <>
             <br />
-            init probe @ {new Date(stats.initProbe.at).toLocaleTimeString()}:
+            init probe @ {new Date(stats.initProbe.at).toLocaleTimeString()} (save: {stats.initProbe.saveName ?? '<unsaved>'}):
             <br />
             &nbsp;&nbsp;api: {stats.initProbe.apiHasOurKey ? '✓' : '✗'} {stats.initProbe.apiOurKeyShape} · {stats.initProbe.apiKeysAtInit.length} keys
             <br />
             &nbsp;&nbsp;localStorage: {stats.initProbe.localStorageAvailable ? 'avail' : 'NA'} · {stats.initProbe.localStorageHasOurKey ? '✓' : '✗'} {stats.initProbe.localStorageOurKeyShape} · {stats.initProbe.localStorageKeysAtInit.length} keys
+            {stats.initProbe.otherSaveKeys.length > 0 && (
+              <>
+                <br />
+                &nbsp;&nbsp;other save slots present: {stats.initProbe.otherSaveKeys.join(', ')}
+              </>
+            )}
           </>
         )}
       </div>

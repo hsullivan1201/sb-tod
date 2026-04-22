@@ -40,8 +40,13 @@ import {
   type StorageBackendKind,
 } from './storage-adapter';
 
-const STORAGE_KEY = 'sb-tod:state:v1';
+const STORAGE_KEY_PREFIX = 'sb-tod:state:v1:';
+const UNSAVED_SLOT = '_unsaved';
 const APPROX_TOLERANCE = 1.0;
+
+function makeStorageKey(saveName: string | null): string {
+  return STORAGE_KEY_PREFIX + (saveName ?? UNSAVED_SLOT);
+}
 
 export type HydrateOutcome = 'preserved' | 'replayed' | 'baseline-shift' | 'missing-point';
 
@@ -67,6 +72,10 @@ export interface ModStateStats {
   demandChangeEvents: number;
   dayTicks: number;
   lastDay: number | null;
+  /** Current save name (null = no save loaded yet, defaults to `_unsaved` slot). */
+  currentSaveName: string | null;
+  /** The actual storage key in use right now — handy for debugging cross-save bleed. */
+  currentStorageKey: string;
   /** true if set() resolved AND the immediate readback matched. */
   lastPersistOk: boolean | null;
   lastPersistAt: number | null;
@@ -88,6 +97,10 @@ export interface ModStateStats {
 
 export interface InitProbe {
   at: number;
+  /** Save name used to compute the key for THIS init. */
+  saveName: string | null;
+  /** The exact key we looked for. */
+  storageKey: string;
   apiKeysAtInit: string[];
   apiHasOurKey: boolean;
   apiOurKeyShape: string;
@@ -95,15 +108,19 @@ export interface InitProbe {
   localStorageKeysAtInit: string[];
   localStorageHasOurKey: boolean;
   localStorageOurKeyShape: string;
+  /** All keys (api + local) starting with our prefix — surfaces other saves. */
+  otherSaveKeys: string[];
 }
 
 function approxEq(a: number, b: number): boolean {
   return Math.abs(a - b) <= APPROX_TOLERANCE;
 }
 
-async function captureInitProbe(): Promise<InitProbe> {
+async function captureInitProbe(saveName: string | null, storageKey: string): Promise<InitProbe> {
   const probe: InitProbe = {
     at: Date.now(),
+    saveName,
+    storageKey,
     apiKeysAtInit: [],
     apiHasOurKey: false,
     apiOurKeyShape: 'null',
@@ -111,12 +128,17 @@ async function captureInitProbe(): Promise<InitProbe> {
     localStorageKeysAtInit: [],
     localStorageHasOurKey: false,
     localStorageOurKeyShape: 'null',
+    otherSaveKeys: [],
   };
+  const otherKeys = new Set<string>();
   // Lazy import to avoid pulling api at module-load time outside game.
   try {
     const apiMod = await import('../api');
     probe.apiKeysAtInit = await apiMod.storage.keys().catch(() => []);
-    const apiVal = await apiMod.storage.get<unknown>(STORAGE_KEY, null).catch(() => null);
+    for (const k of probe.apiKeysAtInit) {
+      if (k.startsWith(STORAGE_KEY_PREFIX) && k !== storageKey) otherKeys.add(`api:${k}`);
+    }
+    const apiVal = await apiMod.storage.get<unknown>(storageKey, null).catch(() => null);
     probe.apiHasOurKey = apiVal != null;
     probe.apiOurKeyShape = describeShape(apiVal);
   } catch {
@@ -127,9 +149,12 @@ async function captureInitProbe(): Promise<InitProbe> {
     try {
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
-        if (k != null) probe.localStorageKeysAtInit.push(k);
+        if (k != null) {
+          probe.localStorageKeysAtInit.push(k);
+          if (k.startsWith(STORAGE_KEY_PREFIX) && k !== storageKey) otherKeys.add(`local:${k}`);
+        }
       }
-      const lsRaw = localStorage.getItem(STORAGE_KEY);
+      const lsRaw = localStorage.getItem(storageKey);
       probe.localStorageHasOurKey = lsRaw != null;
       if (lsRaw != null) {
         try {
@@ -142,6 +167,7 @@ async function captureInitProbe(): Promise<InitProbe> {
       /* ignore */
     }
   }
+  probe.otherSaveKeys = [...otherKeys];
   return probe;
 }
 
@@ -166,10 +192,19 @@ export interface ModState {
   applyDensityDelta(pointId: string, delta: DemandDelta, source: DeltaSourceKind): ApplyResult;
   markDirty(): void;
   persist(): Promise<boolean>;
+  /**
+   * Switch the active save slot. If the current state is dirty, persist
+   * it under the OLD save name first (to not silently drop unsaved
+   * mutations), then drop in-memory state and re-init under the new name
+   * — which hydrates from the new save's persisted state if any exists.
+   * No-op if the name is unchanged.
+   */
+  setCurrentSaveName(name: string | null): Promise<void>;
+  getCurrentSaveName(): string | null;
   onDayTick(day: number): void;
   onDemandChangeFired(): void;
-  onGameSavedFired(): void;
-  onGameLoadedFired(): void;
+  onGameSavedFired(saveName?: string): void;
+  onGameLoadedFired(saveName?: string): void;
   stats(): ModStateStats;
   /** For tests — override the storage backend. */
   _setStorage(s: StorageLike): void;
@@ -188,6 +223,8 @@ export interface CreateModStateOptions {
   getDemand?: () => DemandData | null;
   /** Persist every N day ticks. Default 1 (every day). */
   persistEveryNDays?: number;
+  /** Initial save name. Default null (uses the `_unsaved` slot). */
+  initialSaveName?: string | null;
 }
 
 export function createModState(options: CreateModStateOptions = {}): ModState {
@@ -207,6 +244,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let storageRoundTripOk: boolean | null = null;
   let lastHydrate: HydrateReport | null = null;
   let initProbe: InitProbe | null = null;
+  let currentSaveName: string | null = options.initialSaveName ?? null;
   let initPromise: Promise<boolean> | null = null;
 
   async function doInit(providedDemand?: DemandData): Promise<boolean> {
@@ -217,17 +255,19 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     demand = d;
     mutator = createMutator(d);
 
+    const storageKey = makeStorageKey(currentSaveName);
+
     // Snapshot raw state of BOTH possible backends at init time so the
     // panel can show exactly what we saw, regardless of what the
     // adapter chose to surface. Crucial for diagnosing post-restart
-    // "where did my data go?" cases.
-    initProbe = await captureInitProbe();
+    // "where did my data go?" cases — and for spotting cross-save bleed.
+    initProbe = await captureInitProbe(currentSaveName, storageKey);
     console.log('[sb-tod] init probe:', initProbe);
 
     let persisted: PersistedState | null = null;
     let storageKeys: string[] = [];
     try {
-      persisted = await backend.get<PersistedState | null>(STORAGE_KEY, null);
+      persisted = await backend.get<PersistedState | null>(storageKey, null);
     } catch (err) {
       console.warn('[sb-tod] storage.get threw during init:', err);
       persisted = null;
@@ -241,7 +281,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     if (persisted && persisted.version === 1) {
       lastHydrate = applyPersisted(mutator, d, persisted);
       console.log(
-        `[sb-tod] Hydrated from storage (saved ${new Date(persisted.savedAt).toISOString()}): preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}. Storage keys: [${storageKeys.join(', ')}]`
+        `[sb-tod] Hydrated "${storageKey}" (saved ${new Date(persisted.savedAt).toISOString()}): preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}. Storage keys: [${storageKeys.join(', ')}]`
       );
     } else {
       // Fresh game (or first run, or persisted state was dropped). Capture
@@ -257,7 +297,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         fromStorage: false,
       };
       console.log(
-        `[sb-tod] No persisted state found at "${STORAGE_KEY}". Captured ${mutator.snapshot().baselineDemand.size} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install).`
+        `[sb-tod] No persisted state found at "${storageKey}". Captured ${mutator.snapshot().baselineDemand.size} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install or different save slot).`
       );
     }
 
@@ -309,15 +349,16 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         },
       ]),
     };
+    const storageKey = makeStorageKey(currentSaveName);
     try {
-      await backend.set(STORAGE_KEY, payload);
+      await backend.set(storageKey, payload);
       // Immediate round-trip verify. Probe 1 caught a case where set()
       // resolved but get() returned undefined — silent drop. If that's
       // happening here, surface it loudly; persistence is effectively
       // broken and we need to know before the user counts on a reload.
       let readback: PersistedState | null = null;
       try {
-        readback = await backend.get<PersistedState | null>(STORAGE_KEY, null);
+        readback = await backend.get<PersistedState | null>(storageKey, null);
       } catch (e) {
         console.warn('[sb-tod] readback during persist verify threw:', e);
       }
@@ -325,7 +366,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       storageRoundTripOk = matches;
       if (!matches) {
         console.warn(
-          `[sb-tod] storage round-trip MISMATCH after set("${STORAGE_KEY}"): wrote savedAt=${payload.savedAt} but readback=${readback ? `savedAt=${readback.savedAt}` : 'null'}. Data will not survive restart. (Browser mode? Known game flake? Check Electron / api.storage.)`
+          `[sb-tod] storage round-trip MISMATCH after set("${storageKey}"): wrote savedAt=${payload.savedAt} but readback=${readback ? `savedAt=${readback.savedAt}` : 'null'}. Data will not survive restart. (Browser mode? Known game flake? Check Electron / api.storage.)`
         );
         lastPersistOk = false;
         return false;
@@ -361,17 +402,48 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     // observability only — NEVER mutate from here (feedback-loop hazard)
   }
 
-  function onGameSavedFired(): void {
+  function onGameSavedFired(saveName?: string): void {
+    // If the player did "save as" with a new name, the in-memory state
+    // applies to the NEW save (it's what they were just playing). Switch
+    // the key without dropping in-memory; persist immediately.
+    if (saveName && saveName !== currentSaveName) {
+      currentSaveName = saveName;
+    }
     if (initialized && dirty) void persist();
   }
 
-  function onGameLoadedFired(): void {
-    // Reset so init can re-hydrate from storage against the new demand.
+  function onGameLoadedFired(saveName?: string): void {
+    // Loading a different save means switching slots: dump in-memory and
+    // hydrate from the new save's storage. setCurrentSaveName persists
+    // any unsaved deltas under the OLD name first, so nothing is lost.
+    if (saveName !== undefined && saveName !== currentSaveName) {
+      void setCurrentSaveName(saveName).catch((e) =>
+        console.warn('[sb-tod] setCurrentSaveName on game-load failed:', e)
+      );
+      return;
+    }
+    // Same save name (or undefined — game didn't tell us): just re-init
+    // to pick up whatever the game put in live demand.
     initialized = false;
     initPromise = null;
     mutator = null;
     demand = null;
     ensureInit().catch((e) => console.warn('[sb-tod] re-init after load failed:', e));
+  }
+
+  async function setCurrentSaveName(name: string | null): Promise<void> {
+    if (name === currentSaveName) return;
+    // Persist current state under the OLD name before switching, so any
+    // unsaved deltas don't vanish on cross-save load.
+    if (initialized && dirty) {
+      await persist().catch((e) => console.warn('[sb-tod] persist before save-switch failed:', e));
+    }
+    currentSaveName = name;
+    initialized = false;
+    initPromise = null;
+    mutator = null;
+    demand = null;
+    await ensureInit().catch((e) => console.warn('[sb-tod] re-init after save-switch failed:', e));
   }
 
   return {
@@ -387,6 +459,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       dirty = true;
     },
     persist,
+    setCurrentSaveName,
+    getCurrentSaveName: () => currentSaveName,
     onDayTick,
     onDemandChangeFired,
     onGameSavedFired,
@@ -400,6 +474,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         demandChangeEvents,
         dayTicks,
         lastDay,
+        currentSaveName,
+        currentStorageKey: makeStorageKey(currentSaveName),
         lastPersistOk,
         lastPersistAt,
         storageRoundTripOk,

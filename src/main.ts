@@ -74,10 +74,10 @@ hooks.onDemandChange(() => {
   getModState().onDemandChangeFired();
 });
 
-hooks.onGameSaved(() => {
-  getModState().onGameSavedFired();
+hooks.onGameSaved((saveName) => {
+  getModState().onGameSavedFired(saveName);
 });
 
-hooks.onGameLoaded(() => {
-  getModState().onGameLoadedFired();
+hooks.onGameLoaded((saveName) => {
+  getModState().onGameLoadedFired(saveName);
 });
