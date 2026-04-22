@@ -78,14 +78,78 @@ export interface ModStateStats {
   storageRoundTripOk: boolean | null;
   /** Which backend (api / local / none) the last successful persist used. */
   storageBackend: StorageBackendKind;
+  /** Snapshot of what the storage backend showed at init time. */
+  initProbe: InitProbe | null;
   pointsTracked: number;
   popsTracked: number;
   pointsWithDeltas: number;
   lastHydrate: HydrateReport | null;
 }
 
+export interface InitProbe {
+  at: number;
+  apiKeysAtInit: string[];
+  apiHasOurKey: boolean;
+  apiOurKeyShape: string;
+  localStorageAvailable: boolean;
+  localStorageKeysAtInit: string[];
+  localStorageHasOurKey: boolean;
+  localStorageOurKeyShape: string;
+}
+
 function approxEq(a: number, b: number): boolean {
   return Math.abs(a - b) <= APPROX_TOLERANCE;
+}
+
+async function captureInitProbe(): Promise<InitProbe> {
+  const probe: InitProbe = {
+    at: Date.now(),
+    apiKeysAtInit: [],
+    apiHasOurKey: false,
+    apiOurKeyShape: 'null',
+    localStorageAvailable: false,
+    localStorageKeysAtInit: [],
+    localStorageHasOurKey: false,
+    localStorageOurKeyShape: 'null',
+  };
+  // Lazy import to avoid pulling api at module-load time outside game.
+  try {
+    const apiMod = await import('../api');
+    probe.apiKeysAtInit = await apiMod.storage.keys().catch(() => []);
+    const apiVal = await apiMod.storage.get<unknown>(STORAGE_KEY, null).catch(() => null);
+    probe.apiHasOurKey = apiVal != null;
+    probe.apiOurKeyShape = describeShape(apiVal);
+  } catch {
+    /* ignore — probe still useful */
+  }
+  if (typeof localStorage !== 'undefined') {
+    probe.localStorageAvailable = true;
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k != null) probe.localStorageKeysAtInit.push(k);
+      }
+      const lsRaw = localStorage.getItem(STORAGE_KEY);
+      probe.localStorageHasOurKey = lsRaw != null;
+      if (lsRaw != null) {
+        try {
+          probe.localStorageOurKeyShape = describeShape(JSON.parse(lsRaw));
+        } catch {
+          probe.localStorageOurKeyShape = `<unparseable, ${lsRaw.length} chars>`;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return probe;
+}
+
+function describeShape(v: unknown): string {
+  if (v == null) return 'null';
+  if (typeof v !== 'object') return String(v);
+  const o = v as any;
+  return `{ version: ${o.version}, savedAt: ${o.savedAt}, points: ${o.baselineDemand?.length ?? '?'}, pops: ${o.baselinePopSizes?.length ?? '?'}, deltas: ${o.cumulativeDeltas?.length ?? '?'} }`;
 }
 
 function totalDelta(d: PointDelta): { jobs: number; residents: number } {
@@ -142,6 +206,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let lastPersistAt: number | null = null;
   let storageRoundTripOk: boolean | null = null;
   let lastHydrate: HydrateReport | null = null;
+  let initProbe: InitProbe | null = null;
   let initPromise: Promise<boolean> | null = null;
 
   async function doInit(providedDemand?: DemandData): Promise<boolean> {
@@ -151,6 +216,13 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     }
     demand = d;
     mutator = createMutator(d);
+
+    // Snapshot raw state of BOTH possible backends at init time so the
+    // panel can show exactly what we saw, regardless of what the
+    // adapter chose to surface. Crucial for diagnosing post-restart
+    // "where did my data go?" cases.
+    initProbe = await captureInitProbe();
+    console.log('[sb-tod] init probe:', initProbe);
 
     let persisted: PersistedState | null = null;
     let storageKeys: string[] = [];
@@ -332,6 +404,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         lastPersistAt,
         storageRoundTripOk,
         storageBackend,
+        initProbe,
         pointsTracked: snap?.baselineDemand.size ?? 0,
         popsTracked: snap?.baselinePopSizes.size ?? 0,
         pointsWithDeltas: snap?.cumulativeDeltas.size ?? 0,

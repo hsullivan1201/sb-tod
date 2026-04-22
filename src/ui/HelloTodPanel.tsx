@@ -1010,6 +1010,16 @@ function DebugTodSection({
           : stats.lastHydrate.fromStorage
           ? `from-storage · preserved ${stats.lastHydrate.preserved} · replayed ${stats.lastHydrate.replayed} · shifted ${stats.lastHydrate.baselineShift}`
           : 'fresh (no persisted state found — either first run, game reset mod storage, or storage backend broken)'}
+        {stats.initProbe && (
+          <>
+            <br />
+            init probe @ {new Date(stats.initProbe.at).toLocaleTimeString()}:
+            <br />
+            &nbsp;&nbsp;api: {stats.initProbe.apiHasOurKey ? '✓' : '✗'} {stats.initProbe.apiOurKeyShape} · {stats.initProbe.apiKeysAtInit.length} keys
+            <br />
+            &nbsp;&nbsp;localStorage: {stats.initProbe.localStorageAvailable ? 'avail' : 'NA'} · {stats.initProbe.localStorageHasOurKey ? '✓' : '✗'} {stats.initProbe.localStorageOurKeyShape} · {stats.initProbe.localStorageKeysAtInit.length} keys
+          </>
+        )}
       </div>
     </div>
   );
