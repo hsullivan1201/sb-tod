@@ -90,7 +90,7 @@ export const DURATION_PRESETS = [1, 3, 5, 10, 20, 30] as const;
  * validateProposal call (via costMultiplier on ProposalInput), so
  * changing it here propagates everywhere that matters.
  */
-export const DEBUG_COST_MULTIPLIER = 0.01;
+export const DEBUG_COST_MULTIPLIER: number = 0.01;
 
 export interface Deal {
   id: string;
