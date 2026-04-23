@@ -19,7 +19,8 @@ import {
 } from '../scoring';
 import { clearHighlight, setHighlight, setHighlightPoints, type MarkedPoint } from './mapHighlight';
 import { getModState } from '../state/mod-state';
-import { findWalkshed, totalsFromHits } from '../scoring/walkshed';
+import { findWalkshed, haversineMeters, totalsFromHits } from '../scoring/walkshed';
+import { getMap } from '../api';
 import { storage } from '../api';
 import {
   validateProposal,
@@ -119,6 +120,43 @@ export function HelloTodPanel() {
     return () => window.removeEventListener('keydown', onKey, true);
   }, [highlightedId]);
 
+  // Map-click pin: while the panel is open, clicking on or near any
+  // station-group center on the map pins it in the panel. Lets the
+  // player select stations that aren't surfaced in any of the top-N
+  // lists. Threshold is generous (200m) since players don't pixel-
+  // perfect and the game's station icons span ~30px on screen.
+  // Coexists with the game's own click handler (MapLibre allows
+  // multiple); we don't preventDefault.
+  useEffect(() => {
+    const m = getMap();
+    if (!m || typeof m.on !== 'function') return;
+    const handler = (e: any) => {
+      const lng = e?.lngLat?.lng;
+      const lat = e?.lngLat?.lat;
+      if (typeof lng !== 'number' || typeof lat !== 'number') return;
+      const click: [number, number] = [lng, lat];
+      let best: { row: ScoredStation; dist: number } | null = null;
+      for (const row of snapshot.scored) {
+        const d = haversineMeters(click, [row.center[0], row.center[1]]);
+        if (d <= 200 && (!best || d < best.dist)) {
+          best = { row, dist: d };
+        }
+      }
+      if (best) {
+        setHighlight(best.row.center, HIGHLIGHT_RADIUS_M, { easeCamera: false });
+        setHighlightedId(best.row.id);
+      }
+    };
+    m.on('click', handler);
+    return () => {
+      try {
+        m.off?.('click', handler);
+      } catch {
+        /* ignore */
+      }
+    };
+  }, [snapshot]);
+
   const topResidential = useMemo(
     () =>
       [...snapshot.scored]
@@ -178,6 +216,11 @@ export function HelloTodPanel() {
         <Row label="Demand Points" value={snapshot.demandPoints.toLocaleString()} />
         <Row label="Pops" value={snapshot.pops.toLocaleString()} />
         <Row label="Riders (15min)" value={Math.round(totalRiders).toLocaleString()} />
+        {!highlightedId && (
+          <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', fontStyle: 'italic', margin: '4px 0 0' }}>
+            Click any station on the map (or any row below) to pin its walkshed and propose deals.
+          </p>
+        )}
       </section>
 
       <AccessSection

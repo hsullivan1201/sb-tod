@@ -110,9 +110,23 @@ export function initMapHighlight(): void {
   }
 }
 
-export function setHighlight(center: LngLat, radiusMeters: number): void {
+export interface SetHighlightOptions {
+  /**
+   * If true (default), pan + zoom the camera to the highlighted point.
+   * Pass false when the user clicked the spot themselves on the map —
+   * they're already looking at it and a camera move feels wrong.
+   */
+  easeCamera?: boolean;
+}
+
+export function setHighlight(
+  center: LngLat,
+  radiusMeters: number,
+  options: SetHighlightOptions = {}
+): void {
   const m = getMap();
   if (!m) return;
+  const easeCamera = options.easeCamera ?? true;
   try {
     const src = m.getSource(SOURCE_ID) as FeatureCollectionSource | undefined;
     if (!src?.setData) return;
@@ -124,7 +138,7 @@ export function setHighlight(center: LngLat, radiusMeters: number): void {
     // re-adds them after this call if they want them.
     const ptsSrc = m.getSource(POINTS_SOURCE_ID) as FeatureCollectionSource | undefined;
     ptsSrc?.setData?.(EMPTY_POINTS);
-    if (typeof m.easeTo === 'function') {
+    if (easeCamera && typeof m.easeTo === 'function') {
       m.easeTo({
         center: [center[0], center[1]],
         zoom: Math.max(m.getZoom?.() ?? 13, 14),
