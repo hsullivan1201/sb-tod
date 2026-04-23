@@ -233,6 +233,10 @@ export function HelloTodPanel() {
       <DealsSection
         pinned={highlightedId ? snapshot.scored.find((s) => s.id === highlightedId) ?? null : null}
         onAfter={() => setSnapshot(readSnapshot())}
+        onLocate={(deal) => {
+          setHighlight(deal.centerLngLat, HIGHLIGHT_RADIUS_M);
+          setHighlightedId(deal.centerStationGroupId);
+        }}
       />
 
       <DebugTodSection
@@ -1120,9 +1124,11 @@ function fmtMoney(n: number): string {
 function DealsSection({
   pinned,
   onAfter,
+  onLocate,
 }: {
   pinned: ScoredStation | null;
   onAfter: () => void;
+  onLocate: (deal: Deal) => void;
 }) {
   const [open, setOpen] = useState(true);
   const [tick, setTick] = useState(0); // bump to refresh deals list
@@ -1199,6 +1205,7 @@ function DealsSection({
               deal={d}
               onCancel={() => { state.cancelDeal(d.id); refresh(); }}
               onComplete={() => { state.debugCompleteDeal(d.id); refresh(); onAfter(); }}
+              onLocate={() => onLocate(d)}
             />
           ))}
         </div>
@@ -1210,7 +1217,13 @@ function DealsSection({
             Completed
           </div>
           {completed.slice(-5).reverse().map((d) => (
-            <DealCard key={d.id} deal={d} onCancel={null} onComplete={null} />
+            <DealCard
+              key={d.id}
+              deal={d}
+              onCancel={null}
+              onComplete={null}
+              onLocate={() => onLocate(d)}
+            />
           ))}
         </div>
       )}
@@ -1275,6 +1288,7 @@ function ProposeDeal({
       proposal: preview,
       startDay: gameState.getCurrentDay(),
       centerStationGroupId: pinned.id,
+      centerStationGroupName: pinned.name,
       centerLngLat: pinned.center,
       radiusMeters: HIGHLIGHT_RADIUS_M,
     });
@@ -1431,18 +1445,28 @@ function DealCard({
   deal,
   onCancel,
   onComplete,
+  onLocate,
 }: {
   deal: Deal;
   onCancel: (() => void) | null;
   onComplete: (() => void) | null;
+  onLocate: (() => void) | null;
 }) {
   const currentDay = (() => {
     try { return gameState.getCurrentDay(); } catch { return deal.startDay; }
   })();
   const elapsed = Math.max(0, Math.min(deal.durationDays, currentDay - deal.startDay + 1));
-  const fraction = elapsed / deal.durationDays;
   const target = deal.totalDensity;
   const applied = deal.appliedSoFar;
+  // Progress = average fractional delivery across the dimensions this
+  // deal targets. Day-elapsed fraction is misleading because debug
+  // "complete now" jumps applied to total without changing the day.
+  const dimsContributing: number[] = [];
+  if (target.residents > 0) dimsContributing.push(Math.min(1, applied.residents / target.residents));
+  if (target.jobs > 0) dimsContributing.push(Math.min(1, applied.jobs / target.jobs));
+  const fraction = dimsContributing.length > 0
+    ? dimsContributing.reduce((s, f) => s + f, 0) / dimsContributing.length
+    : 0;
   const lastReport = getModState().stats().lastTickReports.find((r) => r.dealId === deal.id);
 
   return (
@@ -1463,11 +1487,32 @@ function DealCard({
         <span>
           <strong style={{ color: KIND_COLORS[deal.kind] }}>{KIND_LABELS[deal.kind]}/{deal.tier}</strong>
           {' · '}
-          <span style={{ color: 'rgba(255,255,255,0.6)' }}>{deal.centerStationGroupId.slice(0, 8)}</span>
+          {onLocate ? (
+            <button
+              type="button"
+              onClick={onLocate}
+              title="pin this station on the map"
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: 'rgba(255,255,255,0.85)',
+                fontSize: 10,
+                cursor: 'pointer',
+                padding: 0,
+                textDecoration: 'underline dotted',
+              }}
+            >
+              {deal.centerStationGroupName ?? deal.centerStationGroupId.slice(0, 8)}
+            </button>
+          ) : (
+            <span style={{ color: 'rgba(255,255,255,0.6)' }}>
+              {deal.centerStationGroupName ?? deal.centerStationGroupId.slice(0, 8)}
+            </span>
+          )}
         </span>
         <span style={{ color: 'rgba(255,255,255,0.5)' }}>
           {deal.state === 'active'
-            ? `day ${elapsed}/${deal.durationDays}`
+            ? `day ${elapsed}/${deal.durationDays} · ${Math.round(fraction * 100)}%`
             : deal.state}
         </span>
       </div>

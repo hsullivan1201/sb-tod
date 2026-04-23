@@ -79,6 +79,8 @@ export interface Deal {
   tier: DealTier;
   /** ID of the station group anchoring the walkshed (purely descriptive). */
   centerStationGroupId: string;
+  /** Human-readable station group name at proposal time, for the deal card. */
+  centerStationGroupName: string;
   /** Center used for walkshed weighting at apply time. */
   centerLngLat: LngLat;
   /** Walkshed radius in meters. Same value the scoring layer used. */
@@ -271,6 +273,7 @@ export interface ConfirmProposalInput {
   proposal: ValidProposal;
   startDay: number;
   centerStationGroupId: string;
+  centerStationGroupName: string;
   centerLngLat: LngLat;
   radiusMeters: number;
   /** Override ID generator for tests / determinism. */
@@ -283,6 +286,7 @@ export function confirmProposal(input: ConfirmProposalInput): Deal {
     kind: input.proposal.kind,
     tier: input.proposal.tier,
     centerStationGroupId: input.centerStationGroupId,
+    centerStationGroupName: input.centerStationGroupName,
     centerLngLat: input.centerLngLat,
     radiusMeters: input.radiusMeters,
     totalDensity: input.proposal.totalDensity,

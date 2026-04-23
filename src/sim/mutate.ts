@@ -208,6 +208,49 @@ function isSplitChildId(id: string): boolean {
   return id.startsWith(SPLIT_POP_PREFIX);
 }
 
+/**
+ * Largest-fractional-remainder apportionment. Distributes `total`
+ * units across items proportional to their `weight`, with each item
+ * getting an integer count. The total is exact: ∑ result = total.
+ *
+ * Example: weights [2, 1, 1], total = 4
+ *   exact = [2.0, 1.0, 1.0] → all integer → [2, 1, 1]
+ *
+ * Example: weights [1, 1, 1], total = 4
+ *   exact = [1.33, 1.33, 1.33] → floors [1, 1, 1] = 3 allocated
+ *   leftover = 1, distributed to highest-remainder → [2, 1, 1]
+ */
+function apportionLargestRemainder(
+  items: Array<{ id: string; weight: number }>,
+  total: number
+): Map<string, number> {
+  const result = new Map<string, number>();
+  const sumWeight = items.reduce((s, i) => s + i.weight, 0);
+  if (sumWeight <= 0 || total <= 0 || items.length === 0) {
+    for (const i of items) result.set(i.id, 0);
+    return result;
+  }
+  const remainders: Array<{ id: string; remainder: number }> = [];
+  let allocated = 0;
+  for (const item of items) {
+    const exact = (item.weight / sumWeight) * total;
+    const base = Math.floor(exact);
+    result.set(item.id, base);
+    allocated += base;
+    remainders.push({ id: item.id, remainder: exact - base });
+  }
+  remainders.sort((a, b) => b.remainder - a.remainder);
+  let leftover = total - allocated;
+  let idx = 0;
+  while (leftover > 0 && remainders.length > 0) {
+    const winner = remainders[idx % remainders.length].id;
+    result.set(winner, (result.get(winner) ?? 0) + 1);
+    leftover--;
+    idx++;
+  }
+  return result;
+}
+
 export function createMutator(
   demand: DemandData,
   options: MutatorOptions = {}
@@ -492,17 +535,34 @@ export function createMutator(
       if (!homeAtP && !jobAtP) continue;
       affectedOriginals.push(pop);
     }
+    // Capture baselines for affected pops up front so the apportionment
+    // weights have access to them whether we go strict or fractional.
+    for (const pop of affectedOriginals) ensurePopBaseline(pop);
 
     let totalCreated = 0;
     let totalRemoved = 0;
-    for (const pop of affectedOriginals) {
-      const baselineSize = ensurePopBaseline(pop);
-      const rRatio = residentsRatioFor(pop.residenceId);
-      const jRatio = jobsRatioFor(pop.jobId);
-      const target = baselineSize * rRatio * jRatio;
-      const { created, removed } = reconcilePopGroup(pop, target, baselineSize);
-      totalCreated += created;
-      totalRemoved += removed;
+
+    if (strictUnitSize !== undefined && strictUnitSize > 0) {
+      // PER-POINT apportionment in strict mode. Total pops at the point
+      // = floor(point.residents / unitSize) (and same for jobs). Extras
+      // are apportioned across origin pops by their baseline size using
+      // largest-fractional-remainder. Each pop's actual child count is
+      // the max of the residence-side and jobs-side allocations (one
+      // child satisfies both).
+      const r = reconcilePointStrict(pointId, affectedOriginals);
+      totalCreated += r.created;
+      totalRemoved += r.removed;
+    } else {
+      // Fractional mode: existing per-origin scaling.
+      for (const pop of affectedOriginals) {
+        const baselineSize = baselinePopSizes.get(pop.id) ?? pop.size;
+        const rRatio = residentsRatioFor(pop.residenceId);
+        const jRatio = jobsRatioFor(pop.jobId);
+        const target = baselineSize * rRatio * jRatio;
+        const { created, removed } = reconcilePopGroup(pop, target, baselineSize);
+        totalCreated += created;
+        totalRemoved += removed;
+      }
     }
 
     point.jobs = nextJobs;
@@ -518,6 +578,128 @@ export function createMutator(
       splitsRemoved: totalRemoved,
       cumulativeDelta: totals,
     };
+  }
+
+  /**
+   * Strict-mode reconciliation: drives pop counts at the point level
+   * rather than per-origin. Total pops at the point = floor(target /
+   * unitSize), apportioned across origins by baseline size using
+   * largest-fractional-remainder. Each origin's child count is the
+   * larger of its residence-share and jobs-share allocations.
+   *
+   * Note: this only reconciles `pointId`. A child added here also
+   * lives at the origin's OTHER point (residence ≠ jobId case);
+   * that other point's pop totals shift but won't be reconciled
+   * until it's mutated itself. v1 accepts this slight asymmetry.
+   */
+  function reconcilePointStrict(
+    pointId: string,
+    _affected: Pop[]
+  ): { created: number; removed: number } {
+    if (strictUnitSize === undefined || strictUnitSize <= 0) {
+      return { created: 0, removed: 0 };
+    }
+    const baseline = baselineDemand.get(pointId);
+    if (!baseline) return { created: 0, removed: 0 };
+    const cum = cumulativeDeltas.get(pointId);
+    const totals = cum ? totalOf(cum) : { jobs: 0, residents: 0 };
+
+    // Origin pops touching this point on each side.
+    const residenceOrigins: Pop[] = [];
+    const jobsOrigins: Pop[] = [];
+    for (const p of demand.popsMap.values()) {
+      if (isSplitChildId(p.id)) continue;
+      if (p.residenceId === pointId) residenceOrigins.push(p);
+      if (p.jobId === pointId) jobsOrigins.push(p);
+    }
+
+    const targetR = baseline.residents + totals.residents;
+    const targetJ = baseline.jobs + totals.jobs;
+    // floor: only materialize a new pop once a full unitSize chunk has
+    // accumulated. max(numBaseline, ...) so we never delete originals
+    // even if the floor would suggest a smaller count.
+    const desiredR = Math.max(residenceOrigins.length, Math.floor(targetR / strictUnitSize));
+    const desiredJ = Math.max(jobsOrigins.length, Math.floor(targetJ / strictUnitSize));
+    const extraR = desiredR - residenceOrigins.length;
+    const extraJ = desiredJ - jobsOrigins.length;
+
+    const apportionedR = apportionLargestRemainder(
+      residenceOrigins.map((p) => ({
+        id: p.id,
+        weight: baselinePopSizes.get(p.id) ?? p.size,
+      })),
+      extraR
+    );
+    const apportionedJ = apportionLargestRemainder(
+      jobsOrigins.map((p) => ({
+        id: p.id,
+        weight: baselinePopSizes.get(p.id) ?? p.size,
+      })),
+      extraJ
+    );
+
+    // For every origin touching this point: desired children = max of
+    // residence-side and jobs-side allocations. A single child satisfies
+    // both dimensions.
+    const allTouching = new Set<string>();
+    for (const p of residenceOrigins) allTouching.add(p.id);
+    for (const p of jobsOrigins) allTouching.add(p.id);
+
+    let created = 0;
+    let removed = 0;
+    for (const originId of allTouching) {
+      const fromR = apportionedR.get(originId) ?? 0;
+      const fromJ = apportionedJ.get(originId) ?? 0;
+      const desiredChildren = Math.max(fromR, fromJ);
+      const origin = demand.popsMap.get(originId);
+      if (!origin) continue;
+      const r = setSplitChildCount(origin, desiredChildren);
+      created += r.created;
+      removed += r.removed;
+    }
+    return { created, removed };
+  }
+
+  /** Bring origin's split-child count to exactly N. Sizes set to strictUnitSize. */
+  function setSplitChildCount(
+    origin: Pop,
+    desiredCount: number
+  ): { created: number; removed: number } {
+    const existing = (splitChildren.get(origin.id) ?? []).filter((id) =>
+      demand.popsMap.has(id)
+    );
+    let created = 0;
+    let removed = 0;
+    while (existing.length > desiredCount) {
+      const childId = existing.pop()!;
+      demand.popsMap.delete(childId);
+      removePopIdFromPoint(origin.residenceId, childId);
+      if (origin.jobId !== origin.residenceId) removePopIdFromPoint(origin.jobId, childId);
+      removed++;
+    }
+    while (existing.length < desiredCount) {
+      const childId = nextChildId(origin.id, existing.length);
+      const childPop: Pop = {
+        ...origin,
+        id: childId,
+        size: strictUnitSize ?? origin.size,
+      };
+      demand.popsMap.set(childId, childPop);
+      addPopIdToPoint(origin.residenceId, childId);
+      if (origin.jobId !== origin.residenceId) addPopIdToPoint(origin.jobId, childId);
+      existing.push(childId);
+      created++;
+    }
+    if (existing.length > 0) splitChildren.set(origin.id, existing);
+    else splitChildren.delete(origin.id);
+    // Force original + children to strictUnitSize.
+    const sz = strictUnitSize ?? origin.size;
+    origin.size = sz;
+    for (const id of existing) {
+      const child = demand.popsMap.get(id);
+      if (child) child.size = sz;
+    }
+    return { created, removed };
   }
 
   function captureBaselines(): void {

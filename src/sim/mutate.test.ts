@@ -519,22 +519,30 @@ describe('strict unit-size mode', () => {
     }
   });
 
-  it('rounds the per-origin unit count to nearest, never below 1', () => {
+  it('chunks pops at the point level: +200 cumulative residents → +1 new pop', () => {
+    // Baseline-consistent setup: 600 residents in 3 pops of 200 each.
     const P = point('P', 0, 600);
-    const pops = [pop('x', 'P', 'P', 200)];
+    const pops = [
+      pop('a', 'P', 'P', 200),
+      pop('b', 'P', 'P', 200),
+      pop('c', 'P', 'P', 200),
+    ];
     const demand = fixture([P], pops);
     const m = createMutator(demand, { strictUnitSize: 200 });
 
-    // +200 res on baseline 600 → ratio 1.333, target = 200 * 1.333 = 266.67
-    // round(266.67/200) = round(1.333) = 1 (round half up only kicks in
-    // at exact .5, and 1.333 rounds down). So we stay at 1 pop.
-    m.applyDensityDelta('P', { residents: 200 }, 'deals');
-    expect(demand.popsMap.size).toBe(1);
-    expect(demand.popsMap.get('x')!.size).toBe(200);
+    // +50 cumulative: target 650 → floor(650/200) = 3 → no new pop yet.
+    m.applyDensityDelta('P', { residents: 50 }, 'deals');
+    expect(demand.popsMap.size).toBe(3);
 
-    // +600 res → ratio 2.0, target = 400, round(2.0) = 2 units.
-    m.applyDensityDelta('P', { residents: 400 }, 'deals'); // cumulative now +600
-    expect(demand.popsMap.size).toBe(2);
+    // +200 cumulative: target 800 → floor(800/200) = 4 → +1 pop.
+    m.applyDensityDelta('P', { residents: 150 }, 'deals'); // total +200
+    expect(demand.popsMap.size).toBe(4);
+    for (const p of demand.popsMap.values()) expect(p.size).toBe(200);
+
+    // +600 cumulative: target 1200 → floor = 6 → +3 total over baseline,
+    // i.e. 2 more from the previous +1 state.
+    m.applyDensityDelta('P', { residents: 400 }, 'deals'); // total +600
+    expect(demand.popsMap.size).toBe(6);
     for (const p of demand.popsMap.values()) expect(p.size).toBe(200);
   });
 
