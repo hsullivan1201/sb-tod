@@ -17,9 +17,9 @@ import {
   type CalibrationInfo,
   type ScoredStation,
 } from '../scoring';
-import { clearHighlight, setHighlight } from './mapHighlight';
+import { clearHighlight, setHighlight, setHighlightPoints, type MarkedPoint } from './mapHighlight';
 import { getModState } from '../state/mod-state';
-import { findWalkshed } from '../scoring/walkshed';
+import { findWalkshed, totalsFromHits } from '../scoring/walkshed';
 import { storage } from '../api';
 import {
   validateProposal,
@@ -32,6 +32,12 @@ import {
 } from '../sim/deals';
 
 const HIGHLIGHT_RADIUS_M = 500;
+
+const DEAL_KIND_HEX: Record<DealKind, string> = {
+  housing: '#60a5fa',
+  commercial: '#fb923c',
+  mixed: '#a78bfa',
+};
 
 const { Button } = utils.components as Record<string, React.ComponentType<any>>;
 
@@ -234,8 +240,35 @@ export function HelloTodPanel() {
         pinned={highlightedId ? snapshot.scored.find((s) => s.id === highlightedId) ?? null : null}
         onAfter={() => setSnapshot(readSnapshot())}
         onLocate={(deal) => {
-          setHighlight(deal.centerLngLat, HIGHLIGHT_RADIUS_M);
+          setHighlight(deal.centerLngLat, deal.radiusMeters);
           setHighlightedId(deal.centerStationGroupId);
+          // Scatter markers on the deal's eligible target points so the
+          // player can see exactly where this deal lands density. Color
+          // matches the deal kind; radius scales with walkshed weight
+          // (closer points = bigger marker = more chunks).
+          const demand = gameState.getDemandData();
+          if (!demand) return;
+          const hits = findWalkshed(
+            [deal.centerLngLat[0], deal.centerLngLat[1]],
+            demand.points.values(),
+            { radiusMeters: deal.radiusMeters }
+          );
+          const wantsRes = deal.totalDensity.residents > 0;
+          const wantsJobs = deal.totalDensity.jobs > 0;
+          const color = DEAL_KIND_HEX[deal.kind];
+          const markers: MarkedPoint[] = [];
+          for (const hit of hits) {
+            const eligible =
+              (wantsRes && hit.point.residents > 0) ||
+              (wantsJobs && hit.point.jobs > 0);
+            if (!eligible) continue;
+            markers.push({
+              lngLat: [hit.point.location[0], hit.point.location[1]] as const,
+              color,
+              radiusPx: 4 + Math.round(hit.weight * 8), // 4–12 px
+            });
+          }
+          setHighlightPoints(markers);
         }}
       />
 
@@ -1132,6 +1165,7 @@ function DealsSection({
 }) {
   const [open, setOpen] = useState(true);
   const [tick, setTick] = useState(0); // bump to refresh deals list
+  const [showAllCompleted, setShowAllCompleted] = useState(false);
   const refresh = useCallback(() => setTick((t) => t + 1), []);
   const state = getModState();
   const deals = state.getDeals();
@@ -1213,10 +1247,19 @@ function DealsSection({
 
       {completed.length > 0 && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase' }}>
-            Completed
+          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase', display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+            <span>Completed{!showAllCompleted && completed.length > 5 ? ` (showing 5 of ${completed.length})` : ` (${completed.length})`}</span>
+            {completed.length > 5 && (
+              <button
+                type="button"
+                onClick={() => setShowAllCompleted((s) => !s)}
+                style={{ background: 'transparent', border: 'none', color: 'rgba(255,255,255,0.5)', fontSize: 10, cursor: 'pointer', padding: 0, textTransform: 'none' }}
+              >
+                {showAllCompleted ? 'collapse' : 'show all'}
+              </button>
+            )}
           </div>
-          {completed.slice(-5).reverse().map((d) => (
+          {(showAllCompleted ? completed : completed.slice(-5)).slice().reverse().map((d) => (
             <DealCard
               key={d.id}
               deal={d}
@@ -1271,6 +1314,33 @@ function ProposeDeal({
       durationOverride: durationOverride ?? undefined,
     });
   }, [pinned, kind, tier, durationOverride]);
+
+  // Estimated transit-commuter impact based on the walkshed's current
+  // mode share. New residents get the walkshed's resident-transit
+  // ratio applied; new workers get the worker-transit ratio. Rough but
+  // useful for "is this worth $25M?" intuition.
+  const impactEstimate = useMemo(() => {
+    if (!pinned || !preview || !preview.ok) return null;
+    const demand = gameState.getDemandData();
+    if (!demand) return null;
+    const hits = findWalkshed(
+      [pinned.center[0], pinned.center[1]],
+      demand.points.values(),
+      { radiusMeters: HIGHLIGHT_RADIUS_M }
+    );
+    const totals = totalsFromHits(hits);
+    const resTransitShare = totals.residents > 0 ? totals.residentTransit / totals.residents : 0;
+    const jobTransitShare = totals.jobs > 0 ? totals.workerTransit / totals.jobs : 0;
+    const newResTransit = preview.totalDensity.residents * resTransitShare;
+    const newJobTransit = preview.totalDensity.jobs * jobTransitShare;
+    return {
+      newResTransit,
+      newJobTransit,
+      total: newResTransit + newJobTransit,
+      resTransitShare,
+      jobTransitShare,
+    };
+  }, [pinned, preview]);
 
   const onConfirm = useCallback(async () => {
     if (!pinned) return;
@@ -1411,6 +1481,19 @@ function ProposeDeal({
           preview.ok
             ? <><br />walkshed: {preview.eligiblePoints.length} points · {preview.eligiblePoints.filter((p) => p.residentsEligible).length} can take residents · {preview.eligiblePoints.filter((p) => p.jobsEligible).length} can take jobs</>
             : <><br /><span style={{ color: '#fca5a5' }}>blocked: {preview.message}</span></>
+        )}
+        {impactEstimate && impactEstimate.total > 0 && (
+          <>
+            <br />est. new transit users: {Math.round(impactEstimate.total).toLocaleString()}
+            {impactEstimate.newResTransit > 0 && (
+              <> ({Math.round(impactEstimate.newResTransit).toLocaleString()} from residents @ {Math.round(impactEstimate.resTransitShare * 100)}%</>
+            )}
+            {impactEstimate.newJobTransit > 0 && (
+              <>{impactEstimate.newResTransit > 0 ? ' · ' : ' ('}
+              {Math.round(impactEstimate.newJobTransit).toLocaleString()} from workers @ {Math.round(impactEstimate.jobTransitShare * 100)}%</>
+            )}
+            {(impactEstimate.newResTransit > 0 || impactEstimate.newJobTransit > 0) && <>)</>}
+          </>
         )}
       </div>
 

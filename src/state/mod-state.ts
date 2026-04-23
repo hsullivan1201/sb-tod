@@ -25,7 +25,7 @@
  * through JSON.
  */
 
-import { gameState } from '../api';
+import { gameState, ui as uiApi, actions as actionsApi } from '../api';
 import type { DemandData, DemandPoint, PointDelta } from '../types';
 import {
   createMutator,
@@ -197,6 +197,17 @@ async function captureInitProbe(saveName: string | null, storageKey: string): Pr
   }
   probe.otherSaveKeys = [...otherKeys];
   return probe;
+}
+
+function formatDeliverySummary(deal: Deal): string {
+  const parts: string[] = [];
+  if (deal.totalDensity.residents > 0) {
+    parts.push(`${Math.round(deal.appliedSoFar.residents).toLocaleString()} residents`);
+  }
+  if (deal.totalDensity.jobs > 0) {
+    parts.push(`${Math.round(deal.appliedSoFar.jobs).toLocaleString()} jobs`);
+  }
+  return parts.join(' + ') || '0';
 }
 
 function describeShape(v: unknown): string {
@@ -526,6 +537,16 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         console.log(
           `[sb-tod] deal ${deal.id} (${deal.kind}/${deal.tier}) completed on day ${day}: delivered ${deal.appliedSoFar.residents.toFixed(0)}r / ${deal.appliedSoFar.jobs.toFixed(0)}j of ${deal.totalDensity.residents}r / ${deal.totalDensity.jobs}j planned.`
         );
+        try {
+          const summary = formatDeliverySummary(deal);
+          uiApi.showNotification(
+            `TOD deal complete: ${deal.kind}/${deal.tier} at ${deal.centerStationGroupName} delivered ${summary}.`,
+            'success'
+          );
+        } catch (e) {
+          // showNotification can throw if the UI isn't ready; non-fatal.
+          console.warn('[sb-tod] completion notification failed:', e);
+        }
       }
       reports.push({
         dealId: deal.id,
@@ -612,9 +633,37 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     cancelDeal(dealId) {
       const d = deals.find((dd) => dd.id === dealId);
       if (!d || d.state !== 'active') return false;
+      // Refund the unspent fraction. We use the average delivered
+      // fraction across active dimensions (residents + jobs that this
+      // deal targets) — same calc the UI progress bar uses.
+      const fractions: number[] = [];
+      if (d.totalDensity.residents > 0) {
+        fractions.push(Math.min(1, d.appliedSoFar.residents / d.totalDensity.residents));
+      }
+      if (d.totalDensity.jobs > 0) {
+        fractions.push(Math.min(1, d.appliedSoFar.jobs / d.totalDensity.jobs));
+      }
+      const deliveredFraction =
+        fractions.length > 0 ? fractions.reduce((s, f) => s + f, 0) / fractions.length : 0;
+      const refund = Math.round(d.totalCost * (1 - deliveredFraction));
+      if (refund > 0) {
+        try {
+          actionsApi.addMoney(refund, 'TOD Deal refund');
+        } catch (e) {
+          console.warn('[sb-tod] refund addMoney failed:', e);
+        }
+      }
       d.state = 'cancelled';
       dirty = true;
       void persist();
+      try {
+        uiApi.showNotification(
+          `Cancelled ${d.kind}/${d.tier} at ${d.centerStationGroupName}. Refunded $${refund.toLocaleString()} (${Math.round((1 - deliveredFraction) * 100)}% unspent).`,
+          'info'
+        );
+      } catch (e) {
+        console.warn('[sb-tod] cancel notification failed:', e);
+      }
       return true;
     },
     debugCompleteDeal(dealId) {
