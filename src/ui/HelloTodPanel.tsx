@@ -11,7 +11,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { gameState, utils } from '../api';
+import { gameState, utils, actions } from '../api';
 import {
   scoreAllStationsDetailed,
   type CalibrationInfo,
@@ -21,6 +21,14 @@ import { clearHighlight, setHighlight } from './mapHighlight';
 import { getModState } from '../state/mod-state';
 import { findWalkshed } from '../scoring/walkshed';
 import { storage } from '../api';
+import {
+  validateProposal,
+  confirmProposal,
+  DEFAULT_TIER_TABLE,
+  type Deal,
+  type DealKind,
+  type DealTier,
+} from '../sim/deals';
 
 const HIGHLIGHT_RADIUS_M = 500;
 
@@ -220,6 +228,11 @@ export function HelloTodPanel() {
           Debug DL
         </Button>
       </div>
+
+      <DealsSection
+        pinned={highlightedId ? snapshot.scored.find((s) => s.id === highlightedId) ?? null : null}
+        onAfter={() => setSnapshot(readSnapshot())}
+      />
 
       <DebugTodSection
         highlightedId={highlightedId}
@@ -1029,6 +1042,374 @@ function DebugTodSection({
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DealsSection — Stage 2 main feature.
+// Pin a station → propose a housing/commercial/mixed deal targeting its
+// walkshed. Active deals tick daily via mod-state; this section just lets
+// the player propose, monitor, and (eventually) cancel them.
+// ---------------------------------------------------------------------------
+
+const DEAL_KINDS: DealKind[] = ['housing', 'commercial', 'mixed'];
+const DEAL_TIERS: DealTier[] = ['S', 'M', 'L'];
+
+const KIND_LABELS: Record<DealKind, string> = {
+  housing: 'Housing',
+  commercial: 'Commercial',
+  mixed: 'Mixed-use',
+};
+
+const KIND_COLORS: Record<DealKind, string> = {
+  housing: '#60a5fa',     // blue
+  commercial: '#fb923c',   // orange
+  mixed: '#a78bfa',        // purple
+};
+
+function fmtMoney(n: number): string {
+  if (n >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(0)}k`;
+  return `$${n.toFixed(0)}`;
+}
+
+function DealsSection({
+  pinned,
+  onAfter,
+}: {
+  pinned: ScoredStation | null;
+  onAfter: () => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const [tick, setTick] = useState(0); // bump to refresh deals list
+  const refresh = useCallback(() => setTick((t) => t + 1), []);
+  const state = getModState();
+  const deals = state.getDeals();
+  // recompute split groups whenever tick changes
+  const _ = tick; void _;
+
+  const active = useMemo(() => deals.filter((d) => d.state === 'active'), [deals, tick]);
+  const completed = useMemo(() => deals.filter((d) => d.state === 'completed'), [deals, tick]);
+
+  if (!open) {
+    return (
+      <div>
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: 'rgba(255,255,255,0.6)',
+            fontSize: 12,
+            cursor: 'pointer',
+            padding: 0,
+          }}
+        >
+          ▸ Deals ({active.length} active, {completed.length} done)
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <section
+      style={{
+        border: '1px solid rgba(255,255,255,0.1)',
+        borderRadius: 4,
+        padding: 10,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <strong style={{ fontSize: 12 }}>
+          Deals — {active.length} active · {completed.length} done
+        </strong>
+        <button
+          type="button"
+          onClick={() => setOpen(false)}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: 'rgba(255,255,255,0.5)',
+            fontSize: 12,
+            cursor: 'pointer',
+          }}
+        >
+          ▾
+        </button>
+      </div>
+
+      <ProposeDeal pinned={pinned} onAfter={() => { refresh(); onAfter(); }} />
+
+      {active.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase' }}>
+            Active
+          </div>
+          {active.map((d) => (
+            <DealCard key={d.id} deal={d} onCancel={() => { state.cancelDeal(d.id); refresh(); }} />
+          ))}
+        </div>
+      )}
+
+      {completed.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.5)', textTransform: 'uppercase' }}>
+            Completed
+          </div>
+          {completed.slice(-5).reverse().map((d) => (
+            <DealCard key={d.id} deal={d} onCancel={null} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ProposeDeal({
+  pinned,
+  onAfter,
+}: {
+  pinned: ScoredStation | null;
+  onAfter: () => void;
+}) {
+  const [kind, setKind] = useState<DealKind>('housing');
+  const [tier, setTier] = useState<DealTier>('S');
+  const [lastResult, setLastResult] = useState<string | null>(null);
+
+  const tierConfig = DEFAULT_TIER_TABLE[kind][tier];
+
+  // Live preview: validate against current demand whenever inputs change.
+  const preview = useMemo(() => {
+    if (!pinned) return null;
+    const demand = gameState.getDemandData();
+    if (!demand) return null;
+    let budget = 0;
+    try { budget = gameState.getBudget(); } catch { /* unimplemented in some builds */ }
+    return validateProposal({
+      kind,
+      tier,
+      centerLngLat: pinned.center,
+      radiusMeters: HIGHLIGHT_RADIUS_M,
+      walkshedPoints: demand.points.values(),
+      budget,
+    });
+  }, [pinned, kind, tier]);
+
+  const onConfirm = useCallback(async () => {
+    if (!pinned) return;
+    if (!preview || !preview.ok) {
+      setLastResult(`Cannot propose: ${preview?.message ?? 'no preview'}`);
+      return;
+    }
+    const state = getModState();
+    const ok = await state.ensureInit();
+    if (!ok) {
+      setLastResult('Mod state not ready.');
+      return;
+    }
+    const deal = confirmProposal({
+      proposal: preview,
+      startDay: gameState.getCurrentDay(),
+      centerStationGroupId: pinned.id,
+      centerLngLat: pinned.center,
+      radiusMeters: HIGHLIGHT_RADIUS_M,
+    });
+    try {
+      actions.subtractMoney(deal.totalCost, 'TOD Deal');
+    } catch (e) {
+      console.warn('[sb-tod] subtractMoney threw:', e);
+    }
+    state.addDeal(deal);
+    setLastResult(`Confirmed ${deal.kind}/${deal.tier} on ${pinned.name} — ${fmtMoney(deal.totalCost)}, ${deal.durationDays} days. Will tick daily on onDayChange.`);
+    onAfter();
+  }, [pinned, preview, onAfter]);
+
+  if (!pinned) {
+    return (
+      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)', fontStyle: 'italic' }}>
+        Pin a station above to propose a deal.
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        background: 'rgba(255,255,255,0.03)',
+        borderRadius: 4,
+        padding: 8,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6,
+        fontSize: 11,
+      }}
+    >
+      <div style={{ color: 'rgba(255,255,255,0.7)' }}>
+        Propose deal on <strong>{pinned.name}</strong>:
+      </div>
+
+      <div style={{ display: 'flex', gap: 4 }}>
+        {DEAL_KINDS.map((k) => (
+          <button
+            key={k}
+            type="button"
+            onClick={() => setKind(k)}
+            style={{
+              flex: 1,
+              padding: '4px 6px',
+              background: kind === k ? KIND_COLORS[k] : 'rgba(255,255,255,0.05)',
+              color: kind === k ? '#000' : 'rgba(255,255,255,0.7)',
+              border: 'none',
+              borderRadius: 3,
+              cursor: 'pointer',
+              fontSize: 11,
+              fontWeight: kind === k ? 600 : 400,
+            }}
+          >
+            {KIND_LABELS[k]}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ display: 'flex', gap: 4 }}>
+        {DEAL_TIERS.map((t) => (
+          <button
+            key={t}
+            type="button"
+            onClick={() => setTier(t)}
+            style={{
+              flex: 1,
+              padding: '4px 6px',
+              background: tier === t ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.05)',
+              color: 'rgba(255,255,255,0.8)',
+              border: 'none',
+              borderRadius: 3,
+              cursor: 'pointer',
+              fontSize: 11,
+              fontWeight: tier === t ? 600 : 400,
+            }}
+          >
+            {t}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ color: 'rgba(255,255,255,0.6)', fontFamily: 'monospace', fontSize: 10, lineHeight: 1.5 }}>
+        +{tierConfig.totalDensity.residents.toLocaleString()} res ·{' '}
+        +{tierConfig.totalDensity.jobs.toLocaleString()} jobs · {fmtMoney(tierConfig.cost)} ·{' '}
+        {tierConfig.duration}d
+        {preview && (
+          preview.ok
+            ? <><br />walkshed: {preview.eligiblePoints.length} points · {preview.eligiblePoints.filter((p) => p.residentsEligible).length} can take residents · {preview.eligiblePoints.filter((p) => p.jobsEligible).length} can take jobs</>
+            : <><br /><span style={{ color: '#fca5a5' }}>blocked: {preview.message}</span></>
+        )}
+      </div>
+
+      <button
+        type="button"
+        disabled={!preview || !preview.ok}
+        onClick={onConfirm}
+        style={{
+          padding: '6px 10px',
+          background: preview?.ok ? KIND_COLORS[kind] : 'rgba(255,255,255,0.1)',
+          color: preview?.ok ? '#000' : 'rgba(255,255,255,0.4)',
+          border: 'none',
+          borderRadius: 3,
+          cursor: preview?.ok ? 'pointer' : 'not-allowed',
+          fontSize: 11,
+          fontWeight: 600,
+        }}
+      >
+        Confirm — {fmtMoney(tierConfig.cost)}
+      </button>
+
+      {lastResult && (
+        <div style={{ color: 'rgba(255,255,255,0.7)', fontFamily: 'monospace', fontSize: 10, whiteSpace: 'pre-wrap' }}>
+          {lastResult}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DealCard({
+  deal,
+  onCancel,
+}: {
+  deal: Deal;
+  onCancel: (() => void) | null;
+}) {
+  const currentDay = (() => {
+    try { return gameState.getCurrentDay(); } catch { return deal.startDay; }
+  })();
+  const elapsed = Math.max(0, Math.min(deal.durationDays, currentDay - deal.startDay + 1));
+  const fraction = elapsed / deal.durationDays;
+  const target = deal.totalDensity;
+  const applied = deal.appliedSoFar;
+
+  return (
+    <div
+      style={{
+        border: `1px solid ${KIND_COLORS[deal.kind]}40`,
+        borderLeftWidth: 3,
+        borderLeftColor: KIND_COLORS[deal.kind],
+        borderRadius: 3,
+        padding: 6,
+        fontSize: 10,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 3,
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span>
+          <strong style={{ color: KIND_COLORS[deal.kind] }}>{KIND_LABELS[deal.kind]}/{deal.tier}</strong>
+          {' · '}
+          <span style={{ color: 'rgba(255,255,255,0.6)' }}>{deal.centerStationGroupId.slice(0, 8)}</span>
+        </span>
+        <span style={{ color: 'rgba(255,255,255,0.5)' }}>
+          {deal.state === 'active'
+            ? `day ${elapsed}/${deal.durationDays}`
+            : deal.state}
+        </span>
+      </div>
+      <div style={{ height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}>
+        <div
+          style={{
+            height: '100%',
+            width: `${Math.min(100, fraction * 100)}%`,
+            background: KIND_COLORS[deal.kind],
+          }}
+        />
+      </div>
+      <div style={{ color: 'rgba(255,255,255,0.5)', fontFamily: 'monospace' }}>
+        {target.residents > 0 && (<>res {applied.residents.toFixed(0)}/{target.residents} </>)}
+        {target.jobs > 0 && (<>jobs {applied.jobs.toFixed(0)}/{target.jobs} </>)}
+        · {fmtMoney(deal.totalCost)}
+      </div>
+      {onCancel && (
+        <button
+          type="button"
+          onClick={onCancel}
+          style={{
+            alignSelf: 'flex-end',
+            background: 'transparent',
+            border: 'none',
+            color: 'rgba(255,255,255,0.4)',
+            fontSize: 10,
+            cursor: 'pointer',
+            padding: 0,
+          }}
+        >
+          cancel
+        </button>
+      )}
     </div>
   );
 }

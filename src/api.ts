@@ -43,6 +43,9 @@ export const gameState = {
   isPaused(): boolean {
     return getRaw().gameState.isPaused();
   },
+  getBudget(): number {
+    return getRaw().gameState.getBudget();
+  },
   // Group/transfer surface — bundled template types don't list these,
   // but probe-1 confirmed they exist and Debug DL confirmed shapes
   // (2026-04-22). Cast through `any` since the d.ts is stale.
@@ -78,6 +81,15 @@ export const hooks = {
   },
   onDemandChange(cb: (popCount: number) => void): void {
     getRaw().hooks.onDemandChange(cb);
+  },
+};
+
+export const actions = {
+  subtractMoney(amount: number, category?: string): void {
+    getRaw().actions.subtractMoney(amount, category);
+  },
+  addMoney(amount: number, category?: string): void {
+    getRaw().actions.addMoney(amount, category);
   },
 };
 

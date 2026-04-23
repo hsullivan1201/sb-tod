@@ -1,0 +1,418 @@
+/**
+ * SB TOD — Developer Deals
+ *
+ * Implements ARCHITECTURE decision 1b: housing / commercial / mixed
+ * deals tied to a station-group walkshed. Each deal commits a fixed
+ * total density delta over a duration in days. Daily ticks apply
+ * incremental fractions, distributed across walkshed DemandPoints by
+ * the same distance-decay function the scoring layer uses.
+ *
+ * Pure module — no api calls, no I/O, no mutator coupling. Returns
+ * declarative "what to apply" descriptions; the caller (mod-state's
+ * day tick) feeds those into the mutator.
+ */
+
+import type { DemandPoint } from '../types';
+import type { LngLat } from '../types';
+import { findWalkshed, type WalkshedHit } from '../scoring/walkshed';
+
+export type DealKind = 'housing' | 'commercial' | 'mixed';
+export type DealTier = 'S' | 'M' | 'L';
+export type DealState = 'active' | 'completed' | 'cancelled';
+
+export interface DealTotalDensity {
+  jobs: number;
+  residents: number;
+}
+
+export interface TierConfig {
+  totalDensity: DealTotalDensity;
+  cost: number;
+  duration: number;
+}
+
+/**
+ * Default tier table from ARCHITECTURE.md decision 1b. Mixed tiers are
+ * 70% of housing-tier residents + 70% of commercial-tier jobs, with
+ * cost = 70% of (housing.cost + commercial.cost). All numbers are
+ * starting points — empirical tuning happens after gameplay testing.
+ */
+export const DEFAULT_TIER_TABLE: Record<DealKind, Record<DealTier, TierConfig>> = {
+  housing: {
+    S: { totalDensity: { residents: 500, jobs: 0 }, cost: 25_000_000, duration: 30 },
+    M: { totalDensity: { residents: 2000, jobs: 0 }, cost: 80_000_000, duration: 60 },
+    L: { totalDensity: { residents: 8000, jobs: 0 }, cost: 250_000_000, duration: 90 },
+  },
+  commercial: {
+    S: { totalDensity: { residents: 0, jobs: 1500 }, cost: 30_000_000, duration: 30 },
+    M: { totalDensity: { residents: 0, jobs: 6000 }, cost: 100_000_000, duration: 60 },
+    L: { totalDensity: { residents: 0, jobs: 25_000 }, cost: 320_000_000, duration: 90 },
+  },
+  mixed: {
+    S: {
+      totalDensity: { residents: Math.round(500 * 0.7), jobs: Math.round(1500 * 0.7) },
+      cost: Math.round((25_000_000 + 30_000_000) * 0.7),
+      duration: 30,
+    },
+    M: {
+      totalDensity: { residents: Math.round(2000 * 0.7), jobs: Math.round(6000 * 0.7) },
+      cost: Math.round((80_000_000 + 100_000_000) * 0.7),
+      duration: 60,
+    },
+    L: {
+      totalDensity: { residents: Math.round(8000 * 0.7), jobs: Math.round(25_000 * 0.7) },
+      cost: Math.round((250_000_000 + 320_000_000) * 0.7),
+      duration: 90,
+    },
+  },
+};
+
+export interface Deal {
+  id: string;
+  kind: DealKind;
+  tier: DealTier;
+  /** ID of the station group anchoring the walkshed (purely descriptive). */
+  centerStationGroupId: string;
+  /** Center used for walkshed weighting at apply time. */
+  centerLngLat: LngLat;
+  /** Walkshed radius in meters. Same value the scoring layer used. */
+  radiusMeters: number;
+  /** What we plan to add over the deal's lifetime. */
+  totalDensity: DealTotalDensity;
+  /** Player paid this much upfront on confirmation. */
+  totalCost: number;
+  /** Game day when the deal was confirmed. */
+  startDay: number;
+  /** Number of game days the deal stretches over. */
+  durationDays: number;
+  /** Lifecycle state. */
+  state: DealState;
+  /**
+   * Cumulative applied density across all daily ticks. Lets the daily
+   * tick recover from missed days (catches up to the linear schedule)
+   * and lets the UI show a progress bar.
+   */
+  appliedSoFar: DealTotalDensity;
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+export type ProposalRejectReason =
+  | 'no-eligible-residential-points'
+  | 'no-eligible-commercial-points'
+  | 'walkshed-empty'
+  | 'insufficient-funds'
+  | 'invalid-tier';
+
+export interface ProposalEligiblePoint {
+  point: DemandPoint;
+  weight: number;
+  /** True if this point can absorb residents from this proposal. */
+  residentsEligible: boolean;
+  /** True if this point can absorb jobs. */
+  jobsEligible: boolean;
+}
+
+export interface ValidProposal {
+  ok: true;
+  kind: DealKind;
+  tier: DealTier;
+  totalDensity: DealTotalDensity;
+  totalCost: number;
+  durationDays: number;
+  /** Per-point breakdown the proposal modal shows the player. */
+  eligiblePoints: ProposalEligiblePoint[];
+  /** Pre-computed total weight for the residents distribution. */
+  totalResidentsWeight: number;
+  /** Pre-computed total weight for the jobs distribution. */
+  totalJobsWeight: number;
+}
+
+export interface InvalidProposal {
+  ok: false;
+  reason: ProposalRejectReason;
+  message: string;
+}
+
+export type ProposalResult = ValidProposal | InvalidProposal;
+
+export interface ProposalInput {
+  kind: DealKind;
+  tier: DealTier;
+  centerLngLat: LngLat;
+  radiusMeters: number;
+  walkshedPoints: Iterable<DemandPoint>;
+  /** Player's current budget. */
+  budget: number;
+  /**
+   * Threshold below which a point can't absorb residents (residential or
+   * mixed deals). Default 0 — any baseline > 0 is eligible. Match the
+   * mutator's ghostTownThreshold to avoid late-stage rejections.
+   */
+  residentsEligibilityThreshold?: number;
+  jobsEligibilityThreshold?: number;
+  /** Override default tier table (for tests / future tuning). */
+  tierTable?: typeof DEFAULT_TIER_TABLE;
+}
+
+export function validateProposal(input: ProposalInput): ProposalResult {
+  const tierTable = input.tierTable ?? DEFAULT_TIER_TABLE;
+  const tierConfig = tierTable[input.kind]?.[input.tier];
+  if (!tierConfig) {
+    return {
+      ok: false,
+      reason: 'invalid-tier',
+      message: `unknown tier ${input.kind}/${input.tier}`,
+    };
+  }
+
+  if (input.budget < tierConfig.cost) {
+    return {
+      ok: false,
+      reason: 'insufficient-funds',
+      message: `deal costs $${tierConfig.cost.toLocaleString()}; budget is $${input.budget.toLocaleString()}`,
+    };
+  }
+
+  const hits: WalkshedHit[] = findWalkshed(
+    [input.centerLngLat[0], input.centerLngLat[1]],
+    input.walkshedPoints,
+    {
+      radiusMeters: input.radiusMeters,
+    }
+  );
+  if (hits.length === 0) {
+    return {
+      ok: false,
+      reason: 'walkshed-empty',
+      message: `no DemandPoints within ${input.radiusMeters}m of center`,
+    };
+  }
+
+  const resThreshold = input.residentsEligibilityThreshold ?? 0;
+  const jobThreshold = input.jobsEligibilityThreshold ?? 0;
+  const wantsResidents = tierConfig.totalDensity.residents > 0;
+  const wantsJobs = tierConfig.totalDensity.jobs > 0;
+
+  const eligible: ProposalEligiblePoint[] = [];
+  let totalResidentsWeight = 0;
+  let totalJobsWeight = 0;
+  for (const hit of hits) {
+    const residentsEligible = hit.point.residents > resThreshold;
+    const jobsEligible = hit.point.jobs > jobThreshold;
+    if (residentsEligible) totalResidentsWeight += hit.weight;
+    if (jobsEligible) totalJobsWeight += hit.weight;
+    eligible.push({
+      point: hit.point,
+      weight: hit.weight,
+      residentsEligible,
+      jobsEligible,
+    });
+  }
+
+  if (wantsResidents && totalResidentsWeight === 0) {
+    return {
+      ok: false,
+      reason: 'no-eligible-residential-points',
+      message: `no walkshed point has residents > ${resThreshold} — proportional scaling can't bootstrap density from zero`,
+    };
+  }
+  if (wantsJobs && totalJobsWeight === 0) {
+    return {
+      ok: false,
+      reason: 'no-eligible-commercial-points',
+      message: `no walkshed point has jobs > ${jobThreshold}`,
+    };
+  }
+
+  return {
+    ok: true,
+    kind: input.kind,
+    tier: input.tier,
+    totalDensity: tierConfig.totalDensity,
+    totalCost: tierConfig.cost,
+    durationDays: tierConfig.duration,
+    eligiblePoints: eligible,
+    totalResidentsWeight,
+    totalJobsWeight,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Confirm a proposal → Deal
+// ---------------------------------------------------------------------------
+
+let _idCounter = 0;
+function nextDealId(): string {
+  _idCounter++;
+  return `deal-${Date.now().toString(36)}-${_idCounter.toString(36)}`;
+}
+
+export interface ConfirmProposalInput {
+  proposal: ValidProposal;
+  startDay: number;
+  centerStationGroupId: string;
+  centerLngLat: LngLat;
+  radiusMeters: number;
+  /** Override ID generator for tests / determinism. */
+  idGenerator?: () => string;
+}
+
+export function confirmProposal(input: ConfirmProposalInput): Deal {
+  return {
+    id: (input.idGenerator ?? nextDealId)(),
+    kind: input.proposal.kind,
+    tier: input.proposal.tier,
+    centerStationGroupId: input.centerStationGroupId,
+    centerLngLat: input.centerLngLat,
+    radiusMeters: input.radiusMeters,
+    totalDensity: input.proposal.totalDensity,
+    totalCost: input.proposal.totalCost,
+    startDay: input.startDay,
+    durationDays: input.proposal.durationDays,
+    state: 'active',
+    appliedSoFar: { residents: 0, jobs: 0 },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Daily tick — distribute today's portion across walkshed points
+// ---------------------------------------------------------------------------
+
+export interface DailyApplyTarget {
+  pointId: string;
+  delta: { jobs?: number; residents?: number };
+}
+
+export interface DailyApplyPlan {
+  /** Per-point deltas to feed into mutator.applyDensityDelta. */
+  targets: DailyApplyTarget[];
+  /**
+   * What we'll record on the deal as `appliedSoFar` increment, in
+   * aggregate. This is the SUM of the per-point deltas — used to keep
+   * the deal's progress tracker honest even when distribution rounds.
+   */
+  aggregateDelta: DealTotalDensity;
+  /** True if this tick completes the deal (no further apply needed). */
+  marksCompletion: boolean;
+}
+
+export interface ComputeDailyApplyInput {
+  deal: Deal;
+  currentDay: number;
+  /** Live DemandPoints in the deal's walkshed (for re-deriving weights). */
+  walkshedPoints: Iterable<DemandPoint>;
+  residentsEligibilityThreshold?: number;
+  jobsEligibilityThreshold?: number;
+}
+
+/**
+ * Compute today's per-point deltas for an active deal.
+ *
+ * Schedule semantics: the deal commits `totalDensity` over `durationDays`.
+ * On any given day N relative to start, the *expected delivered* is
+ * `(N / durationDays) × totalDensity` (linear ramp). Today's delta is
+ * `expected - appliedSoFar` — so if days were missed (paused game,
+ * load gap), we catch up.
+ *
+ * Distribution: per dimension (residents / jobs), partition today's
+ * delta across eligible walkshed points proportional to walkshed
+ * weight. A point eligible for residents but not jobs gets only
+ * residents, etc.
+ */
+export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan {
+  const { deal, currentDay } = input;
+  const daysActive = Math.max(0, Math.min(deal.durationDays, currentDay - deal.startDay + 1));
+  const fractionDelivered = daysActive / deal.durationDays;
+
+  const expectedResidents = deal.totalDensity.residents * fractionDelivered;
+  const expectedJobs = deal.totalDensity.jobs * fractionDelivered;
+  const todayResidents = expectedResidents - deal.appliedSoFar.residents;
+  const todayJobs = expectedJobs - deal.appliedSoFar.jobs;
+
+  const marksCompletion = currentDay >= deal.startDay + deal.durationDays - 1;
+
+  // Re-derive walkshed weights against current live demand. Eligibility
+  // can shift over the deal's lifetime as density grows; we honor that
+  // (a point that becomes eligible mid-deal joins the distribution).
+  const hits = findWalkshed(
+    [deal.centerLngLat[0], deal.centerLngLat[1]],
+    input.walkshedPoints,
+    {
+      radiusMeters: deal.radiusMeters,
+    }
+  );
+  const resThreshold = input.residentsEligibilityThreshold ?? 0;
+  const jobThreshold = input.jobsEligibilityThreshold ?? 0;
+  let totalResWeight = 0;
+  let totalJobWeight = 0;
+  for (const hit of hits) {
+    if (hit.point.residents > resThreshold) totalResWeight += hit.weight;
+    if (hit.point.jobs > jobThreshold) totalJobWeight += hit.weight;
+  }
+
+  // Build per-point targets. Skip zero-deltas to keep the plan lean.
+  const perPoint = new Map<string, { jobs: number; residents: number }>();
+  if (todayResidents !== 0 && totalResWeight > 0) {
+    for (const hit of hits) {
+      if (hit.point.residents <= resThreshold) continue;
+      const share = (hit.weight / totalResWeight) * todayResidents;
+      const slot = perPoint.get(hit.point.id) ?? { jobs: 0, residents: 0 };
+      slot.residents += share;
+      perPoint.set(hit.point.id, slot);
+    }
+  }
+  if (todayJobs !== 0 && totalJobWeight > 0) {
+    for (const hit of hits) {
+      if (hit.point.jobs <= jobThreshold) continue;
+      const share = (hit.weight / totalJobWeight) * todayJobs;
+      const slot = perPoint.get(hit.point.id) ?? { jobs: 0, residents: 0 };
+      slot.jobs += share;
+      perPoint.set(hit.point.id, slot);
+    }
+  }
+
+  const targets: DailyApplyTarget[] = [];
+  let aggResidents = 0;
+  let aggJobs = 0;
+  for (const [pointId, d] of perPoint) {
+    const delta: { jobs?: number; residents?: number } = {};
+    if (d.residents !== 0) {
+      delta.residents = d.residents;
+      aggResidents += d.residents;
+    }
+    if (d.jobs !== 0) {
+      delta.jobs = d.jobs;
+      aggJobs += d.jobs;
+    }
+    if (delta.residents !== undefined || delta.jobs !== undefined) {
+      targets.push({ pointId, delta });
+    }
+  }
+
+  return {
+    targets,
+    aggregateDelta: { residents: aggResidents, jobs: aggJobs },
+    marksCompletion,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Days elapsed (1-indexed) since deal start, capped at duration. */
+export function dealProgressDays(deal: Deal, currentDay: number): number {
+  return Math.max(0, Math.min(deal.durationDays, currentDay - deal.startDay + 1));
+}
+
+/** Fractional progress in [0, 1] as a function of game days elapsed. */
+export function dealProgressFraction(deal: Deal, currentDay: number): number {
+  return dealProgressDays(deal, currentDay) / deal.durationDays;
+}
+
+export function isDealActive(deal: Deal): boolean {
+  return deal.state === 'active';
+}

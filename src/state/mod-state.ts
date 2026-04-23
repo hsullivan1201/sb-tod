@@ -36,6 +36,10 @@ import {
   type MutatorOptions,
 } from '../sim/mutate';
 import {
+  computeDailyApply,
+  type Deal,
+} from '../sim/deals';
+import {
   createAdaptiveStorage,
   type AdaptiveStorage,
   type StorageBackendKind,
@@ -73,6 +77,16 @@ export interface PersistedState {
    * arrays are equivalent to "no splits for that pop".
    */
   splitChildren?: Array<[string, string[]]>;
+  /** Active + completed deals. Absent on first save (no deals yet). */
+  deals?: Deal[];
+}
+
+export interface DealTickReport {
+  dealId: string;
+  applied: { jobs: number; residents: number };
+  pointsAffected: number;
+  rejections: number;
+  marksCompletion: boolean;
 }
 
 export interface ModStateStats {
@@ -80,6 +94,12 @@ export interface ModStateStats {
   demandChangeEvents: number;
   dayTicks: number;
   lastDay: number | null;
+  /** Counts derived from current deals list. */
+  activeDeals: number;
+  completedDeals: number;
+  cancelledDeals: number;
+  /** Last day's deal application reports — most recent first. */
+  lastTickReports: DealTickReport[];
   /** Current save name (null = no save loaded yet, defaults to `_unsaved` slot). */
   currentSaveName: string | null;
   /** The actual storage key in use right now — handy for debugging cross-save bleed. */
@@ -200,6 +220,15 @@ export interface ModState {
   applyDensityDelta(pointId: string, delta: DemandDelta, source: DeltaSourceKind): ApplyResult;
   markDirty(): void;
   persist(): Promise<boolean>;
+  /** Read-only deals list (active + completed + cancelled, in insertion order). */
+  getDeals(): readonly Deal[];
+  /**
+   * Add a new deal to mod state. Caller is responsible for charging the
+   * player via `api.actions.subtractMoney`.
+   */
+  addDeal(deal: Deal): void;
+  /** Cancel an active deal. (No refund logic in v1; future enhancement.) */
+  cancelDeal(dealId: string): boolean;
   /**
    * Switch the active save slot. If the current state is dirty, persist
    * it under the OLD save name first (to not silently drop unsaved
@@ -266,6 +295,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let lastHydrate: HydrateReport | null = null;
   let initProbe: InitProbe | null = null;
   let currentSaveName: string | null = options.initialSaveName ?? null;
+  let deals: Deal[] = [];
+  let lastTickReports: DealTickReport[] = [];
   let initPromise: Promise<boolean> | null = null;
 
   async function doInit(providedDemand?: DemandData): Promise<boolean> {
@@ -301,8 +332,9 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
 
     if (persisted && persisted.version === 1) {
       lastHydrate = applyPersisted(mutator, d, persisted);
+      deals = persisted.deals ? persisted.deals.map((dd) => ({ ...dd })) : [];
       console.log(
-        `[sb-tod] Hydrated "${storageKey}" (saved ${new Date(persisted.savedAt).toISOString()}): preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}. Storage keys: [${storageKeys.join(', ')}]`
+        `[sb-tod] Hydrated "${storageKey}" (saved ${new Date(persisted.savedAt).toISOString()}): preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}, deals=${deals.length}. Storage keys: [${storageKeys.join(', ')}]`
       );
     } else {
       // Fresh game (or first run, or persisted state was dropped). Capture
@@ -317,6 +349,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         missingPoint: 0,
         fromStorage: false,
       };
+      deals = [];
       console.log(
         `[sb-tod] No persisted state found at "${storageKey}". Captured ${mutator.snapshot().baselineDemand.size} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install or different save slot).`
       );
@@ -385,6 +418,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         id,
         [...children],
       ]),
+      deals: deals.map((dd) => ({ ...dd, appliedSoFar: { ...dd.appliedSoFar } })),
     };
     const storageKey = makeStorageKey(currentSaveName);
     try {
@@ -429,9 +463,67 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       ensureInit().catch((e) => console.warn('[sb-tod] ensureInit on day tick failed:', e));
       return;
     }
+
+    // Apply each active deal's daily delta. Done before the persist below
+    // so the saved state reflects today's progress.
+    lastTickReports = applyActiveDealsForDay(day);
+
     if (dirty && dayTicks % persistEveryNDays === 0) {
       void persist();
     }
+  }
+
+  function applyActiveDealsForDay(day: number): DealTickReport[] {
+    if (!mutator || !demand) return [];
+    const reports: DealTickReport[] = [];
+    for (const deal of deals) {
+      if (deal.state !== 'active') continue;
+      // Don't tick on a day before the deal started (defensive against
+      // weird load ordering — shouldn't normally happen).
+      if (day < deal.startDay) continue;
+      const plan = computeDailyApply({
+        deal,
+        currentDay: day,
+        walkshedPoints: demand.points.values(),
+      });
+      let applied = { jobs: 0, residents: 0 };
+      let pointsAffected = 0;
+      let rejections = 0;
+      for (const target of plan.targets) {
+        const r = mutator.applyDensityDelta(target.pointId, target.delta, 'deals');
+        if (r.ok) {
+          applied.jobs += target.delta.jobs ?? 0;
+          applied.residents += target.delta.residents ?? 0;
+          pointsAffected++;
+          dirty = true;
+        } else {
+          rejections++;
+          // A rejection here is usually ghost-town (a point was eligible at
+          // proposal time but residents/jobs hit zero mid-deal). Log but
+          // don't abort the deal — distribution self-heals next tick.
+          console.warn(
+            `[sb-tod] deal ${deal.id} apply rejected on point ${target.pointId}: ${r.reason} — ${r.message}`
+          );
+        }
+      }
+      deal.appliedSoFar.residents += applied.residents;
+      deal.appliedSoFar.jobs += applied.jobs;
+      if (plan.marksCompletion) {
+        deal.state = 'completed';
+        dirty = true;
+        console.log(
+          `[sb-tod] deal ${deal.id} (${deal.kind}/${deal.tier}) completed on day ${day}: delivered ${deal.appliedSoFar.residents.toFixed(0)}r / ${deal.appliedSoFar.jobs.toFixed(0)}j of ${deal.totalDensity.residents}r / ${deal.totalDensity.jobs}j planned.`
+        );
+      }
+      reports.push({
+        dealId: deal.id,
+        applied,
+        pointsAffected,
+        rejections,
+        marksCompletion: plan.marksCompletion,
+      });
+    }
+    return reports;
   }
 
   function onDemandChangeFired(): void {
@@ -496,6 +588,18 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       dirty = true;
     },
     persist,
+    getDeals: () => deals,
+    addDeal(deal) {
+      deals.push(deal);
+      dirty = true;
+    },
+    cancelDeal(dealId) {
+      const d = deals.find((dd) => dd.id === dealId);
+      if (!d || d.state !== 'active') return false;
+      d.state = 'cancelled';
+      dirty = true;
+      return true;
+    },
     setCurrentSaveName,
     getCurrentSaveName: () => currentSaveName,
     onDayTick,
@@ -506,6 +610,14 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       const snap = mutator?.snapshot();
       const storageBackend: StorageBackendKind =
         (backend as Partial<AdaptiveStorage>).lastBackend?.() ?? 'api';
+      let activeDealsCount = 0;
+      let completedDealsCount = 0;
+      let cancelledDealsCount = 0;
+      for (const d of deals) {
+        if (d.state === 'active') activeDealsCount++;
+        else if (d.state === 'completed') completedDealsCount++;
+        else if (d.state === 'cancelled') cancelledDealsCount++;
+      }
       return {
         initialized,
         demandChangeEvents,
@@ -522,6 +634,10 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         popsTracked: snap?.baselinePopSizes.size ?? 0,
         pointsWithDeltas: snap?.cumulativeDeltas.size ?? 0,
         lastHydrate,
+        activeDeals: activeDealsCount,
+        completedDeals: completedDealsCount,
+        cancelledDeals: cancelledDealsCount,
+        lastTickReports,
       };
     },
     _setStorage(s) {
