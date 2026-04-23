@@ -260,6 +260,14 @@ export interface ModState {
    */
   debugReconcileAll(): { points: number; created: number; removed: number };
   /**
+   * Wipe ALL TOD state for the current save: revert any tracked
+   * mutations to baseline, delete every split child, drop the entire
+   * deals history, persist the empty state. Recovers from corruption
+   * (e.g. the snapshot-aliasing bug that wiped split children silently
+   * across many sessions). Money already spent is NOT refunded.
+   */
+  debugResetCurrentSave(): { dealsCleared: number; pointsReverted: number };
+  /**
    * Switch the active save slot. If the current state is dirty, persist
    * it under the OLD save name first (to not silently drop unsaved
    * mutations), then drop in-memory state and re-init under the new name
@@ -673,6 +681,17 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         console.warn('[sb-tod] cancel notification failed:', e);
       }
       return true;
+    },
+    debugResetCurrentSave() {
+      if (!mutator) return { dealsCleared: 0, pointsReverted: 0 };
+      const dealsCleared = deals.length;
+      const pointsReverted = mutator.snapshot().baselineDemand.size;
+      mutator.revertAll();
+      deals = [];
+      lastTickReports = [];
+      dirty = true;
+      void persist();
+      return { dealsCleared, pointsReverted };
     },
     debugReconcileAll() {
       if (!mutator) return { points: 0, created: 0, removed: 0 };

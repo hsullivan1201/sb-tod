@@ -827,6 +827,8 @@ function DebugTodSection({
   // the same day twice (day-already-accounted-for), which isn't what
   // the player expects when mashing the button for testing.
   const [debugDayBoost, setDebugDayBoost] = useState(0);
+  // Two-click confirmation for the destructive Reset State button.
+  const [resetArmed, setResetArmed] = useState(false);
 
   const refreshStats = useCallback(() => setStats(getModState().stats()), []);
 
@@ -1092,6 +1094,30 @@ function DebugTodSection({
           title="walk every persisted-delta point and force-recreate split children"
         >
           Reconcile now
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={() => {
+            if (!resetArmed) {
+              setResetArmed(true);
+              setLast('Click Reset State again to confirm. Wipes all TOD state for this save (drops all deals, reverts mutations to baseline). Money already spent is NOT refunded.');
+              return;
+            }
+            try {
+              const r = getModState().debugResetCurrentSave();
+              setLast(`Reset complete: ${r.dealsCleared} deals dropped, ${r.pointsReverted} points reverted to baseline. State is now clean — propose new deals on this save freely.`);
+              setResetArmed(false);
+              onAfter();
+              refreshStats();
+            } catch (e: any) {
+              setLast(`reset threw: ${e?.message ?? e}`);
+              setResetArmed(false);
+            }
+          }}
+          title="wipe all TOD state for this save and start fresh"
+          style={resetArmed ? { background: '#dc2626', color: '#fff' } : undefined}
+        >
+          {resetArmed ? 'Confirm Reset?' : 'Reset State'}
         </Button>
       </div>
 
