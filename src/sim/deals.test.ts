@@ -131,6 +131,24 @@ describe('validateProposal', () => {
     expect(r.reason).toBe('walkshed-empty');
   });
 
+  it('applies costMultiplier to totalCost and the funds check', () => {
+    const points = [point('p1', 100, 200, 0, 0.001)];
+    // Housing/L is normally $250M; at 1% it's $2.5M. Budget of $5M
+    // wouldn't cover the original but easily covers the discounted.
+    const r = validateProposal({
+      kind: 'housing',
+      tier: 'L',
+      centerLngLat: CENTER,
+      radiusMeters: 500,
+      walkshedPoints: points,
+      budget: 5_000_000,
+      costMultiplier: 0.01,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.totalCost).toBe(2_500_000);
+  });
+
   it('honors residentsEligibilityThreshold (matches mutator ghostTownThreshold)', () => {
     const points = [point('p1', 0, 50, 0, 0.001)];
     const r = validateProposal({

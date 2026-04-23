@@ -81,6 +81,17 @@ export const DEFAULT_TIER_TABLE: Record<DealKind, Record<DealTier, TierConfig>> 
 /** Duration choices the propose-deal UI offers as quick-pick buttons. */
 export const DURATION_PRESETS = [1, 3, 5, 10, 20, 30] as const;
 
+/**
+ * TEMPORARY: cost multiplier for debug / playtesting. Set to 0.01
+ * during heavy chunked-apply testing so the player can spam Housing/L
+ * proposals without going broke. **FLIP BACK TO 1.0 BEFORE SHIP.**
+ *
+ * The panel reads this constant for both the displayed cost and the
+ * validateProposal call (via costMultiplier on ProposalInput), so
+ * changing it here propagates everywhere that matters.
+ */
+export const DEBUG_COST_MULTIPLIER = 0.01;
+
 export interface Deal {
   id: string;
   kind: DealKind;
@@ -186,6 +197,12 @@ export interface ProposalInput {
    * fast pop or a slow phased build for the same total density.
    */
   durationOverride?: number;
+  /**
+   * Multiplier applied to the tier's base cost. Defaults to 1.0
+   * (no change). The panel passes DEBUG_COST_MULTIPLIER during
+   * playtesting so the player can iterate without going broke.
+   */
+  costMultiplier?: number;
 }
 
 export function validateProposal(input: ProposalInput): ProposalResult {
@@ -199,11 +216,12 @@ export function validateProposal(input: ProposalInput): ProposalResult {
     };
   }
 
-  if (input.budget < tierConfig.cost) {
+  const effectiveCost = Math.round(tierConfig.cost * (input.costMultiplier ?? 1));
+  if (input.budget < effectiveCost) {
     return {
       ok: false,
       reason: 'insufficient-funds',
-      message: `deal costs $${tierConfig.cost.toLocaleString()}; budget is $${input.budget.toLocaleString()}`,
+      message: `deal costs $${effectiveCost.toLocaleString()}; budget is $${input.budget.toLocaleString()}`,
     };
   }
 
@@ -268,7 +286,7 @@ export function validateProposal(input: ProposalInput): ProposalResult {
     kind: input.kind,
     tier: input.tier,
     totalDensity: tierConfig.totalDensity,
-    totalCost: tierConfig.cost,
+    totalCost: effectiveCost,
     durationDays,
     eligiblePoints: eligible,
     totalResidentsWeight,

@@ -26,6 +26,7 @@ import {
   confirmProposal,
   DEFAULT_TIER_TABLE,
   DURATION_PRESETS,
+  DEBUG_COST_MULTIPLIER,
   type Deal,
   type DealKind,
   type DealTier,
@@ -1328,6 +1329,7 @@ function ProposeDeal({
       walkshedPoints: demand.points.values(),
       budget,
       durationOverride: durationOverride ?? undefined,
+      costMultiplier: DEBUG_COST_MULTIPLIER,
     });
   }, [pinned, kind, tier, durationOverride]);
 
@@ -1488,7 +1490,7 @@ function ProposeDeal({
 
       <div style={{ color: 'rgba(255,255,255,0.6)', fontFamily: 'monospace', fontSize: 10, lineHeight: 1.5 }}>
         +{tierConfig.totalDensity.residents.toLocaleString()} res ·{' '}
-        +{tierConfig.totalDensity.jobs.toLocaleString()} jobs · {fmtMoney(tierConfig.cost)} ·{' '}
+        +{tierConfig.totalDensity.jobs.toLocaleString()} jobs · {fmtMoney(Math.round(tierConfig.cost * DEBUG_COST_MULTIPLIER))}{DEBUG_COST_MULTIPLIER !== 1 && <span style={{ color: '#facc15' }}> [DEBUG {Math.round(DEBUG_COST_MULTIPLIER * 100)}%]</span>} ·{' '}
         {effectiveDuration}d
         {durationOverride !== null && (
           <span style={{ color: 'rgba(255,255,255,0.4)' }}> (default {tierConfig.duration})</span>
@@ -1528,7 +1530,7 @@ function ProposeDeal({
           fontWeight: 600,
         }}
       >
-        Confirm — {fmtMoney(tierConfig.cost)}
+        Confirm — {fmtMoney(Math.round(tierConfig.cost * DEBUG_COST_MULTIPLIER))}
       </button>
 
       {lastResult && (
