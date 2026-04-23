@@ -32,38 +32,46 @@ export interface TierConfig {
 }
 
 /**
- * Default tier table. Densities/costs follow ARCHITECTURE.md decision 1b
- * (housing 500/2000/8000 res, commercial 1500/6000/25000 jobs, mixed at
- * 70% of each). Durations were originally 30/60/90 game days but in-game
- * playtesting (Hazel, 2026-04-22) found that pacing too slow — game days
- * pass faster than the architecture envisioned. Cut to 5/10/20 to keep
- * deals visible/satisfying within a play session. Player can override
- * via `durationOverride` on the proposal.
+ * Default tier table. Densities follow the spirit of ARCHITECTURE.md
+ * decision 1b but are now rounded to multiples of 200 — the game's pop
+ * granularity. Each tier delivers a clean integer count of pops over
+ * its duration, so the chunked daily-apply loop never has to fudge
+ * residuals.
+ *
+ * Housing/S of 500 → 600 (+100, slight bump), Commercial/S of 1500 →
+ * 1600 (+100). Mixed = 70% of housing + 70% of commercial, then
+ * rounded to nearest 200 per dimension. Costs unchanged.
+ *
+ * Durations: originally 30/60/90 in the architecture but in-game days
+ * passed faster than envisioned, so cut to 5/10/20. Player can
+ * override per proposal via `durationOverride`.
  */
 export const DEFAULT_TIER_TABLE: Record<DealKind, Record<DealTier, TierConfig>> = {
   housing: {
-    S: { totalDensity: { residents: 500, jobs: 0 }, cost: 25_000_000, duration: 5 },
+    S: { totalDensity: { residents: 600, jobs: 0 }, cost: 25_000_000, duration: 5 },
     M: { totalDensity: { residents: 2000, jobs: 0 }, cost: 80_000_000, duration: 10 },
     L: { totalDensity: { residents: 8000, jobs: 0 }, cost: 250_000_000, duration: 20 },
   },
   commercial: {
-    S: { totalDensity: { residents: 0, jobs: 1500 }, cost: 30_000_000, duration: 5 },
+    S: { totalDensity: { residents: 0, jobs: 1600 }, cost: 30_000_000, duration: 5 },
     M: { totalDensity: { residents: 0, jobs: 6000 }, cost: 100_000_000, duration: 10 },
     L: { totalDensity: { residents: 0, jobs: 25_000 }, cost: 320_000_000, duration: 20 },
   },
+  // Mixed: 70% of housing residents + 70% of commercial jobs, rounded
+  // to nearest 200 per dimension (so it stays pop-clean).
   mixed: {
     S: {
-      totalDensity: { residents: Math.round(500 * 0.7), jobs: Math.round(1500 * 0.7) },
+      totalDensity: { residents: 400, jobs: 1200 }, // 70% × 600 = 420 → 400; 70% × 1600 = 1120 → 1200
       cost: Math.round((25_000_000 + 30_000_000) * 0.7),
       duration: 5,
     },
     M: {
-      totalDensity: { residents: Math.round(2000 * 0.7), jobs: Math.round(6000 * 0.7) },
+      totalDensity: { residents: 1400, jobs: 4200 }, // 70% × 2000 = 1400; 70% × 6000 = 4200
       cost: Math.round((80_000_000 + 100_000_000) * 0.7),
       duration: 10,
     },
     L: {
-      totalDensity: { residents: Math.round(8000 * 0.7), jobs: Math.round(25_000 * 0.7) },
+      totalDensity: { residents: 5600, jobs: 17_600 }, // 70% × 8000 = 5600; 70% × 25000 = 17500 → 17600
       cost: Math.round((250_000_000 + 320_000_000) * 0.7),
       duration: 20,
     },

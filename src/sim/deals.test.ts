@@ -49,7 +49,7 @@ describe('validateProposal', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.totalCost).toBe(25_000_000);
-    expect(r.totalDensity.residents).toBe(500);
+    expect(r.totalDensity.residents).toBe(600);
     expect(r.totalDensity.jobs).toBe(0);
     expect(r.eligiblePoints.length).toBe(2);
     expect(r.eligiblePoints[0].residentsEligible).toBe(true);
@@ -173,13 +173,23 @@ describe('default tier table', () => {
     }
   });
 
-  it('mixed tiers add both, at 70% of housing/commercial respectively', () => {
+  it('every default density is a clean multiple of 200 (chunkable)', () => {
+    for (const kind of ['housing', 'commercial', 'mixed'] as const) {
+      for (const tier of ['S', 'M', 'L'] as const) {
+        const t = DEFAULT_TIER_TABLE[kind][tier];
+        expect(t.totalDensity.residents % 200).toBe(0);
+        expect(t.totalDensity.jobs % 200).toBe(0);
+      }
+    }
+  });
+
+  it('mixed tiers approximate 70% of housing/commercial (within one chunk of 200)', () => {
     for (const tier of ['S', 'M', 'L'] as const) {
       const m = DEFAULT_TIER_TABLE.mixed[tier];
       const h = DEFAULT_TIER_TABLE.housing[tier];
       const c = DEFAULT_TIER_TABLE.commercial[tier];
-      expect(m.totalDensity.residents).toBe(Math.round(h.totalDensity.residents * 0.7));
-      expect(m.totalDensity.jobs).toBe(Math.round(c.totalDensity.jobs * 0.7));
+      expect(Math.abs(m.totalDensity.residents - h.totalDensity.residents * 0.7)).toBeLessThan(200);
+      expect(Math.abs(m.totalDensity.jobs - c.totalDensity.jobs * 0.7)).toBeLessThan(200);
       expect(m.cost).toBe(Math.round((h.cost + c.cost) * 0.7));
     }
   });
@@ -215,7 +225,7 @@ describe('confirmProposal', () => {
     expect(deal.id).toBe('test-1');
     expect(deal.state).toBe('active');
     expect(deal.startDay).toBe(7);
-    expect(deal.totalDensity).toEqual({ residents: 500, jobs: 0 });
+    expect(deal.totalDensity).toEqual({ residents: 600, jobs: 0 });
     expect(deal.appliedSoFar).toEqual({ residents: 0, jobs: 0 });
     expect(deal.pending).toEqual({ residents: 0, jobs: 0 });
     expect(deal.durationDays).toBe(5); // housing/S default
