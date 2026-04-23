@@ -476,6 +476,35 @@ describe('pop splitting', () => {
     expect(demand.popsMap.get('x')!.size).toBeCloseTo(1100, 8);
   });
 
+  it('snapshot returns COPIES so feeding it back to hydrateTracking is safe', () => {
+    // Regression: snapshot used to return refs to the live maps, so
+    // resetCumulativeFor/rebaselineTo (which do `snapshot() →
+    // hydrateTracking(snap)`) would clear the live maps and then
+    // try to iterate them, dropping all entries. This pins the fix.
+    const P = point('P', 0, 600);
+    const pops = [
+      pop('a', 'P', 'P', 200),
+      pop('b', 'P', 'P', 200),
+      pop('c', 'P', 'P', 200),
+    ];
+    const demand = fixture([P], pops);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+    m.applyDensityDelta('P', { residents: 200 }, 'deals');
+
+    const snap = m.snapshot();
+    expect(snap.baselineDemand.size).toBeGreaterThan(0);
+    expect(snap.baselinePopSizes.size).toBeGreaterThan(0);
+    expect(snap.cumulativeDeltas.size).toBe(1);
+
+    // Round-trip the snapshot through hydrateTracking. Should be
+    // a no-op: same baselines, same pop sizes, same deltas.
+    m.hydrateTracking(snap);
+    const after = m.snapshot();
+    expect(after.baselineDemand.size).toBe(snap.baselineDemand.size);
+    expect(after.baselinePopSizes.size).toBe(snap.baselinePopSizes.size);
+    expect(after.cumulativeDeltas.size).toBe(snap.cumulativeDeltas.size);
+  });
+
   it('snapshot().splitChildren reflects the live set; hydrateTracking round-trips it', () => {
     const P = point('P', 0, 100);
     const x = pop('x', 'P', 'P', 150);

@@ -782,34 +782,48 @@ export function createMutator(
       return reconcilePointStrict(pointId, []);
     },
     snapshot() {
+      // IMPORTANT: return shallow copies, not refs. snapshot() is often
+      // called with the intent of feeding the result back into
+      // hydrateTracking (e.g. via resetCumulativeFor) — and
+      // hydrateTracking starts by clearing the live maps. If we
+      // returned refs, that clear would empty the iterables we're
+      // about to read, dropping all entries. Cost of the copy is
+      // negligible (maps with 8k+ entries copy in single-digit ms).
       return {
-        baselineDemand,
-        baselinePopSizes,
-        cumulativeDeltas,
-        splitChildren,
+        baselineDemand: new Map(baselineDemand),
+        baselinePopSizes: new Map(baselinePopSizes),
+        cumulativeDeltas: new Map(cumulativeDeltas),
+        splitChildren: new Map(splitChildren),
       };
     },
     hydrateTracking(persisted) {
+      // Materialize ALL inputs to arrays first, BEFORE we clear any
+      // live map. If a caller passed in a ref to one of our live
+      // maps (snapshot() now returns copies, but external callers
+      // might not), clearing first would empty the iterable mid-read.
+      const baselines = [...persisted.baselineDemand];
+      const popSizes = [...persisted.baselinePopSizes];
+      const deltas = [...persisted.cumulativeDeltas];
+      const splits = persisted.splitChildren ? [...persisted.splitChildren] : [];
+
       baselineDemand.clear();
       baselinePopSizes.clear();
       cumulativeDeltas.clear();
       splitChildren.clear();
-      for (const [id, b] of persisted.baselineDemand) {
+      for (const [id, b] of baselines) {
         baselineDemand.set(id, { jobs: b.jobs, residents: b.residents });
       }
-      for (const [id, s] of persisted.baselinePopSizes) {
+      for (const [id, s] of popSizes) {
         baselinePopSizes.set(id, s);
       }
-      for (const [id, d] of persisted.cumulativeDeltas) {
+      for (const [id, d] of deltas) {
         cumulativeDeltas.set(id, {
           jobs: { fromDeals: d.jobs.fromDeals, fromOrganic: d.jobs.fromOrganic },
           residents: { fromDeals: d.residents.fromDeals, fromOrganic: d.residents.fromOrganic },
         });
       }
-      if (persisted.splitChildren) {
-        for (const [id, children] of persisted.splitChildren) {
-          if (children.length > 0) splitChildren.set(id, [...children]);
-        }
+      for (const [id, children] of splits) {
+        if (children.length > 0) splitChildren.set(id, [...children]);
       }
     },
   };
