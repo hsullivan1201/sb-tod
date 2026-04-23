@@ -1076,6 +1076,22 @@ function DebugTodSection({
         >
           Tick now (+1d)
         </Button>
+        <Button
+          variant="secondary"
+          onClick={() => {
+            try {
+              const r = getModState().debugReconcileAll();
+              setLast(`Reconciled ${r.points} pts: +${r.created} pops created, -${r.removed} removed.`);
+              onAfter();
+              refreshStats();
+            } catch (e: any) {
+              setLast(`reconcile threw: ${e?.message ?? e}`);
+            }
+          }}
+          title="walk every persisted-delta point and force-recreate split children"
+        >
+          Reconcile now
+        </Button>
       </div>
 
       {last && (

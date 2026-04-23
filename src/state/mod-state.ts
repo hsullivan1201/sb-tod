@@ -252,6 +252,14 @@ export interface ModState {
    */
   debugCompleteDeal(dealId: string): boolean;
   /**
+   * Debug: walk every persisted-delta point and force-reconcile its
+   * pop state against tracked baseline + cumulative. Recreates split
+   * children that the game dropped during save/load (or that hydrate's
+   * baseline-shift detection caused us to skip). Returns the count of
+   * points reconciled and total children created.
+   */
+  debugReconcileAll(): { points: number; created: number; removed: number };
+  /**
    * Switch the active save slot. If the current state is dirty, persist
    * it under the OLD save name first (to not silently drop unsaved
    * mutations), then drop in-memory state and re-init under the new name
@@ -665,6 +673,21 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         console.warn('[sb-tod] cancel notification failed:', e);
       }
       return true;
+    },
+    debugReconcileAll() {
+      if (!mutator) return { points: 0, created: 0, removed: 0 };
+      const snap = mutator.snapshot();
+      let points = 0;
+      let created = 0;
+      let removed = 0;
+      for (const pointId of snap.cumulativeDeltas.keys()) {
+        const r = mutator.reconcilePoint(pointId);
+        points++;
+        created += r.created;
+        removed += r.removed;
+      }
+      if (created > 0 || removed > 0) dirty = true;
+      return { points, created, removed };
     },
     debugCompleteDeal(dealId) {
       if (!mutator || !demand) return false;
