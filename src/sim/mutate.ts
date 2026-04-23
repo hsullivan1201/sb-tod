@@ -165,6 +165,17 @@ export interface DemandMutator {
    */
   revertAll(): void;
 
+  /**
+   * Reconcile pop state at a single point against current tracked
+   * baseline + cumulative delta. Idempotent: a no-op if the point is
+   * already consistent, recreates missing split children if the game
+   * dropped them across save/load (the game persists DemandPoint
+   * aggregates but our runtime-added pops in popsMap don't survive).
+   *
+   * Strict-mode only. In fractional mode this is a no-op.
+   */
+  reconcilePoint(pointId: string): { created: number; removed: number };
+
   /** Read-only view for persistence and tests. */
   snapshot(): MutatorSnapshot;
 
@@ -764,6 +775,12 @@ export function createMutator(
     },
     captureBaselines,
     revertAll,
+    reconcilePoint(pointId) {
+      if (strictUnitSize === undefined || strictUnitSize <= 0) {
+        return { created: 0, removed: 0 };
+      }
+      return reconcilePointStrict(pointId, []);
+    },
     snapshot() {
       return {
         baselineDemand,

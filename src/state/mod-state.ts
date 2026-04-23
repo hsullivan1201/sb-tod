@@ -793,7 +793,15 @@ function applyPersisted(
     if (matchesPreserved) {
       report.preserved++;
       report.perPoint.set(pointId, 'preserved');
-      // tracking already seeded, nothing else to do
+      // The game preserved point.residents / point.jobs (the
+      // DemandPoint aggregates), but it does NOT preserve our
+      // runtime-added split-child pops in popsMap — those are
+      // serialized as part of our mod state, not the game's. So
+      // even on the "preserved" path we need to recreate any missing
+      // children to make pop count match the (already-correct)
+      // aggregate. reconcilePoint is idempotent: no-op if everything
+      // is already there, recreates missing children otherwise.
+      mutator.reconcilePoint(pointId);
     } else if (matchesReset) {
       // Game reset our mutations. Replay per-source so the delta
       // buckets remain correctly attributed. We must clear the seeded

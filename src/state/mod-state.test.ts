@@ -147,6 +147,51 @@ describe('mod state — persist roundtrip', () => {
     expect(sessionB.mutator().getCumulativeDeltaTotal('P')).toEqual({ jobs: 0, residents: 200 });
   });
 
+  it('preserved-aggregate-but-missing-children: reconcilePoint recreates lost split children on hydrate', async () => {
+    // Game preserves point.residents through save/load, but our
+    // runtime-added split-child pops in popsMap don't survive.
+    // Hydrate's preserved path used to skip reconciliation, leaving
+    // pop count too low. This test pins the fix.
+    const storage = makeStorage();
+
+    // Session 1: 600 residents in 3 pops of 200 each. Strict mode.
+    // Mutate +200 → 4 pops desired (3 originals + 1 child).
+    const A = point('P', 0, 600);
+    const a = pop('a', 'P', 'P', 200);
+    const b = pop('b', 'P', 'P', 200);
+    const c = pop('c', 'P', 'P', 200);
+    const sessionA = createModState({
+      storage,
+      getDemand: () => fixture([A], [a, b, c]),
+      // No mutatorOptions override → defaults to strictUnitSize: 200.
+    });
+    await sessionA.ensureInit();
+    sessionA.applyDensityDelta('P', { residents: 200 }, 'deals');
+    await sessionA.persist();
+
+    // Session 2: simulate game preserving aggregate (800 residents)
+    // but dropping our runtime split children (only 3 originals in
+    // popsMap, no sb-tod-split:* entries).
+    const B = point('P', 0, 800);
+    const a2 = pop('a', 'P', 'P', 200);
+    const b2 = pop('b', 'P', 'P', 200);
+    const c2 = pop('c', 'P', 'P', 200);
+    const demandB = fixture([B], [a2, b2, c2]);
+    const sessionB = createModState({
+      storage,
+      getDemand: () => demandB,
+    });
+    await sessionB.ensureInit();
+
+    expect(sessionB.stats().lastHydrate?.preserved).toBe(1);
+    // Reconciliation should have created 1 missing child to bring
+    // pop count up to floor(800/200) = 4.
+    expect(demandB.popsMap.size).toBe(4);
+    for (const p of demandB.popsMap.values()) {
+      expect(p.size).toBe(200);
+    }
+  });
+
   it('drops stale delta and rebaselines when live matches neither baseline nor expected', async () => {
     const storage = makeStorage();
 
