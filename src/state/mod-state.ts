@@ -203,7 +203,11 @@ function describeShape(v: unknown): string {
   if (v == null) return 'null';
   if (typeof v !== 'object') return String(v);
   const o = v as any;
-  return `{ version: ${o.version}, savedAt: ${o.savedAt}, points: ${o.baselineDemand?.length ?? '?'}, pops: ${o.baselinePopSizes?.length ?? '?'}, deltas: ${o.cumulativeDeltas?.length ?? '?'} }`;
+  const dealsTotal = Array.isArray(o.deals) ? o.deals.length : 0;
+  const dealsActive = Array.isArray(o.deals)
+    ? o.deals.filter((d: any) => d?.state === 'active').length
+    : 0;
+  return `{ version: ${o.version}, savedAt: ${o.savedAt}, points: ${o.baselineDemand?.length ?? '?'}, pops: ${o.baselinePopSizes?.length ?? '?'}, deltas: ${o.cumulativeDeltas?.length ?? '?'}, deals: ${dealsTotal} (${dealsActive} active) }`;
 }
 
 function totalDelta(d: PointDelta): { jobs: number; residents: number } {
@@ -592,12 +596,17 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     addDeal(deal) {
       deals.push(deal);
       dirty = true;
+      // Fire-and-forget persist so the deal is durable immediately,
+      // not waiting for the next day tick / game save. Otherwise a
+      // confirm-then-quit before any day passes loses the deal.
+      void persist();
     },
     cancelDeal(dealId) {
       const d = deals.find((dd) => dd.id === dealId);
       if (!d || d.state !== 'active') return false;
       d.state = 'cancelled';
       dirty = true;
+      void persist();
       return true;
     },
     setCurrentSaveName,
