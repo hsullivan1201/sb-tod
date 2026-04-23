@@ -216,7 +216,26 @@ describe('confirmProposal', () => {
     expect(deal.startDay).toBe(7);
     expect(deal.totalDensity).toEqual({ residents: 500, jobs: 0 });
     expect(deal.appliedSoFar).toEqual({ residents: 0, jobs: 0 });
-    expect(deal.durationDays).toBe(30);
+    expect(deal.durationDays).toBe(5); // housing/S default
+  });
+
+  it('honors a durationOverride from the proposal', () => {
+    const points = [point('p1', 100, 200, 0, 0.001)];
+    const v = validateProposal({
+      kind: 'housing',
+      tier: 'L',
+      centerLngLat: CENTER,
+      radiusMeters: 500,
+      walkshedPoints: points,
+      budget: 1_000_000_000,
+      durationOverride: 7,
+    });
+    expect(v.ok).toBe(true);
+    if (!v.ok) return;
+    expect(v.durationDays).toBe(7);
+    // Cost and density stay tied to the tier — only pacing changed.
+    expect(v.totalCost).toBe(250_000_000);
+    expect(v.totalDensity.residents).toBe(8000);
   });
 });
 

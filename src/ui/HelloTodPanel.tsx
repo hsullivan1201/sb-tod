@@ -25,6 +25,7 @@ import {
   validateProposal,
   confirmProposal,
   DEFAULT_TIER_TABLE,
+  DURATION_PRESETS,
   type Deal,
   type DealKind,
   type DealTier,
@@ -1180,9 +1181,19 @@ function ProposeDeal({
 }) {
   const [kind, setKind] = useState<DealKind>('housing');
   const [tier, setTier] = useState<DealTier>('S');
+  // null = use the tier's default duration; number = explicit override.
+  const [durationOverride, setDurationOverride] = useState<number | null>(null);
   const [lastResult, setLastResult] = useState<string | null>(null);
 
   const tierConfig = DEFAULT_TIER_TABLE[kind][tier];
+  const effectiveDuration = durationOverride ?? tierConfig.duration;
+
+  // Reset duration override when tier changes — otherwise the chosen
+  // override sticks across S/M/L bumps and gets confusing.
+  const onTierChange = useCallback((next: DealTier) => {
+    setTier(next);
+    setDurationOverride(null);
+  }, []);
 
   // Live preview: validate against current demand whenever inputs change.
   const preview = useMemo(() => {
@@ -1198,8 +1209,9 @@ function ProposeDeal({
       radiusMeters: HIGHLIGHT_RADIUS_M,
       walkshedPoints: demand.points.values(),
       budget,
+      durationOverride: durationOverride ?? undefined,
     });
-  }, [pinned, kind, tier]);
+  }, [pinned, kind, tier, durationOverride]);
 
   const onConfirm = useCallback(async () => {
     if (!pinned) return;
@@ -1282,7 +1294,7 @@ function ProposeDeal({
           <button
             key={t}
             type="button"
-            onClick={() => setTier(t)}
+            onClick={() => onTierChange(t)}
             style={{
               flex: 1,
               padding: '4px 6px',
@@ -1300,10 +1312,41 @@ function ProposeDeal({
         ))}
       </div>
 
+      <div style={{ display: 'flex', gap: 3, alignItems: 'center', flexWrap: 'wrap' }}>
+        <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: 10 }}>days:</span>
+        {DURATION_PRESETS.map((d) => {
+          const selected = effectiveDuration === d;
+          const isDefault = d === tierConfig.duration && durationOverride === null;
+          return (
+            <button
+              key={d}
+              type="button"
+              onClick={() => setDurationOverride(d === tierConfig.duration ? null : d)}
+              style={{
+                padding: '2px 6px',
+                background: selected ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.05)',
+                color: 'rgba(255,255,255,0.7)',
+                border: isDefault ? '1px solid rgba(255,255,255,0.3)' : 'none',
+                borderRadius: 3,
+                cursor: 'pointer',
+                fontSize: 10,
+                fontWeight: selected ? 600 : 400,
+              }}
+              title={isDefault ? `default for ${tier}` : undefined}
+            >
+              {d}
+            </button>
+          );
+        })}
+      </div>
+
       <div style={{ color: 'rgba(255,255,255,0.6)', fontFamily: 'monospace', fontSize: 10, lineHeight: 1.5 }}>
         +{tierConfig.totalDensity.residents.toLocaleString()} res ·{' '}
         +{tierConfig.totalDensity.jobs.toLocaleString()} jobs · {fmtMoney(tierConfig.cost)} ·{' '}
-        {tierConfig.duration}d
+        {effectiveDuration}d
+        {durationOverride !== null && (
+          <span style={{ color: 'rgba(255,255,255,0.4)' }}> (default {tierConfig.duration})</span>
+        )}
         {preview && (
           preview.ok
             ? <><br />walkshed: {preview.eligiblePoints.length} points · {preview.eligiblePoints.filter((p) => p.residentsEligible).length} can take residents · {preview.eligiblePoints.filter((p) => p.jobsEligible).length} can take jobs</>

@@ -32,40 +32,46 @@ export interface TierConfig {
 }
 
 /**
- * Default tier table from ARCHITECTURE.md decision 1b. Mixed tiers are
- * 70% of housing-tier residents + 70% of commercial-tier jobs, with
- * cost = 70% of (housing.cost + commercial.cost). All numbers are
- * starting points — empirical tuning happens after gameplay testing.
+ * Default tier table. Densities/costs follow ARCHITECTURE.md decision 1b
+ * (housing 500/2000/8000 res, commercial 1500/6000/25000 jobs, mixed at
+ * 70% of each). Durations were originally 30/60/90 game days but in-game
+ * playtesting (Hazel, 2026-04-22) found that pacing too slow — game days
+ * pass faster than the architecture envisioned. Cut to 5/10/20 to keep
+ * deals visible/satisfying within a play session. Player can override
+ * via `durationOverride` on the proposal.
  */
 export const DEFAULT_TIER_TABLE: Record<DealKind, Record<DealTier, TierConfig>> = {
   housing: {
-    S: { totalDensity: { residents: 500, jobs: 0 }, cost: 25_000_000, duration: 30 },
-    M: { totalDensity: { residents: 2000, jobs: 0 }, cost: 80_000_000, duration: 60 },
-    L: { totalDensity: { residents: 8000, jobs: 0 }, cost: 250_000_000, duration: 90 },
+    S: { totalDensity: { residents: 500, jobs: 0 }, cost: 25_000_000, duration: 5 },
+    M: { totalDensity: { residents: 2000, jobs: 0 }, cost: 80_000_000, duration: 10 },
+    L: { totalDensity: { residents: 8000, jobs: 0 }, cost: 250_000_000, duration: 20 },
   },
   commercial: {
-    S: { totalDensity: { residents: 0, jobs: 1500 }, cost: 30_000_000, duration: 30 },
-    M: { totalDensity: { residents: 0, jobs: 6000 }, cost: 100_000_000, duration: 60 },
-    L: { totalDensity: { residents: 0, jobs: 25_000 }, cost: 320_000_000, duration: 90 },
+    S: { totalDensity: { residents: 0, jobs: 1500 }, cost: 30_000_000, duration: 5 },
+    M: { totalDensity: { residents: 0, jobs: 6000 }, cost: 100_000_000, duration: 10 },
+    L: { totalDensity: { residents: 0, jobs: 25_000 }, cost: 320_000_000, duration: 20 },
   },
   mixed: {
     S: {
       totalDensity: { residents: Math.round(500 * 0.7), jobs: Math.round(1500 * 0.7) },
       cost: Math.round((25_000_000 + 30_000_000) * 0.7),
-      duration: 30,
+      duration: 5,
     },
     M: {
       totalDensity: { residents: Math.round(2000 * 0.7), jobs: Math.round(6000 * 0.7) },
       cost: Math.round((80_000_000 + 100_000_000) * 0.7),
-      duration: 60,
+      duration: 10,
     },
     L: {
       totalDensity: { residents: Math.round(8000 * 0.7), jobs: Math.round(25_000 * 0.7) },
       cost: Math.round((250_000_000 + 320_000_000) * 0.7),
-      duration: 90,
+      duration: 20,
     },
   },
 };
+
+/** Duration choices the propose-deal UI offers as quick-pick buttons. */
+export const DURATION_PRESETS = [1, 3, 5, 10, 20, 30] as const;
 
 export interface Deal {
   id: string;
@@ -155,6 +161,12 @@ export interface ProposalInput {
   jobsEligibilityThreshold?: number;
   /** Override default tier table (for tests / future tuning). */
   tierTable?: typeof DEFAULT_TIER_TABLE;
+  /**
+   * Override the tier's default duration. Cost and density stay tied
+   * to the tier; only pacing changes. Useful when the player wants a
+   * fast pop or a slow phased build for the same total density.
+   */
+  durationOverride?: number;
 }
 
 export function validateProposal(input: ProposalInput): ProposalResult {
@@ -227,13 +239,18 @@ export function validateProposal(input: ProposalInput): ProposalResult {
     };
   }
 
+  const durationDays =
+    input.durationOverride && input.durationOverride > 0
+      ? Math.round(input.durationOverride)
+      : tierConfig.duration;
+
   return {
     ok: true,
     kind: input.kind,
     tier: input.tier,
     totalDensity: tierConfig.totalDensity,
     totalCost: tierConfig.cost,
-    durationDays: tierConfig.duration,
+    durationDays,
     eligiblePoints: eligible,
     totalResidentsWeight,
     totalJobsWeight,
