@@ -956,10 +956,12 @@ function DebugTodSection({
           variant="secondary"
           onClick={async () => {
             try {
-              // Probe BOTH backends so we can tell exactly which one
-              // has the data. The adaptive layer would hide this.
+              // Probe BOTH backends. Use the CURRENT save's key (not the
+              // legacy un-namespaced one) so we see what the live mod
+              // state would actually load from.
+              const key = getModState().stats().currentStorageKey;
               const apiKeys = await storage.keys().catch(() => [] as string[]);
-              const apiRaw = await storage.get<unknown>('sb-tod:state:v1', null).catch(() => null);
+              const apiRaw = await storage.get<unknown>(key, null).catch(() => null);
               const lsAvailable = typeof localStorage !== 'undefined';
               const lsKeys: string[] = [];
               let lsRaw: unknown = null;
@@ -968,7 +970,7 @@ function DebugTodSection({
                   const k = localStorage.key(i);
                   if (k != null) lsKeys.push(k);
                 }
-                const lsStr = localStorage.getItem('sb-tod:state:v1');
+                const lsStr = localStorage.getItem(key);
                 if (lsStr != null) {
                   try {
                     lsRaw = JSON.parse(lsStr);
@@ -977,18 +979,23 @@ function DebugTodSection({
                   }
                 }
               }
-              const summary = (raw: unknown) =>
-                raw == null
-                  ? 'null'
-                  : typeof raw === 'object' && raw !== null
-                  ? `{ version: ${(raw as any).version}, savedAt: ${(raw as any).savedAt}, points: ${(raw as any).baselineDemand?.length ?? '?'}, pops: ${(raw as any).baselinePopSizes?.length ?? '?'}, deltas: ${(raw as any).cumulativeDeltas?.length ?? '?'} }`
-                  : String(raw);
+              const summary = (raw: unknown) => {
+                if (raw == null) return 'null';
+                if (typeof raw !== 'object' || raw === null) return String(raw);
+                const o = raw as any;
+                const dealsTotal = Array.isArray(o.deals) ? o.deals.length : 0;
+                const dealsActive = Array.isArray(o.deals)
+                  ? o.deals.filter((d: any) => d?.state === 'active').length
+                  : 0;
+                return `{ version: ${o.version}, savedAt: ${o.savedAt}, points: ${o.baselineDemand?.length ?? '?'}, pops: ${o.baselinePopSizes?.length ?? '?'}, deltas: ${o.cumulativeDeltas?.length ?? '?'}, deals: ${dealsTotal} (${dealsActive} active) }`;
+              };
               setLast(
-                `api.storage.keys: [${apiKeys.join(', ') || '<empty>'}]\n` +
-                  `api.storage.get("sb-tod:state:v1"): ${summary(apiRaw)}\n` +
+                `key: ${key}\n` +
+                  `api.storage.keys: [${apiKeys.join(', ') || '<empty>'}]\n` +
+                  `api.storage.get(${key}): ${summary(apiRaw)}\n` +
                   `localStorage available: ${lsAvailable}\n` +
                   `localStorage keys: [${lsKeys.join(', ') || '<empty>'}]\n` +
-                  `localStorage["sb-tod:state:v1"]: ${summary(lsRaw)}`
+                  `localStorage[${key}]: ${summary(lsRaw)}`
               );
             } catch (e: any) {
               setLast(`storage check threw: ${e?.message ?? e}`);
@@ -997,6 +1004,31 @@ function DebugTodSection({
           }}
         >
           Check storage
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={() => {
+            try {
+              const day = gameState.getCurrentDay();
+              getModState().onDayTick(day);
+              const reports = getModState().stats().lastTickReports;
+              if (reports.length === 0) {
+                setLast(`Tick fired (day ${day}). No active deals to apply.`);
+              } else {
+                const lines = reports.map(
+                  (r) =>
+                    `  ${r.dealId}: +${r.applied.residents.toFixed(1)}r / +${r.applied.jobs.toFixed(1)}j across ${r.pointsAffected} pt(s)${r.rejections > 0 ? ` · ${r.rejections} rejected` : ''}${r.marksCompletion ? ' · COMPLETED' : ''}`
+                );
+                setLast(`Tick fired (day ${day}):\n${lines.join('\n')}`);
+              }
+              onAfter();
+              refreshStats();
+            } catch (e: any) {
+              setLast(`tick threw: ${e?.message ?? e}`);
+            }
+          }}
+        >
+          Tick now
         </Button>
       </div>
 
@@ -1395,6 +1427,7 @@ function DealCard({
   const fraction = elapsed / deal.durationDays;
   const target = deal.totalDensity;
   const applied = deal.appliedSoFar;
+  const lastReport = getModState().stats().lastTickReports.find((r) => r.dealId === deal.id);
 
   return (
     <div
@@ -1436,6 +1469,12 @@ function DealCard({
         {target.jobs > 0 && (<>jobs {applied.jobs.toFixed(0)}/{target.jobs} </>)}
         · {fmtMoney(deal.totalCost)}
       </div>
+      {lastReport && (lastReport.applied.residents !== 0 || lastReport.applied.jobs !== 0 || lastReport.rejections > 0) && (
+        <div style={{ color: 'rgba(255,255,255,0.4)', fontFamily: 'monospace', fontSize: 9 }}>
+          last tick: +{lastReport.applied.residents.toFixed(1)}r / +{lastReport.applied.jobs.toFixed(1)}j across {lastReport.pointsAffected} pt{lastReport.pointsAffected === 1 ? '' : 's'}
+          {lastReport.rejections > 0 && <span style={{ color: '#fca5a5' }}> · {lastReport.rejections} rejected</span>}
+        </div>
+      )}
       {onCancel && (
         <button
           type="button"
