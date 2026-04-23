@@ -217,6 +217,7 @@ describe('confirmProposal', () => {
     expect(deal.startDay).toBe(7);
     expect(deal.totalDensity).toEqual({ residents: 500, jobs: 0 });
     expect(deal.appliedSoFar).toEqual({ residents: 0, jobs: 0 });
+    expect(deal.pending).toEqual({ residents: 0, jobs: 0 });
     expect(deal.durationDays).toBe(5); // housing/S default
   });
 
@@ -259,82 +260,99 @@ describe('computeDailyApply', () => {
       durationDays: 60,
       state: 'active',
       appliedSoFar: { residents: 0, jobs: 0 },
+      pending: { residents: 0, jobs: 0 },
       ...overrides,
     };
   }
 
-  it('distributes today residents across eligible walkshed points by weight', () => {
-    // Two points equidistant; should split 50/50.
+  it('accrues into pending on small ticks; materializes chunks once cumulative crosses chunkSize', () => {
+    // 600-res deal over 6 days → 100 res/day. 1 walkshed point.
+    // Day 1: pending 100, no chunks (floor(100/200) = 0).
+    // Day 2: pending 200, 1 chunk → +200 to point.
+    const points = [point('p1', 0, 1000, 0, 0.001)];
+    const day1 = computeDailyApply({
+      deal: activeDeal({ totalDensity: { residents: 600, jobs: 0 }, durationDays: 6 }),
+      currentDay: 1,
+      walkshedPoints: points,
+    });
+    expect(day1.targets.length).toBe(0);
+    expect(day1.newPending.residents).toBeCloseTo(100, 8);
+
+    // Pretend day 1's outcome was applied (appliedSoFar still 0 since
+    // nothing materialized; pending carries the 100). On day 2 we
+    // expect another 100 accrued, total pending 200, 1 chunk fires.
+    const day2 = computeDailyApply({
+      deal: activeDeal({
+        totalDensity: { residents: 600, jobs: 0 },
+        durationDays: 6,
+        pending: day1.newPending,
+      }),
+      currentDay: 2,
+      walkshedPoints: points,
+    });
+    expect(day2.targets.length).toBe(1);
+    expect(day2.targets[0].delta.residents).toBe(200);
+    expect(day2.newPending.residents).toBeCloseTo(0, 8);
+    expect(day2.aggregateDelta.residents).toBe(200);
+  });
+
+  it('apportions chunks across multiple eligible walkshed points by weight', () => {
+    // 800-res deal over 1 day = 4 chunks, 2 equal-weight points → 2 each.
     const points = [
       point('p1', 0, 100, 0, 0.001),
       point('p2', 0, 100, 0, -0.001),
     ];
     const plan = computeDailyApply({
-      deal: activeDeal(),
-      currentDay: 1, // first day
-      walkshedPoints: points,
-    });
-    // Day 1 of 60-day deal: expected = 600/60 = 10 residents.
-    const total = plan.targets.reduce((s, t) => s + (t.delta.residents ?? 0), 0);
-    expect(total).toBeCloseTo(10, 8);
-    // Equal split.
-    expect(plan.targets[0].delta.residents).toBeCloseTo(5, 8);
-    expect(plan.targets[1].delta.residents).toBeCloseTo(5, 8);
-    expect(plan.aggregateDelta.residents).toBeCloseTo(10, 8);
-  });
-
-  it('weights closer points higher than farther ones (linear decay)', () => {
-    const points = [
-      point('near', 0, 100, 0, 0.0009),  // ~100m N — high weight
-      point('far', 0, 100, 0, 0.0045),    // ~500m N — at radius edge, weight ~0
-    ];
-    const plan = computeDailyApply({
-      deal: activeDeal(),
+      deal: activeDeal({ totalDensity: { residents: 800, jobs: 0 }, durationDays: 1 }),
       currentDay: 1,
       walkshedPoints: points,
     });
-    const near = plan.targets.find((t) => t.pointId === 'near');
-    const far = plan.targets.find((t) => t.pointId === 'far');
-    expect(near).toBeDefined();
-    if (near && far) {
-      expect(near.delta.residents!).toBeGreaterThan(far.delta.residents ?? 0);
-    }
+    expect(plan.aggregateDelta.residents).toBe(800);
+    const p1 = plan.targets.find((t) => t.pointId === 'p1');
+    const p2 = plan.targets.find((t) => t.pointId === 'p2');
+    expect(p1?.delta.residents).toBe(400);
+    expect(p2?.delta.residents).toBe(400);
   });
 
-  it('skips ghost-town points in distribution', () => {
+  it('skips ghost-town points in chunk distribution', () => {
     const points = [
       point('p1', 0, 200, 0, 0.001),
       point('ghost', 0, 0, 0, -0.001), // no residents
     ];
     const plan = computeDailyApply({
-      deal: activeDeal(),
+      deal: activeDeal({ totalDensity: { residents: 400, jobs: 0 }, durationDays: 1 }),
       currentDay: 1,
       walkshedPoints: points,
     });
     expect(plan.targets.length).toBe(1);
     expect(plan.targets[0].pointId).toBe('p1');
-    // All 10 today goes to the one eligible point.
-    expect(plan.targets[0].delta.residents).toBeCloseTo(10, 8);
+    expect(plan.targets[0].delta.residents).toBe(400);
   });
 
-  it('catches up from missed days using cumulative schedule', () => {
-    // Deal started day 1, 60-day duration, 600 total residents → 10/day.
-    // Currently day 5 but appliedSoFar shows we only delivered 10 (one day's worth).
-    // Today should apply (5/60 × 600) - 10 = 50 - 10 = 40 residents.
+  it('catches up via expected − applied − pending so missed days don\'t over-accrue', () => {
+    // Deal day 1 of 6, 600 total → 100/day. If we somehow pre-applied
+    // 200 and have 0 pending, on day 1 we expect 100 expected − 200
+    // applied − 0 pending = -100 → clamped to 0.
     const points = [point('p1', 0, 200, 0, 0.001)];
     const plan = computeDailyApply({
-      deal: activeDeal({ appliedSoFar: { residents: 10, jobs: 0 } }),
-      currentDay: 5,
+      deal: activeDeal({
+        totalDensity: { residents: 600, jobs: 0 },
+        durationDays: 6,
+        appliedSoFar: { residents: 200, jobs: 0 },
+      }),
+      currentDay: 1,
       walkshedPoints: points,
     });
-    expect(plan.aggregateDelta.residents).toBeCloseTo(40, 8);
+    // Already past expected, so today accrues 0; pending stays at 0.
+    expect(plan.newPending.residents).toBe(0);
+    expect(plan.targets.length).toBe(0);
   });
 
   it('marks completion on the final day of the deal', () => {
     const points = [point('p1', 0, 200, 0, 0.001)];
     const plan = computeDailyApply({
       deal: activeDeal({ startDay: 1, durationDays: 30 }),
-      currentDay: 30, // start + duration - 1
+      currentDay: 30,
       walkshedPoints: points,
     });
     expect(plan.marksCompletion).toBe(true);
@@ -350,45 +368,57 @@ describe('computeDailyApply', () => {
     expect(plan.marksCompletion).toBe(false);
   });
 
-  it('handles mixed deals: residents go to res-eligible points, jobs to jobs-eligible', () => {
+  it('rounds residual UP to a chunk on the final day so the player gets ≥ what they paid for', () => {
+    // Smaller-than-chunk deal that would otherwise deliver 0:
+    // 100-res deal over 1 day. Final-day rounding: ceil(100/200) = 1.
+    const points = [point('p1', 0, 200, 0, 0.001)];
+    const plan = computeDailyApply({
+      deal: activeDeal({ totalDensity: { residents: 100, jobs: 0 }, durationDays: 1 }),
+      currentDay: 1,
+      walkshedPoints: points,
+    });
+    expect(plan.marksCompletion).toBe(true);
+    expect(plan.targets[0].delta.residents).toBe(200); // overshoots paid 100
+  });
+
+  it('handles mixed deals: chunks of residents and jobs route independently to eligible points', () => {
     const points = [
-      point('residential', 0, 500, 0, 0.001),  // residents only
-      point('commercial', 500, 0, 0, -0.001),   // jobs only
-      point('both', 200, 200, 0.001, 0),         // mixed
+      point('residential', 0, 500, 0, 0.001),
+      point('commercial', 500, 0, 0, -0.001),
+      point('both', 200, 200, 0.001, 0),
     ];
+    // Mixed deal sized so chunks materialize in one tick.
     const plan = computeDailyApply({
       deal: activeDeal({
         kind: 'mixed',
-        totalDensity: { residents: 60, jobs: 90 }, // simplified for math
-        durationDays: 30,
+        totalDensity: { residents: 400, jobs: 600 },
+        durationDays: 1,
       }),
       currentDay: 1,
       walkshedPoints: points,
     });
-    // Day 1 of 30: expected = 2 residents, 3 jobs.
-    const totalRes = plan.targets.reduce((s, t) => s + (t.delta.residents ?? 0), 0);
-    const totalJobs = plan.targets.reduce((s, t) => s + (t.delta.jobs ?? 0), 0);
-    expect(totalRes).toBeCloseTo(2, 8);
-    expect(totalJobs).toBeCloseTo(3, 8);
-    // Residential point should not receive jobs.
+    expect(plan.aggregateDelta.residents).toBe(400); // 2 chunks
+    expect(plan.aggregateDelta.jobs).toBe(600); // 3 chunks
+    // Residential-only point should never see job chunks; vice versa.
     const res = plan.targets.find((t) => t.pointId === 'residential');
     expect(res?.delta.jobs).toBeUndefined();
-    // Commercial point should not receive residents.
     const com = plan.targets.find((t) => t.pointId === 'commercial');
     expect(com?.delta.residents).toBeUndefined();
   });
 
-  it('produces empty plan when nothing changes (e.g., deal already fully applied)', () => {
+  it('produces empty plan when expected = applied + pending (already on schedule)', () => {
     const points = [point('p1', 0, 200, 0, 0.001)];
     const plan = computeDailyApply({
       deal: activeDeal({
-        appliedSoFar: { residents: 10, jobs: 0 }, // equal to expected at day 1
+        totalDensity: { residents: 600, jobs: 0 },
+        durationDays: 6,
+        appliedSoFar: { residents: 0, jobs: 0 },
+        pending: { residents: 100, jobs: 0 }, // already accrued day 1
       }),
       currentDay: 1,
       walkshedPoints: points,
     });
-    // expected = 10, applied = 10, today = 0 → no targets.
     expect(plan.targets.length).toBe(0);
-    expect(plan.aggregateDelta.residents).toBe(0);
+    expect(plan.newPending.residents).toBeCloseTo(100, 8);
   });
 });

@@ -519,6 +519,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       }
       deal.appliedSoFar.residents += applied.residents;
       deal.appliedSoFar.jobs += applied.jobs;
+      deal.pending = plan.newPending;
       if (plan.marksCompletion) {
         deal.state = 'completed';
         dirty = true;
@@ -638,6 +639,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
           );
         }
       }
+      d.pending = plan.newPending;
       d.state = 'completed';
       dirty = true;
       void persist();

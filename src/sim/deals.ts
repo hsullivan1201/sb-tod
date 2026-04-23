@@ -101,6 +101,15 @@ export interface Deal {
    * and lets the UI show a progress bar.
    */
   appliedSoFar: DealTotalDensity;
+  /**
+   * Fractional density not yet large enough to materialize as a
+   * chunkSize-multiple. Persists across ticks so small daily slivers
+   * accumulate into chunks. Default chunkSize = 200 (matches game pop
+   * granularity). E.g. a 500-res deal over 5 days adds 100/day to
+   * pending.residents; on day 2, pending crosses 200 and we
+   * materialize a +200 chunk at one walkshed point.
+   */
+  pending: DealTotalDensity;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +304,7 @@ export function confirmProposal(input: ConfirmProposalInput): Deal {
     durationDays: input.proposal.durationDays,
     state: 'active',
     appliedSoFar: { residents: 0, jobs: 0 },
+    pending: { residents: 0, jobs: 0 },
   };
 }
 
@@ -318,6 +328,11 @@ export interface DailyApplyPlan {
   aggregateDelta: DealTotalDensity;
   /** True if this tick completes the deal (no further apply needed). */
   marksCompletion: boolean;
+  /**
+   * The deal's new pending values after this tick. Caller updates
+   * `deal.pending` with this so chunks accumulate across ticks.
+   */
+  newPending: DealTotalDensity;
 }
 
 export interface ComputeDailyApplyInput {
@@ -327,34 +342,93 @@ export interface ComputeDailyApplyInput {
   walkshedPoints: Iterable<DemandPoint>;
   residentsEligibilityThreshold?: number;
   jobsEligibilityThreshold?: number;
+  /**
+   * Granularity at which to materialize density into the simulation.
+   * Default 200 to match the game's pop unit size, so each chunk
+   * shows up as exactly one new pop.
+   */
+  chunkSize?: number;
+}
+
+function apportionLargestRemainderLocal(
+  items: Array<{ id: string; weight: number }>,
+  total: number
+): Map<string, number> {
+  const result = new Map<string, number>();
+  const sumWeight = items.reduce((s, i) => s + i.weight, 0);
+  if (sumWeight <= 0 || total <= 0 || items.length === 0) {
+    for (const i of items) result.set(i.id, 0);
+    return result;
+  }
+  const remainders: Array<{ id: string; remainder: number }> = [];
+  let allocated = 0;
+  for (const item of items) {
+    const exact = (item.weight / sumWeight) * total;
+    const base = Math.floor(exact);
+    result.set(item.id, base);
+    allocated += base;
+    remainders.push({ id: item.id, remainder: exact - base });
+  }
+  remainders.sort((a, b) => b.remainder - a.remainder);
+  let leftover = total - allocated;
+  let idx = 0;
+  while (leftover > 0 && remainders.length > 0) {
+    const winner = remainders[idx % remainders.length].id;
+    result.set(winner, (result.get(winner) ?? 0) + 1);
+    leftover--;
+    idx++;
+  }
+  return result;
 }
 
 /**
- * Compute today's per-point deltas for an active deal.
+ * Compute today's per-point chunk deltas for an active deal.
  *
  * Schedule semantics: the deal commits `totalDensity` over `durationDays`.
  * On any given day N relative to start, the *expected delivered* is
  * `(N / durationDays) × totalDensity` (linear ramp). Today's delta is
- * `expected - appliedSoFar` — so if days were missed (paused game,
- * load gap), we catch up.
+ * `expected - appliedSoFar - pending` — what new fractional density we
+ * accrue this tick.
  *
- * Distribution: per dimension (residents / jobs), partition today's
- * delta across eligible walkshed points proportional to walkshed
- * weight. A point eligible for residents but not jobs gets only
- * residents, etc.
+ * Chunking: today's accrual is added to `deal.pending`. We then
+ * materialize as many `chunkSize`-multiples as fit, with the remainder
+ * carried over to the next tick. Without chunking, small daily slivers
+ * spread across many walkshed points never reach the per-point boundary
+ * the mutator needs to actually create a new pop.
+ *
+ * Distribution: chunks-to-place are apportioned across eligible
+ * walkshed points by largest-fractional-remainder weighted by walkshed
+ * weight. Each point gets some integer number of chunks; the per-point
+ * delta is `chunks × chunkSize`.
+ *
+ * Final-day kicker: on the deal's last day, we round the residual
+ * (pending after the final tick) up to the nearest chunk so the player
+ * gets *at least* what they paid for. Slight overshoot beats stingy
+ * undershoot for a finite-duration commitment.
  */
 export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan {
   const { deal, currentDay } = input;
+  const chunkSize = input.chunkSize ?? 200;
   const daysActive = Math.max(0, Math.min(deal.durationDays, currentDay - deal.startDay + 1));
   const fractionDelivered = daysActive / deal.durationDays;
 
   const expectedResidents = deal.totalDensity.residents * fractionDelivered;
   const expectedJobs = deal.totalDensity.jobs * fractionDelivered;
-  // Clamp at 0: if we've somehow over-applied (e.g. a debug fast-forward
-  // tick), a later real day-tick should be a no-op, not unwind the
-  // already-applied delta.
-  const todayResidents = Math.max(0, expectedResidents - deal.appliedSoFar.residents);
-  const todayJobs = Math.max(0, expectedJobs - deal.appliedSoFar.jobs);
+  // What we'd LIKE to have applied + held by end of today.
+  // Subtract what's already applied AND what's already pending — both
+  // are accounted for in the "we've accrued this much" balance.
+  const todayAccrueResidents = Math.max(
+    0,
+    expectedResidents - deal.appliedSoFar.residents - deal.pending.residents
+  );
+  const todayAccrueJobs = Math.max(
+    0,
+    expectedJobs - deal.appliedSoFar.jobs - deal.pending.jobs
+  );
+
+  // Add to running pending balance.
+  let pendingR = deal.pending.residents + todayAccrueResidents;
+  let pendingJ = deal.pending.jobs + todayAccrueJobs;
 
   const marksCompletion = currentDay >= deal.startDay + deal.durationDays - 1;
 
@@ -364,52 +438,70 @@ export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan
   const hits = findWalkshed(
     [deal.centerLngLat[0], deal.centerLngLat[1]],
     input.walkshedPoints,
-    {
-      radiusMeters: deal.radiusMeters,
-    }
+    { radiusMeters: deal.radiusMeters }
   );
   const resThreshold = input.residentsEligibilityThreshold ?? 0;
   const jobThreshold = input.jobsEligibilityThreshold ?? 0;
-  let totalResWeight = 0;
-  let totalJobWeight = 0;
-  for (const hit of hits) {
-    if (hit.point.residents > resThreshold) totalResWeight += hit.weight;
-    if (hit.point.jobs > jobThreshold) totalJobWeight += hit.weight;
-  }
+  const resEligible = hits.filter((h) => h.point.residents > resThreshold);
+  const jobsEligible = hits.filter((h) => h.point.jobs > jobThreshold);
 
-  // Build per-point targets. Skip zero-deltas to keep the plan lean.
+  // Number of chunks to materialize this tick. On non-final days, floor
+  // (carry the remainder). On the final day, ceil the remainder so the
+  // player gets at least what they paid for.
+  const chunksRoundFn = marksCompletion ? Math.ceil : Math.floor;
+  const chunksR =
+    deal.totalDensity.residents > 0 ? Math.max(0, chunksRoundFn(pendingR / chunkSize)) : 0;
+  const chunksJ =
+    deal.totalDensity.jobs > 0 ? Math.max(0, chunksRoundFn(pendingJ / chunkSize)) : 0;
+
+  const apportionedR =
+    chunksR > 0 && resEligible.length > 0
+      ? apportionLargestRemainderLocal(
+          resEligible.map((h) => ({ id: h.point.id, weight: h.weight })),
+          chunksR
+        )
+      : new Map<string, number>();
+  const apportionedJ =
+    chunksJ > 0 && jobsEligible.length > 0
+      ? apportionLargestRemainderLocal(
+          jobsEligible.map((h) => ({ id: h.point.id, weight: h.weight })),
+          chunksJ
+        )
+      : new Map<string, number>();
+
+  // Subtract what we materialized from pending. (May go negative on the
+  // final-day kicker; that's fine, it just signals "fully delivered.")
+  pendingR -= chunksR * chunkSize;
+  pendingJ -= chunksJ * chunkSize;
+
+  // Build per-point targets, merging residence and jobs chunks for the
+  // same point into a single mutator call.
   const perPoint = new Map<string, { jobs: number; residents: number }>();
-  if (todayResidents !== 0 && totalResWeight > 0) {
-    for (const hit of hits) {
-      if (hit.point.residents <= resThreshold) continue;
-      const share = (hit.weight / totalResWeight) * todayResidents;
-      const slot = perPoint.get(hit.point.id) ?? { jobs: 0, residents: 0 };
-      slot.residents += share;
-      perPoint.set(hit.point.id, slot);
-    }
+  for (const [id, count] of apportionedR) {
+    if (count <= 0) continue;
+    const slot = perPoint.get(id) ?? { jobs: 0, residents: 0 };
+    slot.residents += count * chunkSize;
+    perPoint.set(id, slot);
   }
-  if (todayJobs !== 0 && totalJobWeight > 0) {
-    for (const hit of hits) {
-      if (hit.point.jobs <= jobThreshold) continue;
-      const share = (hit.weight / totalJobWeight) * todayJobs;
-      const slot = perPoint.get(hit.point.id) ?? { jobs: 0, residents: 0 };
-      slot.jobs += share;
-      perPoint.set(hit.point.id, slot);
-    }
+  for (const [id, count] of apportionedJ) {
+    if (count <= 0) continue;
+    const slot = perPoint.get(id) ?? { jobs: 0, residents: 0 };
+    slot.jobs += count * chunkSize;
+    perPoint.set(id, slot);
   }
 
   const targets: DailyApplyTarget[] = [];
-  let aggResidents = 0;
-  let aggJobs = 0;
+  let aggR = 0;
+  let aggJ = 0;
   for (const [pointId, d] of perPoint) {
     const delta: { jobs?: number; residents?: number } = {};
     if (d.residents !== 0) {
       delta.residents = d.residents;
-      aggResidents += d.residents;
+      aggR += d.residents;
     }
     if (d.jobs !== 0) {
       delta.jobs = d.jobs;
-      aggJobs += d.jobs;
+      aggJ += d.jobs;
     }
     if (delta.residents !== undefined || delta.jobs !== undefined) {
       targets.push({ pointId, delta });
@@ -418,8 +510,9 @@ export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan
 
   return {
     targets,
-    aggregateDelta: { residents: aggResidents, jobs: aggJobs },
+    aggregateDelta: { residents: aggR, jobs: aggJ },
     marksCompletion,
+    newPending: { residents: pendingR, jobs: pendingJ },
   };
 }
 
