@@ -346,8 +346,11 @@ export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan
 
   const expectedResidents = deal.totalDensity.residents * fractionDelivered;
   const expectedJobs = deal.totalDensity.jobs * fractionDelivered;
-  const todayResidents = expectedResidents - deal.appliedSoFar.residents;
-  const todayJobs = expectedJobs - deal.appliedSoFar.jobs;
+  // Clamp at 0: if we've somehow over-applied (e.g. a debug fast-forward
+  // tick), a later real day-tick should be a no-op, not unwind the
+  // already-applied delta.
+  const todayResidents = Math.max(0, expectedResidents - deal.appliedSoFar.residents);
+  const todayJobs = Math.max(0, expectedJobs - deal.appliedSoFar.jobs);
 
   const marksCompletion = currentDay >= deal.startDay + deal.durationDays - 1;
 

@@ -784,6 +784,11 @@ function DebugTodSection({
   const [open, setOpen] = useState(false);
   const [last, setLast] = useState<string | null>(null);
   const [stats, setStats] = useState(() => getModState().stats());
+  // Counter local to this panel so repeated Tick-now clicks actually
+  // advance the deal schedule. The catch-up math returns 0 if we pass
+  // the same day twice (day-already-accounted-for), which isn't what
+  // the player expects when mashing the button for testing.
+  const [debugDayBoost, setDebugDayBoost] = useState(0);
 
   const refreshStats = useCallback(() => setStats(getModState().stats()), []);
 
@@ -1009,17 +1014,20 @@ function DebugTodSection({
           variant="secondary"
           onClick={() => {
             try {
-              const day = gameState.getCurrentDay();
-              getModState().onDayTick(day);
+              const realDay = gameState.getCurrentDay();
+              const nextBoost = debugDayBoost + 1;
+              setDebugDayBoost(nextBoost);
+              const fakeDay = realDay + nextBoost;
+              getModState().onDayTick(fakeDay);
               const reports = getModState().stats().lastTickReports;
               if (reports.length === 0) {
-                setLast(`Tick fired (day ${day}). No active deals to apply.`);
+                setLast(`Tick fired (day ${fakeDay} · debug +${nextBoost}). No active deals.`);
               } else {
                 const lines = reports.map(
                   (r) =>
-                    `  ${r.dealId}: +${r.applied.residents.toFixed(1)}r / +${r.applied.jobs.toFixed(1)}j across ${r.pointsAffected} pt(s)${r.rejections > 0 ? ` · ${r.rejections} rejected` : ''}${r.marksCompletion ? ' · COMPLETED' : ''}`
+                    `  ${r.dealId.slice(-12)}: +${r.applied.residents.toFixed(1)}r / +${r.applied.jobs.toFixed(1)}j across ${r.pointsAffected} pt(s)${r.rejections > 0 ? ` · ${r.rejections} rejected` : ''}${r.marksCompletion ? ' · COMPLETED' : ''}`
                 );
-                setLast(`Tick fired (day ${day}):\n${lines.join('\n')}`);
+                setLast(`Tick fired (day ${fakeDay} · debug +${nextBoost}):\n${lines.join('\n')}`);
               }
               onAfter();
               refreshStats();
@@ -1027,8 +1035,9 @@ function DebugTodSection({
               setLast(`tick threw: ${e?.message ?? e}`);
             }
           }}
+          title="advances deal schedule by 1 day each click; safe to mash"
         >
-          Tick now
+          Tick now (+1d)
         </Button>
       </div>
 
@@ -1185,7 +1194,12 @@ function DealsSection({
             Active
           </div>
           {active.map((d) => (
-            <DealCard key={d.id} deal={d} onCancel={() => { state.cancelDeal(d.id); refresh(); }} />
+            <DealCard
+              key={d.id}
+              deal={d}
+              onCancel={() => { state.cancelDeal(d.id); refresh(); }}
+              onComplete={() => { state.debugCompleteDeal(d.id); refresh(); onAfter(); }}
+            />
           ))}
         </div>
       )}
@@ -1196,7 +1210,7 @@ function DealsSection({
             Completed
           </div>
           {completed.slice(-5).reverse().map((d) => (
-            <DealCard key={d.id} deal={d} onCancel={null} />
+            <DealCard key={d.id} deal={d} onCancel={null} onComplete={null} />
           ))}
         </div>
       )}
@@ -1416,9 +1430,11 @@ function ProposeDeal({
 function DealCard({
   deal,
   onCancel,
+  onComplete,
 }: {
   deal: Deal;
   onCancel: (() => void) | null;
+  onComplete: (() => void) | null;
 }) {
   const currentDay = (() => {
     try { return gameState.getCurrentDay(); } catch { return deal.startDay; }
@@ -1475,22 +1491,42 @@ function DealCard({
           {lastReport.rejections > 0 && <span style={{ color: '#fca5a5' }}> · {lastReport.rejections} rejected</span>}
         </div>
       )}
-      {onCancel && (
-        <button
-          type="button"
-          onClick={onCancel}
-          style={{
-            alignSelf: 'flex-end',
-            background: 'transparent',
-            border: 'none',
-            color: 'rgba(255,255,255,0.4)',
-            fontSize: 10,
-            cursor: 'pointer',
-            padding: 0,
-          }}
-        >
-          cancel
-        </button>
+      {(onCancel || onComplete) && (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          {onComplete && (
+            <button
+              type="button"
+              onClick={onComplete}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: 'rgba(255,255,255,0.4)',
+                fontSize: 10,
+                cursor: 'pointer',
+                padding: 0,
+              }}
+              title="debug: apply remaining density now and mark completed"
+            >
+              complete now
+            </button>
+          )}
+          {onCancel && (
+            <button
+              type="button"
+              onClick={onCancel}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: 'rgba(255,255,255,0.4)',
+                fontSize: 10,
+                cursor: 'pointer',
+                padding: 0,
+              }}
+            >
+              cancel
+            </button>
+          )}
+        </div>
       )}
     </div>
   );

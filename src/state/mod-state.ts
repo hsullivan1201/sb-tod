@@ -234,6 +234,13 @@ export interface ModState {
   /** Cancel an active deal. (No refund logic in v1; future enhancement.) */
   cancelDeal(dealId: string): boolean;
   /**
+   * Debug: apply all remaining density of an active deal in one shot
+   * and mark it completed. Bypasses the daily schedule. Useful for
+   * verifying the mutation path end-to-end without waiting for game
+   * time. Returns false if the deal isn't found or isn't active.
+   */
+  debugCompleteDeal(dealId: string): boolean;
+  /**
    * Switch the active save slot. If the current state is dirty, persist
    * it under the OLD save name first (to not silently drop unsaved
    * mutations), then drop in-memory state and re-init under the new name
@@ -605,6 +612,33 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       const d = deals.find((dd) => dd.id === dealId);
       if (!d || d.state !== 'active') return false;
       d.state = 'cancelled';
+      dirty = true;
+      void persist();
+      return true;
+    },
+    debugCompleteDeal(dealId) {
+      if (!mutator || !demand) return false;
+      const d = deals.find((dd) => dd.id === dealId);
+      if (!d || d.state !== 'active') return false;
+      // Force the schedule to "last day" so the catch-up math returns
+      // the entire remaining density.
+      const plan = computeDailyApply({
+        deal: d,
+        currentDay: d.startDay + d.durationDays - 1,
+        walkshedPoints: demand.points.values(),
+      });
+      for (const target of plan.targets) {
+        const r = mutator.applyDensityDelta(target.pointId, target.delta, 'deals');
+        if (r.ok) {
+          d.appliedSoFar.residents += target.delta.residents ?? 0;
+          d.appliedSoFar.jobs += target.delta.jobs ?? 0;
+        } else {
+          console.warn(
+            `[sb-tod] debugCompleteDeal ${d.id} apply rejected on point ${target.pointId}: ${r.reason} — ${r.message}`
+          );
+        }
+      }
+      d.state = 'completed';
       dirty = true;
       void persist();
       return true;
