@@ -246,7 +246,7 @@ describe('confirmProposal', () => {
     expect(deal.totalDensity).toEqual({ residents: 600, jobs: 0 });
     expect(deal.appliedSoFar).toEqual({ residents: 0, jobs: 0 });
     expect(deal.pending).toEqual({ residents: 0, jobs: 0 });
-    expect(deal.durationDays).toBe(5); // housing/S default
+    expect(deal.durationDays).toBe(1); // housing/S default
   });
 
   it('honors a durationOverride from the proposal', () => {

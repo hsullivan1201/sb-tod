@@ -42,20 +42,19 @@ export interface TierConfig {
  * 1600 (+100). Mixed = 70% of housing + 70% of commercial, then
  * rounded to nearest 200 per dimension. Costs unchanged.
  *
- * Durations: originally 30/60/90 in the architecture but in-game days
- * passed faster than envisioned, so cut to 5/10/20. Player can
- * override per proposal via `durationOverride`.
+ * Durations are tuned for the game's quick day cadence: S/M/L deals
+ * complete in 1/2/3 days.
  */
 export const DEFAULT_TIER_TABLE: Record<DealKind, Record<DealTier, TierConfig>> = {
   housing: {
-    S: { totalDensity: { residents: 600, jobs: 0 }, cost: 25_000_000, duration: 5 },
-    M: { totalDensity: { residents: 2000, jobs: 0 }, cost: 80_000_000, duration: 10 },
-    L: { totalDensity: { residents: 8000, jobs: 0 }, cost: 250_000_000, duration: 20 },
+    S: { totalDensity: { residents: 600, jobs: 0 }, cost: 25_000_000, duration: 1 },
+    M: { totalDensity: { residents: 2000, jobs: 0 }, cost: 80_000_000, duration: 2 },
+    L: { totalDensity: { residents: 8000, jobs: 0 }, cost: 250_000_000, duration: 3 },
   },
   commercial: {
-    S: { totalDensity: { residents: 0, jobs: 1600 }, cost: 30_000_000, duration: 5 },
-    M: { totalDensity: { residents: 0, jobs: 6000 }, cost: 100_000_000, duration: 10 },
-    L: { totalDensity: { residents: 0, jobs: 25_000 }, cost: 320_000_000, duration: 20 },
+    S: { totalDensity: { residents: 0, jobs: 1600 }, cost: 30_000_000, duration: 1 },
+    M: { totalDensity: { residents: 0, jobs: 6000 }, cost: 100_000_000, duration: 2 },
+    L: { totalDensity: { residents: 0, jobs: 25_000 }, cost: 320_000_000, duration: 3 },
   },
   // Mixed: 70% of housing residents + 70% of commercial jobs, rounded
   // to nearest 200 per dimension (so it stays pop-clean).
@@ -63,34 +62,29 @@ export const DEFAULT_TIER_TABLE: Record<DealKind, Record<DealTier, TierConfig>> 
     S: {
       totalDensity: { residents: 400, jobs: 1200 }, // 70% × 600 = 420 → 400; 70% × 1600 = 1120 → 1200
       cost: Math.round((25_000_000 + 30_000_000) * 0.7),
-      duration: 5,
+      duration: 1,
     },
     M: {
       totalDensity: { residents: 1400, jobs: 4200 }, // 70% × 2000 = 1400; 70% × 6000 = 4200
       cost: Math.round((80_000_000 + 100_000_000) * 0.7),
-      duration: 10,
+      duration: 2,
     },
     L: {
       totalDensity: { residents: 5600, jobs: 17_600 }, // 70% × 8000 = 5600; 70% × 25000 = 17500 → 17600
       cost: Math.round((250_000_000 + 320_000_000) * 0.7),
-      duration: 20,
+      duration: 3,
     },
   },
 };
 
 /** Duration choices the propose-deal UI offers as quick-pick buttons. */
-export const DURATION_PRESETS = [1, 3, 5, 10, 20, 30] as const;
+export const DURATION_PRESETS = [1, 2, 3] as const;
 
 /**
- * TEMPORARY: cost multiplier for debug / playtesting. Set to 0.01
- * during heavy chunked-apply testing so the player can spam Housing/L
- * proposals without going broke. **FLIP BACK TO 1.0 BEFORE SHIP.**
- *
- * The panel reads this constant for both the displayed cost and the
- * validateProposal call (via costMultiplier on ProposalInput), so
- * changing it here propagates everywhere that matters.
+ * Global cost multiplier. Kept as a single exported constant so future
+ * balance passes can adjust display and validation together.
  */
-export const DEBUG_COST_MULTIPLIER: number = 0.01;
+export const DEAL_COST_MULTIPLIER: number = 1;
 
 export interface Deal {
   id: string;
@@ -199,8 +193,8 @@ export interface ProposalInput {
   durationOverride?: number;
   /**
    * Multiplier applied to the tier's base cost. Defaults to 1.0
-   * (no change). The panel passes DEBUG_COST_MULTIPLIER during
-   * playtesting so the player can iterate without going broke.
+   * (no change). The panel passes DEAL_COST_MULTIPLIER so display and
+   * validation stay in sync during balance passes.
    */
   costMultiplier?: number;
 }

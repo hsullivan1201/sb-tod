@@ -24,9 +24,16 @@ based on station performance is still future work.
   sizing. Ranking-row build buttons prepare that station, and clicking a
   station on the live map while the panel is open selects it for the
   same builder.
+- Deal costs are back at full tier price; S/M/L deals complete in
+  1/2/3 game days. The visible debug "Finish" shortcut is removed.
 - Deals persist per save through `mod-state`, `storage-adapter`, and the
   real `DemandMutator`. On load, persisted deltas are either rehydrated
   if the game preserved them or replayed if the game reset them.
+- Persistence tries the official `api.storage` path, falls back to
+  Electron settings storage and then localStorage when the runtime
+  no-ops it, verifies round-trips, reads the current save name before
+  first init, copies state on Save As, flushes dirty state on game end,
+  and disables new deals only if no backend can be trusted.
 - Added density materializes through Pops, not just DemandPoint totals.
   The mutator runs in strict `200` unit mode, creating separate split
   child Pops so new demand boards like normal game-authored Pops.
@@ -60,7 +67,7 @@ src/
     *.test.ts              deal + mutator coverage
   state/
     mod-state.ts           singleton persisted per-save TOD state
-    storage-adapter.ts     api.storage with localStorage fallback
+    storage-adapter.ts     api.storage with Electron/localStorage fallback
     *.test.ts              persistence/replay coverage
   scoring/
     walkshed.ts            pure: haversine + linear decay → WalkshedHits
@@ -148,9 +155,9 @@ no room" while restoring meaningful headroom elsewhere.
 
 ### What remains after Stage 2
 The explicit deal loop is back: selected-site proposals, S/M/L sizing,
-baseline capture, cumulative deltas, per-save persistence, save/load
-replay, daily deal ticks, and strict 200-sized split Pops. The remaining
-larger idea is organic land-use growth/decay based on station
+baseline capture, cumulative deltas, verified per-save persistence,
+save/load replay, daily deal ticks, and strict 200-sized split Pops. The
+remaining larger idea is organic land-use growth/decay based on station
 performance, separate from player-funded deals. That should keep using
 `mod-state` + `DemandMutator` rather than writing DemandPoints directly.
 

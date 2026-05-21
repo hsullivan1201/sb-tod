@@ -416,6 +416,8 @@ export interface ModdingAPI {
     getStationRidership(stationId?: string | null): StationRidership;
     /** Get ridership broken down by station for a specific route. */
     getRouteRidership(routeId?: string | null): RouteRidership;
+    /** Get the name of the currently loaded save, or null if no save is loaded. */
+    getSaveName(): string | null;
   };
 
   // ---------------------------------------------------------------------------

@@ -2,9 +2,9 @@
  * SB TOD — mod state
  *
  * The singleton holding the `DemandMutator` and everything that needs
- * to survive across save/load. In-memory is the source of truth (probe 1
- * found storage round-trips unreliable — `set().then(get())` returned
- * undefined in one instance), so `api.storage` is persistence, not state.
+ * to survive across save/load. In-memory is the source of truth while the
+ * game is running; verified `api.storage` is the only release persistence
+ * path for player-funded deals.
  *
  * Save/load replay strategy
  * -------------------------
@@ -113,7 +113,7 @@ export interface ModStateStats {
    * `false` if set() silently dropped (the probe-1 flake).
    */
   storageRoundTripOk: boolean | null;
-  /** Which backend (api / local / none) the last successful persist used. */
+  /** Which backend (api / electron / local / none) the last successful persist used. */
   storageBackend: StorageBackendKind;
   /** Snapshot of what the storage backend showed at init time. */
   initProbe: InitProbe | null;
@@ -241,7 +241,7 @@ export interface ModState {
    * Add a new deal to mod state. Caller is responsible for charging the
    * player via `api.actions.subtractMoney`.
    */
-  addDeal(deal: Deal): void;
+  addDeal(deal: Deal): Promise<boolean>;
   /** Cancel an active deal. (No refund logic in v1; future enhancement.) */
   cancelDeal(dealId: string): boolean;
   /**
@@ -280,6 +280,7 @@ export interface ModState {
   onDemandChangeFired(): void;
   onGameSavedFired(saveName?: string): void;
   onGameLoadedFired(saveName?: string): void;
+  onGameEndFired(): void;
   stats(): ModStateStats;
   /** For tests — override the storage backend. */
   _setStorage(s: StorageLike): void;
@@ -300,6 +301,8 @@ export interface CreateModStateOptions {
   persistEveryNDays?: number;
   /** Initial save name. Default null (uses the `_unsaved` slot). */
   initialSaveName?: string | null;
+  /** Current save-name accessor. Defaults to gameState.getSaveName(). */
+  getSaveName?: () => string | null;
   /**
    * Options forwarded to the underlying mutator. Default
    * `{ strictUnitSize: 200 }` — every pop produced is exactly 200 to
@@ -312,6 +315,7 @@ export interface CreateModStateOptions {
 export function createModState(options: CreateModStateOptions = {}): ModState {
   let backend: StorageLike = options.storage ?? createAdaptiveStorage();
   const getDemand = options.getDemand ?? (() => gameState.getDemandData() as DemandData | null);
+  const getSaveName = options.getSaveName ?? (() => gameState.getSaveName());
   const persistEveryNDays = options.persistEveryNDays ?? 1;
   // Strict 200-sized pops by default: matches the game's natural Pop
   // granularity (every game-authored Pop has size 200). Keeps split
@@ -337,7 +341,19 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let lastTickReports: DealTickReport[] = [];
   let initPromise: Promise<boolean> | null = null;
 
+  function readLiveSaveName(): string | null {
+    try {
+      const name = getSaveName();
+      return typeof name === 'string' && name.length > 0 ? name : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function doInit(providedDemand?: DemandData): Promise<boolean> {
+    if (currentSaveName == null) {
+      currentSaveName = readLiveSaveName();
+    }
     const d = providedDemand ?? getDemand();
     if (!d || !d.points || !d.popsMap) {
       return false;
@@ -584,18 +600,21 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     // If the player did "save as" with a new name, the in-memory state
     // applies to the NEW save (it's what they were just playing). Switch
     // the key without dropping in-memory; persist immediately.
-    if (saveName && saveName !== currentSaveName) {
-      currentSaveName = saveName;
+    const nextName = typeof saveName === 'string' && saveName.length > 0 ? saveName : readLiveSaveName();
+    const nameChanged = nextName !== null && nextName !== currentSaveName;
+    if (nameChanged) {
+      currentSaveName = nextName;
     }
-    if (initialized && dirty) void persist();
+    if (initialized && (dirty || nameChanged)) void persist();
   }
 
   function onGameLoadedFired(saveName?: string): void {
+    const nextName = typeof saveName === 'string' && saveName.length > 0 ? saveName : readLiveSaveName();
     // Loading a different save means switching slots: dump in-memory and
     // hydrate from the new save's storage. setCurrentSaveName persists
     // any unsaved deltas under the OLD name first, so nothing is lost.
-    if (saveName !== undefined && saveName !== currentSaveName) {
-      void setCurrentSaveName(saveName).catch((e) =>
+    if (nextName !== currentSaveName) {
+      void setCurrentSaveName(nextName).catch((e) =>
         console.warn('[sb-tod] setCurrentSaveName on game-load failed:', e)
       );
       return;
@@ -607,6 +626,10 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     mutator = null;
     demand = null;
     ensureInit().catch((e) => console.warn('[sb-tod] re-init after load failed:', e));
+  }
+
+  function onGameEndFired(): void {
+    if (initialized && dirty) void persist();
   }
 
   async function setCurrentSaveName(name: string | null): Promise<void> {
@@ -638,13 +661,18 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     },
     persist,
     getDeals: () => deals,
-    addDeal(deal) {
+    async addDeal(deal) {
       deals.push(deal);
       dirty = true;
-      // Fire-and-forget persist so the deal is durable immediately,
-      // not waiting for the next day tick / game save. Otherwise a
-      // confirm-then-quit before any day passes loses the deal.
-      void persist();
+      // Persist immediately so the deal is durable before the caller
+      // treats it as started. Otherwise a confirm-then-quit before any
+      // day passes loses the deal.
+      const ok = await persist();
+      if (!ok) {
+        deals = deals.filter((d) => d.id !== deal.id);
+        dirty = true;
+      }
+      return ok;
     },
     cancelDeal(dealId) {
       const d = deals.find((dd) => dd.id === dealId);
@@ -742,6 +770,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     onDemandChangeFired,
     onGameSavedFired,
     onGameLoadedFired,
+    onGameEndFired,
     stats() {
       const snap = mutator?.snapshot();
       const storageBackend: StorageBackendKind =

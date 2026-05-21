@@ -15,6 +15,7 @@ Stage 2 is the playable dashboard plus persisted developer deals:
 - Residential and commercial growth rankings
 - Captured-value and TOD-risk rankings
 - New Development card with Housing / Jobs / Mixed and S / M / L deal sizing
+- Full-price S / M / L deals complete over 1 / 2 / 3 game days
 - Build buttons on rows prepare the selected station for a deal
 - Clicking a station on the map while the panel is open selects it for building
 - 500m walkshed pin on the map when a row is selected
@@ -45,6 +46,15 @@ cumulative deltas, split-pop children, and lifecycle state. On load, the
 mod reconciles live demand against storage: if the game preserved the
 mutation it rehydrates tracking; if the game reset it, the mod replays
 the deltas.
+
+Persistence tries the official `api.storage` backend first and verifies
+every write with an immediate readback. If the game runtime no-ops that
+API, the mod falls back to Electron settings storage, then localStorage,
+and reports the backend in Diagnostics. New deals are disabled only if no
+backend can round-trip, so a development can't charge the player unless
+it can also survive save/load. Save names are read before first init,
+Save As copies state into the new slot, and dirty state flushes on game
+end.
 
 When deals add population, the mutator updates both DemandPoint
 aggregates and Pops. New demand materializes as separate split child
@@ -86,7 +96,7 @@ src/
     mutate.ts          Baseline-anchored DemandPoint + Pop mutator
   state/
     mod-state.ts       Persisted per-save state and load replay
-    storage-adapter.ts api.storage/localStorage fallback
+    storage-adapter.ts api.storage/Electron/localStorage fallback
   scoring/
     walkshed.ts        Pure walkshed distance + aggregation logic
     todScore.ts        Pure TOD scoring formulas

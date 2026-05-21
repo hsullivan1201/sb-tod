@@ -77,3 +77,7 @@ hooks.onGameSaved((saveName) => {
 hooks.onGameLoaded((saveName) => {
   getModState().onGameLoadedFired(saveName);
 });
+
+hooks.onGameEnd(() => {
+  getModState().onGameEndFired();
+});

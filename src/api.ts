@@ -46,6 +46,10 @@ export const gameState = {
   getBudget(): number {
     return getRaw().gameState.getBudget();
   },
+  getSaveName(): string | null {
+    const name = (getRaw().gameState as any).getSaveName?.();
+    return typeof name === 'string' && name.length > 0 ? name : null;
+  },
   // Group/transfer surface — bundled template types don't list these,
   // but probe-1 confirmed they exist and Debug DL confirmed shapes
   // (2026-04-22). Cast through `any` since the d.ts is stale.
@@ -75,6 +79,9 @@ export const hooks = {
   },
   onGameSaved(cb: (saveName: string) => void): void {
     getRaw().hooks.onGameSaved(cb);
+  },
+  onGameEnd(cb: () => void): void {
+    getRaw().hooks.onGameEnd(cb);
   },
   onDayChange(cb: (day: number) => void): void {
     getRaw().hooks.onDayChange(cb);

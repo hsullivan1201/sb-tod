@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { DemandData, DemandPoint, Pop } from '../types';
 import { createModState, type StorageLike, type PersistedState } from './mod-state';
+import type { Deal } from '../sim/deals';
 
 function point(id: string, jobs: number, residents: number): DemandPoint {
   return {
@@ -53,6 +54,39 @@ function makeStorage(): StorageLike & { _data: Map<string, unknown> } {
     async delete(key) {
       data.delete(key);
     },
+  };
+}
+
+function makeNoopStorage(): StorageLike {
+  return {
+    async set() {
+      // Simulates browser/no-op api.storage: set resolves, get returns default.
+    },
+    async get<T>(_key: string, defaultValue: T): Promise<T> {
+      return defaultValue;
+    },
+    async delete() {
+      // no-op
+    },
+  };
+}
+
+function deal(id = 'deal-1'): Deal {
+  return {
+    id,
+    kind: 'housing',
+    tier: 'S',
+    centerStationGroupId: 'station-1',
+    centerStationGroupName: 'Station 1',
+    centerLngLat: [-122, 37],
+    radiusMeters: 500,
+    totalDensity: { residents: 600, jobs: 0 },
+    totalCost: 250_000,
+    startDay: 1,
+    durationDays: 1,
+    state: 'active',
+    appliedSoFar: { residents: 0, jobs: 0 },
+    pending: { residents: 0, jobs: 0 },
   };
 }
 
@@ -271,6 +305,24 @@ describe('mod state — persist roundtrip', () => {
 // Lifecycle hooks
 // ---------------------------------------------------------------------------
 describe('mod state — lifecycle hooks', () => {
+  it('uses the current game save name before first init', async () => {
+    const storage = makeStorage();
+    const A = point('P', 100, 1000);
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => fixture([A], []),
+      getSaveName: () => 'alpha',
+    });
+
+    await state.ensureInit();
+    expect(state.getCurrentSaveName()).toBe('alpha');
+    state.applyDensityDelta('P', { residents: 50 }, 'deals');
+    expect(await state.persist()).toBe(true);
+    expect(storage._data.has('sb-tod:state:v1:alpha')).toBe(true);
+    expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(false);
+  });
+
   it('persists on day tick when dirty (configurable cadence)', async () => {
     const storage = makeStorage();
     const A = point('P', 100, 1000);
@@ -305,6 +357,20 @@ describe('mod state — lifecycle hooks', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(false);
+  });
+
+  it('flushes dirty state on game end', async () => {
+    const storage = makeStorage();
+    const A = point('P', 100, 1000);
+    const state = createModState({ mutatorOptions: {}, storage, getDemand: () => fixture([A], []) });
+    await state.ensureInit();
+    state.applyDensityDelta('P', { residents: 50 }, 'deals');
+
+    state.onGameEndFired();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(true);
   });
 
   it('counts onDemandChange events without ever mutating', async () => {
@@ -431,6 +497,45 @@ describe('mod state — applyDensityDelta + revert', () => {
     await Promise.resolve();
     expect(state.getCurrentSaveName()).toBe('alpha-copy');
     expect(storage._data.has('sb-tod:state:v1:alpha-copy')).toBe(true);
+  });
+
+  it('save-as copies clean state into the new slot too', async () => {
+    const storage = makeStorage();
+    const A = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => fixture([A], [x]),
+      initialSaveName: 'alpha',
+    });
+    await state.ensureInit();
+    state.applyDensityDelta('P', { residents: 100 }, 'deals');
+    expect(await state.persist()).toBe(true);
+
+    // State is clean now, but a Save As still needs to copy it to the
+    // new save slot so it doesn't stay stranded under the old key.
+    state.onGameSavedFired('alpha-copy');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(state.getCurrentSaveName()).toBe('alpha-copy');
+    expect(storage._data.has('sb-tod:state:v1:alpha')).toBe(true);
+    expect(storage._data.has('sb-tod:state:v1:alpha-copy')).toBe(true);
+  });
+
+  it('rejects new deals when persistence cannot round-trip', async () => {
+    const A = point('P', 100, 1000);
+    const state = createModState({
+      mutatorOptions: {},
+      storage: makeNoopStorage(),
+      getDemand: () => fixture([A], []),
+    });
+    await state.ensureInit();
+
+    expect(await state.addDeal(deal())).toBe(false);
+    expect(state.getDeals()).toHaveLength(0);
+    expect(state.stats().storageRoundTripOk).toBe(false);
   });
 
   it('does not mark dirty on failed mutation (ghost-town reject)', async () => {

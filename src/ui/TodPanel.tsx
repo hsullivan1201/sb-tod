@@ -11,7 +11,7 @@ import { actions, gameState, getMap, hooks, ui, utils } from '../api';
 import {
   confirmProposal,
   DEFAULT_TIER_TABLE,
-  DEBUG_COST_MULTIPLIER,
+  DEAL_COST_MULTIPLIER,
   dealProgressFraction,
   validateProposal,
   type Deal,
@@ -242,10 +242,20 @@ export function TodPanel() {
         radiusMeters: HIGHLIGHT_RADIUS_M,
         walkshedPoints: demand.points.values(),
         budget: gameState.getBudget(),
-        costMultiplier: DEBUG_COST_MULTIPLIER,
+        costMultiplier: DEAL_COST_MULTIPLIER,
       });
       if (!proposal.ok) {
         ui.showNotification(`Cannot build at ${displayName(row.name, row.id)}: ${proposal.message}`, 'warning');
+        return;
+      }
+
+      const persistenceReady = await state.persist();
+      if (!persistenceReady) {
+        setDealVersion((v) => v + 1);
+        ui.showNotification(
+          'TOD persistence is not available. New development is disabled until storage can save and read back data.',
+          'error'
+        );
         return;
       }
 
@@ -266,7 +276,20 @@ export function TodPanel() {
         return;
       }
 
-      state.addDeal(deal);
+      const stored = await state.addDeal(deal);
+      if (!stored) {
+        try {
+          actions.addMoney(deal.totalCost, 'TOD Deal refund');
+        } catch (err) {
+          console.warn('[sb-tod] refund after failed deal persist failed:', err);
+        }
+        setDealVersion((v) => v + 1);
+        ui.showNotification(
+          'TOD persistence failed after charging. The deal was not started and the cost was refunded.',
+          'error'
+        );
+        return;
+      }
       setSnapshot(readSnapshot());
       setDealVersion((v) => v + 1);
       ui.showNotification(
@@ -355,6 +378,8 @@ export function TodPanel() {
   const riskExcluded = snapshot.scored.length - riskCandidates.length;
   const deals = useMemo(() => [...getModState().getDeals()], [snapshot, dealVersion]);
   const dealStats = useMemo(() => summarizeDeals(deals), [deals]);
+  const stateStats = useMemo(() => getModState().stats(), [snapshot, dealVersion]);
+  const persistenceBlocked = stateStats.storageRoundTripOk === false;
   const proposalPreview = useMemo(
     () => (selectedStation ? readProposalPreview(selectedStation, proposalKind, proposalTier) : null),
     [selectedStation, proposalKind, proposalTier, snapshot, dealVersion]
@@ -397,6 +422,7 @@ export function TodPanel() {
         proposalKind={proposalKind}
         proposalTier={proposalTier}
         proposalPreview={proposalPreview}
+        persistenceBlocked={persistenceBlocked}
         onKindChange={setProposalKind}
         onTierChange={setProposalTier}
         onConfirm={() => {
@@ -472,11 +498,6 @@ export function TodPanel() {
           setDealVersion((v) => v + 1);
           setSnapshot(readSnapshot());
         }}
-        onComplete={(deal) => {
-          if (!getModState().debugCompleteDeal(deal.id)) return;
-          setDealVersion((v) => v + 1);
-          setSnapshot(readSnapshot());
-        }}
       />
 
       <details style={diagnosticsStyle}>
@@ -508,6 +529,7 @@ function BuildSection({
   proposalKind,
   proposalTier,
   proposalPreview,
+  persistenceBlocked,
   onKindChange,
   onTierChange,
   onConfirm,
@@ -516,6 +538,7 @@ function BuildSection({
   proposalKind: DealKind;
   proposalTier: DealTier;
   proposalPreview: ProposalResult | null;
+  persistenceBlocked: boolean;
   onKindChange: (kind: DealKind) => void;
   onTierChange: (tier: DealTier) => void;
   onConfirm: () => void;
@@ -524,11 +547,14 @@ function BuildSection({
   const tierConfig = DEFAULT_TIER_TABLE[proposalKind][proposalTier];
   const previewOk = proposalPreview?.ok === true;
   const previewText =
-    proposalPreview == null
-      ? `${fmtMoney(Math.round(tierConfig.cost * DEBUG_COST_MULTIPLIER))} · ${densitySummary(tierConfig.totalDensity)} · ${tierConfig.duration} days`
+    persistenceBlocked
+      ? 'Persistence unavailable; new deals are disabled.'
+      : proposalPreview == null
+      ? `${fmtMoney(Math.round(tierConfig.cost * DEAL_COST_MULTIPLIER))} · ${densitySummary(tierConfig.totalDensity)} · ${tierConfig.duration} days`
       : proposalPreview.ok
         ? `${fmtMoney(proposalPreview.totalCost)} · ${densitySummary(proposalPreview.totalDensity)} · ${proposalPreview.durationDays} days · ${proposalPreview.eligiblePoints.length} points`
         : proposalPreview.message;
+  const buildDisabled = !station || !previewOk || persistenceBlocked;
 
   return (
     <section style={{ ...buildPanelStyle, borderColor: `${color}55` }}>
@@ -560,18 +586,18 @@ function BuildSection({
       </div>
 
       <div style={builderFooterStyle}>
-        <span style={{ ...proposalStatusStyle, color: proposalPreview && !previewOk ? SECTION_META.risk.color : MUTED_COLOR }}>
+        <span style={{ ...proposalStatusStyle, color: persistenceBlocked || (proposalPreview && !previewOk) ? SECTION_META.risk.color : MUTED_COLOR }}>
           {previewText}
         </span>
         <button
           type="button"
-          disabled={!station || !previewOk}
+          disabled={buildDisabled}
           style={{
             ...confirmButtonStyle,
             borderColor: color,
-            color: !station || !previewOk ? FAINT_COLOR : color,
-            cursor: !station || !previewOk ? 'not-allowed' : 'pointer',
-            opacity: !station || !previewOk ? 0.62 : 1,
+            color: buildDisabled ? FAINT_COLOR : color,
+            cursor: buildDisabled ? 'not-allowed' : 'pointer',
+            opacity: buildDisabled ? 0.62 : 1,
           }}
           onClick={onConfirm}
         >
@@ -625,13 +651,11 @@ function DealsSection({
   currentDay,
   onLocate,
   onCancel,
-  onComplete,
 }: {
   deals: Deal[];
   currentDay: number;
   onLocate: (deal: Deal) => void;
   onCancel: (deal: Deal) => void;
-  onComplete: (deal: Deal) => void;
 }) {
   const active = deals.filter((deal) => deal.state === 'active');
   const completed = deals.filter((deal) => deal.state === 'completed');
@@ -661,7 +685,6 @@ function DealsSection({
               currentDay={currentDay}
               onLocate={onLocate}
               onCancel={onCancel}
-              onComplete={onComplete}
             />
           ))}
         </div>
@@ -675,13 +698,11 @@ function DealRow({
   currentDay,
   onLocate,
   onCancel,
-  onComplete,
 }: {
   deal: Deal;
   currentDay: number;
   onLocate: (deal: Deal) => void;
   onCancel: (deal: Deal) => void;
-  onComplete: (deal: Deal) => void;
 }) {
   const color = dealColor(deal.kind);
   const progress = deal.state === 'active' ? dealProgressFraction(deal, currentDay) : 1;
@@ -713,14 +734,6 @@ function DealRow({
                 onClick={() => onCancel(deal)}
               >
                 Cancel
-              </button>
-              <button
-                type="button"
-                title="Debug smoke-test shortcut: applies all remaining chunks now."
-                style={{ ...buildButtonStyle, borderColor: FAINT_COLOR, color: MUTED_COLOR }}
-                onClick={() => onComplete(deal)}
-              >
-                Finish
               </button>
             </>
           )}
@@ -970,7 +983,7 @@ function readProposalPreview(
       radiusMeters: HIGHLIGHT_RADIUS_M,
       walkshedPoints: demand.points.values(),
       budget: gameState.getBudget(),
-      costMultiplier: DEBUG_COST_MULTIPLIER,
+      costMultiplier: DEAL_COST_MULTIPLIER,
     });
   } catch {
     return null;
@@ -1486,7 +1499,7 @@ function downloadDebug(snapshot: Snapshot) {
   const state = getModState();
   const payload = {
     timestamp: new Date().toISOString(),
-    bundleVersion: 'panel-v13-map-select-builder',
+    bundleVersion: 'panel-v14-storage-fallback',
     counts: {
       stations: snapshot.stations,
       demandPoints: snapshot.demandPoints,
