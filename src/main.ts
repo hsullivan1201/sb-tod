@@ -25,12 +25,14 @@ hooks.onMapReady(() => {
   uiInitialized = true;
 
   try {
-    ui.addToolbarPanel({
+    // Floating panel (not a toolbar panel) so the player can pan the map
+    // and click stations to select them while the dashboard is open.
+    ui.addFloatingPanel({
       id: 'sb-tod-panel',
       icon: 'Building2',
-      tooltip: 'Transit-Oriented Development',
       title: 'TOD',
-      width: 420,
+      defaultWidth: 420,
+      defaultHeight: 640,
       render: TodPanel,
     });
 

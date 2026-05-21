@@ -126,6 +126,19 @@ export const ui = {
   }): void {
     getRaw().ui.addToolbarPanel(config);
   },
+  // Floating panels don't render a full-screen backdrop, so the map
+  // underneath stays pannable and clickable while the panel is open.
+  addFloatingPanel(config: {
+    id: string;
+    title?: string;
+    icon?: string;
+    defaultWidth?: number;
+    defaultHeight?: number;
+    defaultPosition?: { x: number; y: number };
+    render: () => unknown;
+  }): void {
+    getRaw().ui.addFloatingPanel(config);
+  },
   showNotification(message: string, level: 'info' | 'success' | 'warning' | 'error'): void {
     getRaw().ui.showNotification(message, level);
   },

@@ -312,25 +312,36 @@ export function TodPanel() {
     return () => window.removeEventListener('keydown', onKey, true);
   }, [clearSelection, highlighted]);
 
+  // Station markers are DOM elements that call e.stopPropagation() in their
+  // own click handler, so MapLibre's 'click' event never fires for them. A
+  // capture-phase listener on the map container runs before the marker handles
+  // the click, so we still catch station clicks and mirror the selection into
+  // the dashboard. We unproject the click point to lng/lat and match the
+  // nearest scored station.
   useEffect(() => {
     const m = getMap();
-    if (!m || typeof m.on !== 'function') return undefined;
-    const onMapClick = (e: any) => {
-      const lng = e?.lngLat?.lng;
-      const lat = e?.lngLat?.lat;
+    if (!m || typeof m.getContainer !== 'function' || typeof m.unproject !== 'function') {
+      return undefined;
+    }
+    const container = m.getContainer() as HTMLElement | null;
+    if (!container) return undefined;
+    const onContainerClick = (e: MouseEvent) => {
+      const rect = container.getBoundingClientRect();
+      let lngLat;
+      try {
+        lngLat = m.unproject([e.clientX - rect.left, e.clientY - rect.top]);
+      } catch {
+        return;
+      }
+      const lng = lngLat?.lng;
+      const lat = lngLat?.lat;
       if (typeof lng !== 'number' || typeof lat !== 'number') return;
       const nearest = nearestStation(snapshot.scored, [lng, lat], MAP_CLICK_STATION_RADIUS_M);
       if (!nearest) return;
       selectStation(nearest.row, sectionKindForDeal(proposalKind), { easeCamera: false });
     };
-    m.on('click', onMapClick);
-    return () => {
-      try {
-        m.off?.('click', onMapClick);
-      } catch (err) {
-        console.warn('[sb-tod] failed to remove map click listener:', err);
-      }
-    };
+    container.addEventListener('click', onContainerClick, true);
+    return () => container.removeEventListener('click', onContainerClick, true);
   }, [proposalKind, selectStation, snapshot.scored]);
 
   useEffect(() => {
@@ -1097,8 +1108,9 @@ const panelStyle: React.CSSProperties = {
   flexDirection: 'column',
   gap: 14,
   padding: 14,
-  maxHeight: '80vh',
+  maxHeight: '100%',
   overflowY: 'auto',
+  boxSizing: 'border-box',
   color: TEXT_COLOR,
 };
 
