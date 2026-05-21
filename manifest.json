@@ -1,8 +1,8 @@
 {
   "id": "dev.hazel.sb-tod",
   "name": "SB TOD",
-  "description": "Transit-Oriented Development for Subway Builder. Adds a feedback loop from transit service to land use: station areas with good service grow, underserved areas don't. Stage 0 — scaffolding.",
-  "version": "0.1.0",
+  "description": "Transit-Oriented Development for Subway Builder. Adds a feedback loop from transit service to land use: a floating dashboard scores every station area, and you can start housing, jobs, or mixed-use development deals at the stations you serve well.",
+  "version": "0.2.0",
   "author": {
     "name": "hazel"
   },

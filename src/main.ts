@@ -13,7 +13,7 @@ import { initMapHighlight } from './ui/mapHighlight';
 import { getModState } from './state/mod-state';
 
 const MOD_ID = 'dev.hazel.sb-tod';
-const MOD_VERSION = '0.1.0';
+const MOD_VERSION = '0.2.0';
 const TAG = '[sb-tod]';
 
 console.log(`${TAG} v${MOD_VERSION} loading | API v${apiVersion}`);
