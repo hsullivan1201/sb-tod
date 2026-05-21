@@ -19,6 +19,7 @@ import type { LngLat } from '../types';
 const SOURCE_ID = 'sb-tod-highlight';
 const FILL_LAYER_ID = 'sb-tod-highlight-fill';
 const LINE_LAYER_ID = 'sb-tod-highlight-line';
+const DEFAULT_COLOR = '#fbbf24';
 
 // Minimal GeoJSON shapes — `@types/geojson` isn't a dep and we only
 // need the polygon + FeatureCollection forms MapLibre accepts.
@@ -43,6 +44,13 @@ interface FeatureCollectionSource {
   setData(data: FeatureCollection): void;
 }
 
+export interface HighlightOptions {
+  color?: string;
+  fillOpacity?: number;
+  lineOpacity?: number;
+  easeCamera?: boolean;
+}
+
 /**
  * Register the source + layers. Safe to call multiple times — the API's
  * idempotency isn't documented, so we guard.
@@ -56,7 +64,7 @@ export function initMapHighlight(): void {
       type: 'fill',
       source: SOURCE_ID,
       paint: {
-        'fill-color': '#fbbf24',
+        'fill-color': DEFAULT_COLOR,
         'fill-opacity': 0.18,
       },
     });
@@ -65,7 +73,7 @@ export function initMapHighlight(): void {
       type: 'line',
       source: SOURCE_ID,
       paint: {
-        'line-color': '#fbbf24',
+        'line-color': DEFAULT_COLOR,
         'line-width': 2,
         'line-opacity': 0.85,
       },
@@ -76,17 +84,22 @@ export function initMapHighlight(): void {
   }
 }
 
-export function setHighlight(center: LngLat, radiusMeters: number): void {
+export function setHighlight(
+  center: LngLat,
+  radiusMeters: number,
+  options: HighlightOptions = {}
+): void {
   const m = getMap();
   if (!m) return;
   try {
     const src = m.getSource(SOURCE_ID) as FeatureCollectionSource | undefined;
     if (!src?.setData) return;
+    applyHighlightStyle(m, options);
     src.setData({
       type: 'FeatureCollection',
       features: [circlePolygon(center, radiusMeters)],
     });
-    if (typeof m.easeTo === 'function') {
+    if (options.easeCamera !== false && typeof m.easeTo === 'function') {
       m.easeTo({
         center: [center[0], center[1]],
         zoom: Math.max(m.getZoom?.() ?? 13, 14),
@@ -95,6 +108,19 @@ export function setHighlight(center: LngLat, radiusMeters: number): void {
     }
   } catch (err) {
     console.error('[sb-tod] setHighlight failed:', err);
+  }
+}
+
+function applyHighlightStyle(m: any, options: HighlightOptions): void {
+  if (typeof m.setPaintProperty !== 'function') return;
+  const color = options.color ?? DEFAULT_COLOR;
+  m.setPaintProperty(FILL_LAYER_ID, 'fill-color', color);
+  m.setPaintProperty(LINE_LAYER_ID, 'line-color', color);
+  if (options.fillOpacity !== undefined) {
+    m.setPaintProperty(FILL_LAYER_ID, 'fill-opacity', options.fillOpacity);
+  }
+  if (options.lineOpacity !== undefined) {
+    m.setPaintProperty(LINE_LAYER_ID, 'line-opacity', options.lineOpacity);
   }
 }
 

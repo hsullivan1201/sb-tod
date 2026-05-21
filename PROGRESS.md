@@ -12,25 +12,36 @@ reading the session log; the log is the audit trail.
 A Transit-Oriented Development dashboard for Subway Builder. Reads live
 station + demand data, scores every station group on five axes, and
 visualizes the top-N for each axis with a click-to-pin-walkshed map
-overlay. Stage 2 (not yet built) will close the feedback loop by
-mutating `DemandPoint.jobs` / `.residents` based on station performance
-and explicit "developer deals."
+overlay. Stage 2 now handles explicit player-triggered developer deals
+with per-save persistence and save/load replay. Organic growth/decay
+based on station performance is still future work.
 
-### What ships today (Stage 1, complete)
+### What ships today (Stage 2, polished dashboard + persisted deals)
 - Toolbar panel (`Building2` icon → "TOD") that opens a side panel.
-- Five sections: Top Residential TOD, Top Commercial TOD, Top Captured
-  Value, Top TOD Risk, plus header counts (stations / demand points /
-  pops / 15-min ridership total).
-- Click any row → pins a translucent 500m walkshed disc on the live
-  map and eases the camera to it. Click again or "Clear pin" to remove.
-- Auto-calibrated per-map scoring (footer shows the live scales).
-- Debug DL button → downloads a self-describing JSON snapshot (counts,
-  calibration, top rows, deep shape probes of the API surface).
+- Four polished ranking sections: Housing Growth, Job Growth, Captured
+  Value, and TOD Risk, plus compact header counts.
+- New Development builder with Housing / Jobs / Mixed and S / M / L
+  sizing. Ranking-row build buttons prepare that station, and clicking a
+  station on the live map while the panel is open selects it for the
+  same builder.
+- Deals persist per save through `mod-state`, `storage-adapter`, and the
+  real `DemandMutator`. On load, persisted deltas are either rehydrated
+  if the game preserved them or replayed if the game reset them.
+- Added density materializes through Pops, not just DemandPoint totals.
+  The mutator runs in strict `200` unit mode, creating separate split
+  child Pops so new demand boards like normal game-authored Pops.
+- Click any row or map station → pins a translucent 500m walkshed disc
+  on the live map using the current signal/deal color.
+- Auto-refresh on `onDayChange`, plus manual Refresh.
+- Auto-calibrated per-map scoring; calibration lives in the Diagnostics
+  drawer instead of the main panel.
+- Debug DL button remains in Diagnostics and downloads a self-describing
+  JSON snapshot (counts, calibration, top rows, deep API shape probes).
 
 ### Tech stack and commands
 - TypeScript strict, vite (rolldown-vite fork), pnpm, vitest.
 - `pnpm build` — emits `dist/index.js` (the file the game loads).
-- `pnpm test` — vitest, currently 24/24 passing.
+- `pnpm test` — vitest, currently 194/194 passing.
 - `pnpm typecheck` — `tsc --noEmit`.
 - `pnpm dev` — `vite build --watch` + the game runner script.
 - Mod loads from `~/Library/Application Support/metro-maker4/mods/sb-tod/`.
@@ -43,6 +54,14 @@ src/
   api.ts                   typed wrapper over window.SubwayBuilderAPI
   types.ts                 LngLat brand, ModeBreakdown, StationGroup, deltas
   types/                   bundled .d.ts from the template (don't edit)
+  sim/
+    deals.ts               pure deal validation/lifecycle/daily chunks
+    mutate.ts              DemandPoint + Pop mutator, split children
+    *.test.ts              deal + mutator coverage
+  state/
+    mod-state.ts           singleton persisted per-save TOD state
+    storage-adapter.ts     api.storage with localStorage fallback
+    *.test.ts              persistence/replay coverage
   scoring/
     walkshed.ts            pure: haversine + linear decay → WalkshedHits
     todScore.ts            pure: scoreStation, scoreAccess
@@ -50,8 +69,8 @@ src/
                            Joins live data → ScoredStation[] + auto-cal.
     *.test.ts              vitest, pure-function coverage
   ui/
-    HelloTodPanel.tsx      the dashboard
-    mapHighlight.ts        geojson source + 2 layers + circlePolygon
+    TodPanel.tsx           polished dashboard
+    mapHighlight.ts        geojson source + 2 layers + colored pins
 ```
 
 Design invariant: anything in `scoring/` other than `index.ts` must stay
@@ -93,7 +112,7 @@ no room" while restoring meaningful headroom elsewhere.
 1. **No DevTools in the game.** Use the Debug DL button: it dumps a
    JSON snapshot including deep shape probes of any API we're not
    sure of. Add probes to `probeStationGroups` or `probeDemandShape`
-   in `HelloTodPanel.tsx` when you need to confirm shapes. Open the
+   in `TodPanel.tsx` when you need to confirm shapes. Open the
    downloaded file in your editor.
 2. **Bundled `.d.ts` is stale.** Several runtime methods/fields aren't
    in `src/types/`: `getStationGroups`, `getTransferStationIds`,
@@ -127,15 +146,13 @@ no room" while restoring meaningful headroom elsewhere.
    no-traffic stations. Always wrap `getStationRidership(id)` in try/catch
    and treat missing as 0.
 
-### What "stage 2" means and why it's not started yet
-Stage 2 closes the feedback loop. The plan: snapshot baseline densities
-on first day, persist deltas via `api.storage`, mutate
-`DemandPoint.jobs` / `.residents` on `onDayChange` based on TOD scores,
-replay deltas on `onGameLoaded`. Probe 2 confirmed the mutation works
-(reference assignment persists across game days; see
-`probe-2-findings.md`). The hard part is the persistence + replay
-correctness, not the mutation itself. The user explicitly wants to
-hold off until we re-architect a bit; until then, Stage 1 is the ship.
+### What remains after Stage 2
+The explicit deal loop is back: selected-site proposals, S/M/L sizing,
+baseline capture, cumulative deltas, per-save persistence, save/load
+replay, daily deal ticks, and strict 200-sized split Pops. The remaining
+larger idea is organic land-use growth/decay based on station
+performance, separate from player-funded deals. That should keep using
+`mod-state` + `DemandMutator` rather than writing DemandPoints directly.
 
 ### Quick references
 - `HANDOFF.md`, `probe-1-findings.md`, `probe-2-findings.md` —
