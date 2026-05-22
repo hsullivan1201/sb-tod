@@ -17,7 +17,7 @@
     "subway-builder",
     "mod"
   ],
-  "author": "hazel",
+  "author": "hsullivan1201",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^25.0.9",
