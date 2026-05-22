@@ -166,6 +166,15 @@ export interface DemandMutator {
   revertAll(): void;
 
   /**
+   * Remove every runtime split child (tracked or orphaned) and reset
+   * original pop sizes to captured baselines, while keeping point
+   * aggregates and cumulative deltas intact. Load/replay uses this to
+   * rebuild canonical split children from persisted deltas instead of
+   * trusting whatever synthetic pops survived in the save.
+   */
+  canonicalizeSplits(): { removed: number; originalsReset: number };
+
+  /**
    * Reconcile pop state at a single point against current tracked
    * baseline + cumulative delta. Idempotent: a no-op if the point is
    * already consistent, recreates missing split children if the game
@@ -217,6 +226,46 @@ const sourceField: Record<DeltaSourceKind, 'fromDeals' | 'fromOrganic'> = {
 
 function isSplitChildId(id: string): boolean {
   return id.startsWith(SPLIT_POP_PREFIX);
+}
+
+function modeBreakdownTotal(value: unknown): number {
+  const v = (value ?? {}) as Record<string, unknown>;
+  const walking = typeof v.walking === 'number' && Number.isFinite(v.walking) ? v.walking : 0;
+  const driving = typeof v.driving === 'number' && Number.isFinite(v.driving) ? v.driving : 0;
+  const transit = typeof v.transit === 'number' && Number.isFinite(v.transit) ? v.transit : 0;
+  const unknown = typeof v.unknown === 'number' && Number.isFinite(v.unknown) ? v.unknown : 0;
+  return walking + driving + transit + unknown;
+}
+
+function normalizeModeBreakdown(value: unknown, target: number): {
+  walking: number;
+  driving: number;
+  transit: number;
+  unknown: number;
+} {
+  const safeTarget = Number.isFinite(target) && target > 0 ? target : 0;
+  if (safeTarget === 0) {
+    return { walking: 0, driving: 0, transit: 0, unknown: 0 };
+  }
+  const v = (value ?? {}) as Record<string, unknown>;
+  const walking = typeof v.walking === 'number' && Number.isFinite(v.walking) ? v.walking : 0;
+  const driving = typeof v.driving === 'number' && Number.isFinite(v.driving) ? v.driving : 0;
+  const transit = typeof v.transit === 'number' && Number.isFinite(v.transit) ? v.transit : 0;
+  const unknown = typeof v.unknown === 'number' && Number.isFinite(v.unknown) ? v.unknown : 0;
+  const total = walking + driving + transit + unknown;
+  if (total <= 0) {
+    return { walking: 0, driving: 0, transit: 0, unknown: safeTarget };
+  }
+  const scale = safeTarget / total;
+  const nextWalking = walking * scale;
+  const nextDriving = driving * scale;
+  const nextTransit = transit * scale;
+  return {
+    walking: nextWalking,
+    driving: nextDriving,
+    transit: nextTransit,
+    unknown: Math.max(0, safeTarget - nextWalking - nextDriving - nextTransit),
+  };
 }
 
 /**
@@ -295,6 +344,19 @@ export function createMutator(
     return baseline;
   }
 
+  function normalizePointModeShares(point: DemandPoint): void {
+    const residentTotal = modeBreakdownTotal(point.residentModeShare);
+    const workerTotal = modeBreakdownTotal(point.workerModeShare);
+    if (Math.abs(residentTotal - point.residents) > 1e-6) {
+      point.residentModeShare = normalizeModeBreakdown(point.residentModeShare, point.residents);
+      tagged.add(point);
+    }
+    if (Math.abs(workerTotal - point.jobs) > 1e-6) {
+      point.workerModeShare = normalizeModeBreakdown(point.workerModeShare, point.jobs);
+      tagged.add(point);
+    }
+  }
+
   function getOrInitCumulative(pointId: string): PointDelta {
     let cum = cumulativeDeltas.get(pointId);
     if (!cum) {
@@ -338,6 +400,131 @@ export function createMutator(
     }
   }
 
+  function removePopIdFromAllPoints(popId: string): void {
+    for (const pt of demand.points.values()) {
+      if (pt.popIds.includes(popId)) {
+        pt.popIds = pt.popIds.filter((id) => id !== popId);
+        tagged.add(pt);
+      }
+    }
+  }
+
+  function clampDaySecond(value: number): number {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(86_399, value));
+  }
+
+  function hashString(s: string): number {
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+
+  function childTimeOffsetSeconds(childId: string): number {
+    // Spread split siblings across a one-hour window. The original pop
+    // keeps its authored departure time; children get stable, id-derived
+    // offsets so a generated 2k/8k development does not create a burst
+    // of identical 200-person commutes at the same simulation instant.
+    return (hashString(childId) % 3601) - 1800;
+  }
+
+  function deepClone<T>(value: T): T {
+    return JSON.parse(JSON.stringify(value)) as T;
+  }
+
+  function shiftCommuteTimes(value: unknown, offsetSeconds: number): void {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) shiftCommuteTimes(item, offsetSeconds);
+      return;
+    }
+    const obj = value as Record<string, unknown>;
+    for (const key of Object.keys(obj)) {
+      const v = obj[key];
+      if ((key === 'departureTime' || key === 'arrivalTime') && typeof v === 'number') {
+        obj[key] = clampDaySecond(v + offsetSeconds);
+      } else {
+        shiftCommuteTimes(v, offsetSeconds);
+      }
+    }
+  }
+
+  function clonePopForSplit(originalPop: Pop, childId: string): Pop {
+    const offsetSeconds = childTimeOffsetSeconds(childId);
+    const lastCommute = deepClone(originalPop.lastCommute);
+    shiftCommuteTimes(lastCommute, offsetSeconds);
+    return {
+      ...originalPop,
+      id: childId,
+      size: 0,
+      homeDepartureTime: clampDaySecond(originalPop.homeDepartureTime + offsetSeconds),
+      workDepartureTime: clampDaySecond(originalPop.workDepartureTime + offsetSeconds),
+      lastCommute,
+    };
+  }
+
+  function normalizeSplitChild(originalPop: Pop, childId: string, size: number): void {
+    let child = demand.popsMap.get(childId);
+    if (!child) {
+      child = clonePopForSplit(originalPop, childId);
+      demand.popsMap.set(childId, child);
+    }
+    const normalized = clonePopForSplit(originalPop, childId);
+    normalized.size = size;
+    Object.assign(child, normalized);
+  }
+
+  function setSplitChildMembership(
+    originalPop: Pop,
+    childId: string,
+    inResidence: boolean,
+    inJob: boolean
+  ): void {
+    if (inResidence) addPopIdToPoint(originalPop.residenceId, childId);
+    else removePopIdFromPoint(originalPop.residenceId, childId);
+
+    if (originalPop.jobId === originalPop.residenceId) return;
+    if (inJob) addPopIdToPoint(originalPop.jobId, childId);
+    else removePopIdFromPoint(originalPop.jobId, childId);
+  }
+
+  function canonicalizeSplits(): { removed: number; originalsReset: number } {
+    const splitIds = new Set<string>();
+    for (const id of demand.popsMap.keys()) {
+      if (isSplitChildId(id)) splitIds.add(id);
+    }
+    for (const ids of splitChildren.values()) {
+      for (const id of ids) splitIds.add(id);
+    }
+
+    let removed = 0;
+    for (const id of splitIds) {
+      if (demand.popsMap.delete(id)) removed++;
+      removePopIdFromAllPoints(id);
+    }
+    splitChildren.clear();
+
+    let originalsReset = 0;
+    if (strictUnitSize !== undefined && strictUnitSize > 0) {
+      for (const [id, size] of baselinePopSizes) {
+        if (isSplitChildId(id)) continue;
+        const pop = demand.popsMap.get(id);
+        if (!pop) continue;
+        if (pop.size !== size) {
+          pop.size = size;
+          originalsReset++;
+        }
+      }
+    }
+    for (const point of demand.points.values()) {
+      normalizePointModeShares(point);
+    }
+    return { removed, originalsReset };
+  }
+
   function nextChildId(originalId: string, takenIndex: number): string {
     // Base format: sb-tod-split:<originalId>:<n>. If that's already
     // in popsMap (shouldn't happen but we're defensive), bump.
@@ -368,7 +555,8 @@ export function createMutator(
   function reconcilePopGroup(
     originalPop: Pop,
     targetTotalSize: number,
-    baselineSize: number
+    baselineSize: number,
+    membership: { residence: boolean; job: boolean }
   ): { created: number; removed: number } {
     let totalUnits: number;
     let perUnitSize: number;
@@ -414,16 +602,7 @@ export function createMutator(
     // Grow if too few.
     while (existing.length < desiredChildCount) {
       const childId = nextChildId(originalPop.id, existing.length);
-      const childPop: Pop = {
-        ...originalPop,
-        id: childId,
-        size: 0, // will be set below
-      };
-      demand.popsMap.set(childId, childPop);
-      addPopIdToPoint(originalPop.residenceId, childId);
-      if (originalPop.jobId !== originalPop.residenceId) {
-        addPopIdToPoint(originalPop.jobId, childId);
-      }
+      normalizeSplitChild(originalPop, childId, perUnitSize);
       existing.push(childId);
       created++;
     }
@@ -436,8 +615,8 @@ export function createMutator(
     // mode each unit gets target / totalUnits — see the branch above.
     originalPop.size = perUnitSize;
     for (const id of existing) {
-      const child = demand.popsMap.get(id);
-      if (child) child.size = perUnitSize;
+      normalizeSplitChild(originalPop, id, perUnitSize);
+      setSplitChildMembership(originalPop, id, membership.residence, membership.job);
     }
 
     return { created, removed };
@@ -554,12 +733,11 @@ export function createMutator(
     let totalRemoved = 0;
 
     if (strictUnitSize !== undefined && strictUnitSize > 0) {
-      // PER-POINT apportionment in strict mode. Total pops at the point
-      // = floor(point.residents / unitSize) (and same for jobs). Extras
-      // are apportioned across origin pops by their baseline size using
-      // largest-fractional-remainder. Each pop's actual child count is
-      // the max of the residence-side and jobs-side allocations (one
-      // child satisfies both).
+      // Strict mode materializes our cumulative delta into 200-person
+      // child Pops. A child is indexed only on the side whose aggregate
+      // changed, so housing does not create phantom jobs at the work
+      // endpoint and commercial does not create phantom residents at the
+      // home endpoint.
       const r = reconcilePointStrict(pointId, affectedOriginals);
       totalCreated += r.created;
       totalRemoved += r.removed;
@@ -570,7 +748,10 @@ export function createMutator(
         const rRatio = residentsRatioFor(pop.residenceId);
         const jRatio = jobsRatioFor(pop.jobId);
         const target = baselineSize * rRatio * jRatio;
-        const { created, removed } = reconcilePopGroup(pop, target, baselineSize);
+        const { created, removed } = reconcilePopGroup(pop, target, baselineSize, {
+          residence: pop.residenceId === pointId && dRes !== 0,
+          job: pop.jobId === pointId && dJobs !== 0,
+        });
         totalCreated += created;
         totalRemoved += removed;
       }
@@ -578,6 +759,7 @@ export function createMutator(
 
     point.jobs = nextJobs;
     point.residents = nextRes;
+    normalizePointModeShares(point);
     tagged.add(point);
 
     return {
@@ -591,17 +773,47 @@ export function createMutator(
     };
   }
 
+  type AllocationDimension = 'residents' | 'jobs';
+
+  function allocationForPoint(
+    pointId: string,
+    dimension: AllocationDimension
+  ): Map<string, number> {
+    if (strictUnitSize === undefined || strictUnitSize <= 0) return new Map();
+
+    const baseline = baselineDemand.get(pointId);
+    if (!baseline) return new Map();
+
+    const cum = cumulativeDeltas.get(pointId);
+    const totals = cum ? totalOf(cum) : { jobs: 0, residents: 0 };
+    const origins: Pop[] = [];
+    for (const p of demand.popsMap.values()) {
+      if (isSplitChildId(p.id)) continue;
+      if (dimension === 'residents' && p.residenceId === pointId) origins.push(p);
+      if (dimension === 'jobs' && p.jobId === pointId) origins.push(p);
+    }
+
+    const cumulativeDelta = dimension === 'residents' ? totals.residents : totals.jobs;
+    // Additions are materialized in strictUnitSize chunks. Do NOT derive
+    // extra count from floor((baseline + delta) / unit): real game
+    // baselines are not always exactly `originPopCount * 200`, so that
+    // formula can accept a +200 aggregate delta without creating the
+    // corresponding extra Pop. We only own the delta, so chunk the delta.
+    const extra = Math.max(0, Math.floor((cumulativeDelta + 1e-6) / strictUnitSize));
+    return apportionLargestRemainder(
+      origins.map((p) => ({
+        id: p.id,
+        weight: baselinePopSizes.get(p.id) ?? p.size,
+      })),
+      extra
+    );
+  }
+
   /**
-   * Strict-mode reconciliation: drives pop counts at the point level
-   * rather than per-origin. Total pops at the point = floor(target /
-   * unitSize), apportioned across origins by baseline size using
-   * largest-fractional-remainder. Each origin's child count is the
-   * larger of its residence-share and jobs-share allocations.
-   *
-   * Note: this only reconciles `pointId`. A child added here also
-   * lives at the origin's OTHER point (residence ≠ jobId case);
-   * that other point's pop totals shift but won't be reconciled
-   * until it's mutated itself. v1 accepts this slight asymmetry.
+   * Strict-mode reconciliation: drives split counts from BOTH endpoints
+   * for each original pop. A pop's home point may allocate resident
+   * children while its job point allocates job children; reconciling one
+   * endpoint must not delete children owned by the other endpoint.
    */
   function reconcilePointStrict(
     pointId: string,
@@ -610,61 +822,34 @@ export function createMutator(
     if (strictUnitSize === undefined || strictUnitSize <= 0) {
       return { created: 0, removed: 0 };
     }
-    const baseline = baselineDemand.get(pointId);
-    if (!baseline) return { created: 0, removed: 0 };
-    const cum = cumulativeDeltas.get(pointId);
-    const totals = cum ? totalOf(cum) : { jobs: 0, residents: 0 };
 
-    // Origin pops touching this point on each side.
-    const residenceOrigins: Pop[] = [];
-    const jobsOrigins: Pop[] = [];
+    const allTouching = new Set<string>();
     for (const p of demand.popsMap.values()) {
       if (isSplitChildId(p.id)) continue;
-      if (p.residenceId === pointId) residenceOrigins.push(p);
-      if (p.jobId === pointId) jobsOrigins.push(p);
+      if (p.residenceId === pointId || p.jobId === pointId) allTouching.add(p.id);
     }
-
-    const targetR = baseline.residents + totals.residents;
-    const targetJ = baseline.jobs + totals.jobs;
-    // floor: only materialize a new pop once a full unitSize chunk has
-    // accumulated. max(numBaseline, ...) so we never delete originals
-    // even if the floor would suggest a smaller count.
-    const desiredR = Math.max(residenceOrigins.length, Math.floor(targetR / strictUnitSize));
-    const desiredJ = Math.max(jobsOrigins.length, Math.floor(targetJ / strictUnitSize));
-    const extraR = desiredR - residenceOrigins.length;
-    const extraJ = desiredJ - jobsOrigins.length;
-
-    const apportionedR = apportionLargestRemainder(
-      residenceOrigins.map((p) => ({
-        id: p.id,
-        weight: baselinePopSizes.get(p.id) ?? p.size,
-      })),
-      extraR
-    );
-    const apportionedJ = apportionLargestRemainder(
-      jobsOrigins.map((p) => ({
-        id: p.id,
-        weight: baselinePopSizes.get(p.id) ?? p.size,
-      })),
-      extraJ
-    );
-
-    // For every origin touching this point: desired children = max of
-    // residence-side and jobs-side allocations. A single child satisfies
-    // both dimensions.
-    const allTouching = new Set<string>();
-    for (const p of residenceOrigins) allTouching.add(p.id);
-    for (const p of jobsOrigins) allTouching.add(p.id);
 
     let created = 0;
     let removed = 0;
+    const allocations = new Map<string, Map<string, number>>();
+    const getAllocation = (point: string, dimension: AllocationDimension): Map<string, number> => {
+      const key = `${point}:${dimension}`;
+      let cached = allocations.get(key);
+      if (!cached) {
+        cached = allocationForPoint(point, dimension);
+        allocations.set(key, cached);
+      }
+      return cached;
+    };
+
     for (const originId of allTouching) {
-      const fromR = apportionedR.get(originId) ?? 0;
-      const fromJ = apportionedJ.get(originId) ?? 0;
-      const desiredChildren = Math.max(fromR, fromJ);
       const origin = demand.popsMap.get(originId);
       if (!origin) continue;
-      const r = setSplitChildCount(origin, desiredChildren);
+      const fromResidence =
+        getAllocation(origin.residenceId, 'residents').get(originId) ?? 0;
+      const fromJob = getAllocation(origin.jobId, 'jobs').get(originId) ?? 0;
+      const desiredChildren = Math.max(fromResidence, fromJob);
+      const r = setSplitChildCount(origin, desiredChildren, fromResidence, fromJob);
       created += r.created;
       removed += r.removed;
     }
@@ -674,7 +859,9 @@ export function createMutator(
   /** Bring origin's split-child count to exactly N. Sizes set to strictUnitSize. */
   function setSplitChildCount(
     origin: Pop,
-    desiredCount: number
+    desiredCount: number,
+    residenceMembershipCount: number,
+    jobMembershipCount: number
   ): { created: number; removed: number } {
     const existing = (splitChildren.get(origin.id) ?? []).filter((id) =>
       demand.popsMap.has(id)
@@ -690,14 +877,7 @@ export function createMutator(
     }
     while (existing.length < desiredCount) {
       const childId = nextChildId(origin.id, existing.length);
-      const childPop: Pop = {
-        ...origin,
-        id: childId,
-        size: strictUnitSize ?? origin.size,
-      };
-      demand.popsMap.set(childId, childPop);
-      addPopIdToPoint(origin.residenceId, childId);
-      if (origin.jobId !== origin.residenceId) addPopIdToPoint(origin.jobId, childId);
+      normalizeSplitChild(origin, childId, strictUnitSize ?? origin.size);
       existing.push(childId);
       created++;
     }
@@ -706,9 +886,10 @@ export function createMutator(
     // Force original + children to strictUnitSize.
     const sz = strictUnitSize ?? origin.size;
     origin.size = sz;
-    for (const id of existing) {
-      const child = demand.popsMap.get(id);
-      if (child) child.size = sz;
+    for (let i = 0; i < existing.length; i++) {
+      const id = existing[i];
+      normalizeSplitChild(origin, id, sz);
+      setSplitChildMembership(origin, id, i < residenceMembershipCount, i < jobMembershipCount);
     }
     return { created, removed };
   }
@@ -775,6 +956,7 @@ export function createMutator(
     },
     captureBaselines,
     revertAll,
+    canonicalizeSplits,
     reconcilePoint(pointId) {
       if (strictUnitSize === undefined || strictUnitSize <= 0) {
         return { created: 0, removed: 0 };

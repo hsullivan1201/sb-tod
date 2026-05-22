@@ -1,6 +1,6 @@
 {
   "name": "sb-tod",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Transit-Oriented Development mod for Subway Builder",
   "main": "dist/index.js",
   "type": "module",

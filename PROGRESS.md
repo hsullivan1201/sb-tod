@@ -29,14 +29,31 @@ based on station performance is still future work.
 - Deals persist per save through `mod-state`, `storage-adapter`, and the
   real `DemandMutator`. On load, persisted deltas are either rehydrated
   if the game preserved them or replayed if the game reset them.
+- Before each deal tick, `mod-state` rebinds the mutator to the latest
+  live `DemandData` object. This keeps player-funded developments
+  visible in scoring even if the game refreshes/replaces demand data
+  between ticks.
 - Persistence tries the official `api.storage` path, falls back to
   Electron settings storage and then localStorage when the runtime
   no-ops it, verifies round-trips, reads the current save name before
   first init, copies state on Save As, flushes dirty state on game end,
   and disables new deals only if no backend can be trusted.
+- Build confirmation is single-flight: it blocks duplicate clicks,
+  validates budget immediately before charging, and records a money
+  trace in Debug DL (build handler entries, `onMoneyChanged` events, and
+  post-charge budget samples) so duplicate-debit bugs can be traced to
+  the mod handler, event stream, or game budget API. The trace is a
+  bounded in-memory buffer, not hot-path console logging. Already-bad
+  saves still recover by cancelling/refunding a zero-progress active
+  deal.
 - Added density materializes through Pops, not just DemandPoint totals.
   The mutator runs in strict `200` unit mode, creating separate split
   child Pops so new demand boards like normal game-authored Pops.
+  Split children are indexed only on the side whose aggregate changed
+  (homes for housing, jobs for commercial), deep-clone commute state,
+  stagger their departure times, normalize mode-share totals, and are
+  rebuilt canonically from persisted baselines/deltas on load so tracked
+  and orphaned children from older test builds are purged.
 - Click any row or map station → pins a translucent 500m walkshed disc
   on the live map using the current signal/deal color.
 - Auto-refresh on `onDayChange`, plus manual Refresh.
@@ -44,15 +61,17 @@ based on station performance is still future work.
   drawer instead of the main panel.
 - Debug DL button remains in Diagnostics and downloads a self-describing
   JSON snapshot (counts, calibration, top rows, deep API shape probes).
+  It now also includes a rolling runtime trace plus split-pop timing and
+  transit-path audits for reproducing mid-day simulation freezes.
 
 ### Tech stack and commands
 - TypeScript strict, vite (rolldown-vite fork), pnpm, vitest.
 - `pnpm build` — emits `dist/index.js` (the file the game loads).
-- `pnpm test` — vitest, currently 194/194 passing.
+- `pnpm test` — vitest, currently 208/208 passing.
 - `pnpm typecheck` — `tsc --noEmit`.
 - `pnpm dev` — `vite build --watch` + the game runner script.
 - Mod loads from `~/Library/Application Support/metro-maker4/mods/sb-tod/`.
-  Manifest: `id: dev.hazel.sb-tod`, `main: dist/index.js`.
+  Manifest: `id: tod`, `main: dist/index.js`.
 
 ### File map
 ```

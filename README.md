@@ -21,7 +21,7 @@ Stage 2 is the playable dashboard plus persisted developer deals:
 - 500m walkshed pin on the map when a row is selected
 - Section-colored map pins and row score bars
 - Auto-refresh on day change, with manual refresh available
-- Diagnostics drawer with calibration details and JSON debug export
+- Diagnostics drawer with calibration details, runtime trace status, and JSON debug export
 
 The remaining future loop is organic growth/decay: letting station
 performance influence land use automatically over time.
@@ -47,6 +47,10 @@ mod reconciles live demand against storage: if the game preserved the
 mutation it rehydrates tracking; if the game reset it, the mod replays
 the deltas.
 
+Before deal ticks, the mod also rebinds its mutator to the latest live
+DemandData object so developments still affect the data used by scoring
+if the game refreshes demand behind the scenes.
+
 Persistence tries the official `api.storage` backend first and verifies
 every write with an immediate readback. If the game runtime no-ops that
 API, the mod falls back to Electron settings storage, then localStorage,
@@ -56,9 +60,31 @@ it can also survive save/load. Save names are read before first init,
 Save As copies state into the new slot, and dirty state flushes on game
 end.
 
+The build flow guards against duplicate clicks, validates the live
+budget immediately before charging, and records a money trace in Debug
+DL so we can diagnose whether any duplicate debit comes from duplicate
+build events, the money hook stream, or the game budget API itself. If a
+save already contains a zero-progress active deal with a negative budget,
+load recovery cancels/refunds that stuck deal. The trace is kept in a
+bounded in-memory buffer and is not logged on every money event.
+
+Debug DL also keeps a rolling runtime trace for freeze diagnosis: current
+game time, speed, budget, ridership/mode-choice stats, completed commute
+counts, day-tick phase, and TOD split-pop counts. The export includes
+split-pop timing histograms and transit-path sanity checks so freezes can
+be correlated with the synthetic commute batch that was about to run.
+
 When deals add population, the mutator updates both DemandPoint
 aggregates and Pops. New demand materializes as separate split child
 Pops at the game's natural size of 200, rather than one oversized Pop.
+Split children are indexed only on the side whose aggregate changed
+(homes for housing, jobs for commercial), clone their commute state, and
+stagger departure times so they behave like independent game-authored
+Pops without creating phantom jobs or residents at the other end of the
+commute. The mutator also normalizes resident/worker mode-share totals
+after TOD changes. On load, reconcile removes tracked and orphaned TOD
+split children from older builds, then rebuilds a canonical set from
+persisted baselines and deltas.
 Any selected station can start a deal when the live walkshed and budget
 validation pass.
 
@@ -113,7 +139,7 @@ stay pure and unit-tested. Live game API access is isolated in
 
 ## Mod Metadata
 
-- Manifest id: `dev.hazel.sb-tod`
+- Manifest id: `tod`
 - Main bundle: `dist/index.js`
 - Game dependency: Subway Builder modding API `>=1.0.0`
 

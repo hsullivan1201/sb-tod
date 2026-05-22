@@ -379,7 +379,7 @@ describe('pop splitting', () => {
     }
   });
 
-  it('adds child pop IDs to the residence AND job DemandPoint popIds arrays', () => {
+  it('adds child pop IDs only to the side whose aggregate changed', () => {
     const P = point('P', 200, 100); // residence for x
     const Q = point('Q', 100, 100); // job for x
     const x = pop('x', 'P', 'Q', 150);
@@ -389,10 +389,9 @@ describe('pop splitting', () => {
     m.applyDensityDelta('P', { residents: 200 }, 'deals');
 
     const childIds = [...demand.popsMap.keys()].filter((id) => id !== 'x');
-    // Both P and Q should carry the child IDs in their popIds.
     for (const cid of childIds) {
       expect(P.popIds).toContain(cid);
-      expect(Q.popIds).toContain(cid);
+      expect(Q.popIds).not.toContain(cid);
     }
   });
 
@@ -573,6 +572,181 @@ describe('strict unit-size mode', () => {
     m.applyDensityDelta('P', { residents: 400 }, 'deals'); // total +600
     expect(demand.popsMap.size).toBe(6);
     for (const p of demand.popsMap.values()) expect(p.size).toBe(200);
+  });
+
+  it('chunks added deltas even when game baseline aggregate does not match pop count', () => {
+    // Real saves can have point.residents that are not exactly
+    // residence-origin-pop-count * 200. A +200 TOD chunk still needs
+    // to create exactly one new Pop; deriving count from
+    // floor((baseline + delta) / 200) would miss this case.
+    const P = point('P', 0, 350);
+    const Q = point('Q', 400, 0);
+    const pops = [pop('a', 'P', 'Q', 200), pop('b', 'P', 'Q', 200)];
+    const demand = fixture([P, Q], pops);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    m.applyDensityDelta('P', { residents: 200 }, 'deals');
+
+    const splitIds = [...demand.popsMap.keys()].filter((id) => id.startsWith(SPLIT_POP_PREFIX));
+    expect(P.residents).toBe(550);
+    expect(splitIds.length).toBe(1);
+    expect(demand.popsMap.get(splitIds[0])!.size).toBe(200);
+  });
+
+  it('split children are one-sided, deep-cloned, and departure-staggered', () => {
+    const P = point('P', 0, 200, ['x']);
+    const Q = point('Q', 200, 0, []);
+    const x = pop('x', 'P', 'Q', 200);
+    x.homeDepartureTime = 30_000;
+    x.workDepartureTime = 55_000;
+    x.lastCommute.transitPaths = [
+      {
+        departureTime: 30_100,
+        arrivalTime: 31_000,
+        fromStopCoords: [-122, 37],
+        toStopCoords: [-122.1, 37.1],
+        fromStopId: 'a',
+        toStopId: 'b',
+        isDriving: false,
+        isWalking: false,
+        routeId: 'r',
+      },
+    ];
+    const demand = fixture([P, Q], [x]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    m.applyDensityDelta('P', { residents: 400 }, 'deals');
+
+    const child = [...demand.popsMap.values()].find((p) => p.id.startsWith(SPLIT_POP_PREFIX));
+    expect(child).toBeDefined();
+    expect(P.popIds).toContain(child!.id);
+    expect(Q.popIds).not.toContain(child!.id);
+    expect(child!.lastCommute).not.toBe(x.lastCommute);
+    expect(child!.lastCommute.modeChoice).not.toBe(x.lastCommute.modeChoice);
+    expect(child!.homeDepartureTime).not.toBe(x.homeDepartureTime);
+    expect(child!.workDepartureTime).not.toBe(x.workDepartureTime);
+    expect(child!.lastCommute.transitPaths[0].departureTime).not.toBe(
+      x.lastCommute.transitPaths[0].departureTime
+    );
+  });
+
+  it('job deltas attach split children to the job endpoint only', () => {
+    const P = point('P', 0, 200, ['x']);
+    const Q = point('Q', 200, 0, ['x']);
+    const x = pop('x', 'P', 'Q', 200);
+    const demand = fixture([P, Q], [x]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    m.applyDensityDelta('Q', { jobs: 200 }, 'deals');
+
+    const child = [...demand.popsMap.values()].find((p) => p.id.startsWith(SPLIT_POP_PREFIX));
+    expect(child).toBeDefined();
+    expect(P.popIds).not.toContain(child!.id);
+    expect(Q.popIds).toContain(child!.id);
+  });
+
+  it('normalizes point mode-share totals after TOD aggregate changes', () => {
+    const P = point('P', 0, 200, ['x']);
+    P.residentModeShare = { walking: 10, driving: 10, transit: 80, unknown: 0 };
+    const x = pop('x', 'P', 'P', 200);
+    const demand = fixture([P], [x]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    m.applyDensityDelta('P', { residents: 200 }, 'deals');
+
+    const total =
+      P.residentModeShare.walking +
+      P.residentModeShare.driving +
+      P.residentModeShare.transit +
+      P.residentModeShare.unknown;
+    expect(P.residents).toBe(400);
+    expect(total).toBeCloseTo(400, 8);
+  });
+
+  it('normalizes preexisting split children when reconciling a point', () => {
+    const P = point('P', 0, 400, ['x']);
+    const Q = point('Q', 400, 0, []);
+    const x = pop('x', 'P', 'Q', 200);
+    x.homeDepartureTime = 30_000;
+    x.workDepartureTime = 55_000;
+    const staleChild = {
+      ...x,
+      id: `${SPLIT_POP_PREFIX}x:0`,
+      size: 999,
+      lastCommute: x.lastCommute,
+    };
+    const demand = fixture([P, Q], [x, staleChild]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+    m.hydrateTracking({
+      baselineDemand: [['P', { jobs: 0, residents: 200 }]],
+      baselinePopSizes: [['x', 200]],
+      cumulativeDeltas: [
+        ['P', { jobs: { fromDeals: 0, fromOrganic: 0 }, residents: { fromDeals: 200, fromOrganic: 0 } }],
+      ],
+      splitChildren: [['x', [staleChild.id]]],
+    });
+
+    const r = m.reconcilePoint('P');
+    const normalized = demand.popsMap.get(staleChild.id)!;
+
+    expect(r.created).toBe(0);
+    expect(normalized.size).toBe(200);
+    expect(normalized.lastCommute).not.toBe(x.lastCommute);
+    expect(P.popIds).toContain(staleChild.id);
+    expect(Q.popIds).not.toContain(staleChild.id);
+    expect(normalized.homeDepartureTime).not.toBe(x.homeDepartureTime);
+  });
+
+  it('does not let job-endpoint reconcile delete home-endpoint split children', () => {
+    const P = point('P', 0, 200, ['x']);
+    const Q = point('Q', 200, 0, ['x']);
+    const x = pop('x', 'P', 'Q', 200);
+    const demand = fixture([P, Q], [x]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    m.applyDensityDelta('P', { residents: 200 }, 'deals');
+    const childIdsBefore = [...demand.popsMap.keys()].filter((id) =>
+      id.startsWith(SPLIT_POP_PREFIX)
+    );
+    expect(childIdsBefore.length).toBe(1);
+
+    m.reconcilePoint('Q');
+
+    const childIdsAfter = [...demand.popsMap.keys()].filter((id) =>
+      id.startsWith(SPLIT_POP_PREFIX)
+    );
+    expect(childIdsAfter).toEqual(childIdsBefore);
+    expect(P.popIds).toContain(childIdsBefore[0]);
+    expect(Q.popIds).not.toContain(childIdsBefore[0]);
+  });
+
+  it('canonicalizes tracked and orphaned split children before replay', () => {
+    const P = point('P', 0, 400, ['x', `${SPLIT_POP_PREFIX}orphan:0`]);
+    const Q = point('Q', 400, 0, ['x', `${SPLIT_POP_PREFIX}x:0`]);
+    const x = pop('x', 'P', 'Q', 200);
+    x.size = 999;
+    const tracked = { ...x, id: `${SPLIT_POP_PREFIX}x:0`, size: 999 };
+    const orphan = { ...x, id: `${SPLIT_POP_PREFIX}orphan:0`, size: 200 };
+    const demand = fixture([P, Q], [x, tracked, orphan]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+    m.hydrateTracking({
+      baselineDemand: [['P', { jobs: 0, residents: 200 }]],
+      baselinePopSizes: [['x', 200]],
+      cumulativeDeltas: [
+        ['P', { jobs: { fromDeals: 0, fromOrganic: 0 }, residents: { fromDeals: 200, fromOrganic: 0 } }],
+      ],
+      splitChildren: [['x', [tracked.id]]],
+    });
+
+    const result = m.canonicalizeSplits();
+
+    expect(result.removed).toBe(2);
+    expect(result.originalsReset).toBe(1);
+    expect(demand.popsMap.has(tracked.id)).toBe(false);
+    expect(demand.popsMap.has(orphan.id)).toBe(false);
+    expect(demand.popsMap.get('x')!.size).toBe(200);
+    expect(P.popIds).not.toContain(orphan.id);
+    expect(Q.popIds).not.toContain(tracked.id);
   });
 
   it('reverts cleanly back to the single original pop at strictUnitSize', () => {

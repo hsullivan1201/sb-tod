@@ -25,6 +25,18 @@ export interface DealTotalDensity {
   residents: number;
 }
 
+export interface DealChargeAudit {
+  /** Budget immediately before the TOD charge call. */
+  budgetBefore: number;
+  /** Budget the mod expected after exactly one charge. */
+  expectedBudgetAfter: number;
+  /** Budget observed by the mod shortly after the charge call. */
+  budgetAfter: number;
+  /** Debug trace ID for correlating with moneyTrace in Debug DL. */
+  traceId?: string;
+  chargedAt: number;
+}
+
 export interface TierConfig {
   totalDensity: DealTotalDensity;
   cost: number;
@@ -102,6 +114,8 @@ export interface Deal {
   totalDensity: DealTotalDensity;
   /** Player paid this much upfront on confirmation. */
   totalCost: number;
+  /** Audit trail for charge/recovery logic. Absent on legacy persisted deals. */
+  chargeAudit?: DealChargeAudit;
   /** Game day when the deal was confirmed. */
   startDay: number;
   /** Number of game days the deal stretches over. */

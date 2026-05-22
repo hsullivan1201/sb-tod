@@ -71,7 +71,7 @@ function makeNoopStorage(): StorageLike {
   };
 }
 
-function deal(id = 'deal-1'): Deal {
+function deal(id = 'deal-1', overrides: Partial<Deal> = {}): Deal {
   return {
     id,
     kind: 'housing',
@@ -87,6 +87,7 @@ function deal(id = 'deal-1'): Deal {
     state: 'active',
     appliedSoFar: { residents: 0, jobs: 0 },
     pending: { residents: 0, jobs: 0 },
+    ...overrides,
   };
 }
 
@@ -373,6 +374,79 @@ describe('mod state — lifecycle hooks', () => {
     expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(true);
   });
 
+  it('rebinds to refreshed DemandData before applying deal ticks', async () => {
+    const storage = makeStorage();
+    const stalePoint = point('P', 100, 1000);
+    let liveDemand = fixture([stalePoint], [pop('x', 'P', 'P', 50)]);
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => liveDemand,
+    });
+    await state.ensureInit();
+    expect(
+      await state.addDeal(
+        deal('deal-refresh', {
+          centerStationGroupId: 'P',
+          centerStationGroupName: 'P',
+          totalDensity: { residents: 2000, jobs: 0 },
+          startDay: 1,
+          durationDays: 2,
+        })
+      )
+    ).toBe(true);
+
+    const freshPoint = point('P', 100, 1000);
+    liveDemand = fixture([freshPoint], [pop('x', 'P', 'P', 50)]);
+
+    state.onDayTick(1);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(freshPoint.residents).toBe(2000);
+    expect(stalePoint.residents).toBe(1000);
+    expect(state.stats().lastTickReports[0].applied.residents).toBe(1000);
+  });
+
+  it('cancels and refunds a zero-progress active deal when it loads with negative budget', async () => {
+    const storage = makeStorage();
+    const rescueDeal = deal('deal-rescue', {
+      tier: 'L',
+      totalDensity: { residents: 8000, jobs: 0 },
+      totalCost: 250_000_000,
+      durationDays: 3,
+      startDay: 34,
+    });
+    const persisted: PersistedState = {
+      version: 1,
+      savedAt: Date.now(),
+      baselineDemand: [['P', { jobs: 100, residents: 1000 }]],
+      baselinePopSizes: [],
+      cumulativeDeltas: [],
+      deals: [rescueDeal],
+    };
+    await storage.set('sb-tod:state:v1:_unsaved', persisted);
+
+    const refunds: number[] = [];
+    const P = point('P', 100, 1000);
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => fixture([P], []),
+      getBudget: () => -5_000_000,
+      addMoney: (amount) => {
+        refunds.push(amount);
+      },
+    });
+
+    await state.ensureInit();
+
+    expect(refunds).toEqual([250_000_000]);
+    expect(state.getDeals()[0].state).toBe('cancelled');
+    const stored = storage._data.get('sb-tod:state:v1:_unsaved') as PersistedState;
+    expect(stored.deals?.[0].state).toBe('cancelled');
+  });
+
   it('counts onDemandChange events without ever mutating', async () => {
     const storage = makeStorage();
     const A = point('P', 100, 1000);
@@ -536,6 +610,28 @@ describe('mod state — applyDensityDelta + revert', () => {
     expect(await state.addDeal(deal())).toBe(false);
     expect(state.getDeals()).toHaveLength(0);
     expect(state.stats().storageRoundTripOk).toBe(false);
+  });
+
+  it('returns false and removes the pending deal if demand refresh throws during addDeal persist', async () => {
+    const A = point('P', 100, 1000);
+    const demand = fixture([A], []);
+    const storage = makeStorage();
+    let throwOnDemand = false;
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => {
+        if (throwOnDemand) throw new Error('demand refresh exploded');
+        return demand;
+      },
+    });
+    await state.ensureInit();
+
+    throwOnDemand = true;
+    await expect(state.addDeal(deal())).resolves.toBe(false);
+
+    expect(state.getDeals()).toHaveLength(0);
+    expect(state.stats().lastPersistOk).toBe(false);
   });
 
   it('does not mark dirty on failed mutation (ghost-town reject)', async () => {

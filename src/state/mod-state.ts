@@ -62,6 +62,8 @@ export interface HydrateReport {
   replayed: number;
   baselineShift: number;
   missingPoint: number;
+  splitChildrenRemoved: number;
+  originalPopsReset: number;
   fromStorage: boolean;
 }
 
@@ -100,6 +102,12 @@ export interface ModStateStats {
   cancelledDeals: number;
   /** Last day's deal application reports — most recent first. */
   lastTickReports: DealTickReport[];
+  /** Current day-tick phase, for diagnosing freezes around day changes. */
+  dayTickPhase: 'idle' | 'init' | 'refresh-demand' | 'apply-deals' | 'persist';
+  lastTickStartedAt: number | null;
+  lastTickCompletedAt: number | null;
+  lastTickActiveDealId: string | null;
+  lastTickError: string | null;
   /** Current save name (null = no save loaded yet, defaults to `_unsaved` slot). */
   currentSaveName: string | null;
   /** The actual storage key in use right now — handy for debugging cross-save bleed. */
@@ -297,6 +305,10 @@ export interface CreateModStateOptions {
   storage?: StorageLike;
   /** Override demand accessor for tests. Defaults to gameState.getDemandData. */
   getDemand?: () => DemandData | null;
+  /** Override budget accessor for tests. Defaults to gameState.getBudget. */
+  getBudget?: () => number;
+  /** Override budget refund action for tests. Defaults to actions.addMoney. */
+  addMoney?: (amount: number, category?: string) => void;
   /** Persist every N day ticks. Default 1 (every day). */
   persistEveryNDays?: number;
   /** Initial save name. Default null (uses the `_unsaved` slot). */
@@ -316,6 +328,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let backend: StorageLike = options.storage ?? createAdaptiveStorage();
   const getDemand = options.getDemand ?? (() => gameState.getDemandData() as DemandData | null);
   const getSaveName = options.getSaveName ?? (() => gameState.getSaveName());
+  const getBudget = options.getBudget ?? (() => gameState.getBudget());
+  const addMoney = options.addMoney ?? ((amount: number, category?: string) => actionsApi.addMoney(amount, category));
   const persistEveryNDays = options.persistEveryNDays ?? 1;
   // Strict 200-sized pops by default: matches the game's natural Pop
   // granularity (every game-authored Pop has size 200). Keeps split
@@ -340,6 +354,89 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let deals: Deal[] = [];
   let lastTickReports: DealTickReport[] = [];
   let initPromise: Promise<boolean> | null = null;
+  let dayTickPhase: ModStateStats['dayTickPhase'] = 'idle';
+  let lastTickStartedAt: number | null = null;
+  let lastTickCompletedAt: number | null = null;
+  let lastTickActiveDealId: string | null = null;
+  let lastTickError: string | null = null;
+
+  function isZeroDensity(total: { jobs?: number; residents?: number } | undefined): boolean {
+    return (total?.jobs ?? 0) === 0 && (total?.residents ?? 0) === 0;
+  }
+
+  function cloneDeal(d: Deal): Deal {
+    return {
+      ...d,
+      totalDensity: {
+        residents: d.totalDensity?.residents ?? 0,
+        jobs: d.totalDensity?.jobs ?? 0,
+      },
+      appliedSoFar: {
+        residents: d.appliedSoFar?.residents ?? 0,
+        jobs: d.appliedSoFar?.jobs ?? 0,
+      },
+      pending: {
+        residents: d.pending?.residents ?? 0,
+        jobs: d.pending?.jobs ?? 0,
+      },
+      chargeAudit: d.chargeAudit
+        ? {
+            budgetBefore: d.chargeAudit.budgetBefore,
+            expectedBudgetAfter: d.chargeAudit.expectedBudgetAfter,
+            budgetAfter: d.chargeAudit.budgetAfter,
+            traceId: d.chargeAudit.traceId,
+            chargedAt: d.chargeAudit.chargedAt,
+          }
+        : undefined,
+    };
+  }
+
+  function refundDealMoney(amount: number, category: string): boolean {
+    if (amount <= 0) return true;
+    try {
+      addMoney(amount, category);
+      return true;
+    } catch (e) {
+      console.warn('[sb-tod] refund addMoney failed:', e);
+      return false;
+    }
+  }
+
+  function rescueNegativeBudgetFromUnappliedDeal(): boolean {
+    let budget: number | null = null;
+    try {
+      const b = getBudget();
+      budget = Number.isFinite(b) ? b : null;
+    } catch {
+      return false;
+    }
+    if (budget == null || budget >= 0) return false;
+
+    const candidate = [...deals].reverse().find(
+      (d) =>
+        d.state === 'active' &&
+        d.totalCost > 0 &&
+        isZeroDensity(d.appliedSoFar) &&
+        isZeroDensity(d.pending)
+    );
+    if (!candidate) return false;
+
+    candidate.state = 'cancelled';
+    dirty = true;
+    refundDealMoney(candidate.totalCost, 'TOD Deal rescue refund');
+    console.warn(
+      `[sb-tod] negative budget rescue: cancelled zero-progress deal ${candidate.id} and refunded $${candidate.totalCost.toLocaleString()} (budget before refund ${budget.toLocaleString()}).`
+    );
+    try {
+      uiApi.showNotification(
+        `Recovered a stuck TOD deal at ${candidate.centerStationGroupName}. Refunded $${candidate.totalCost.toLocaleString()} and cancelled the zero-progress build.`,
+        'warning'
+      );
+    } catch (e) {
+      console.warn('[sb-tod] rescue notification failed:', e);
+    }
+    return true;
+  }
 
   function readLiveSaveName(): string | null {
     try {
@@ -386,7 +483,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
 
     if (persisted && persisted.version === 1) {
       lastHydrate = applyPersisted(mutator, d, persisted);
-      deals = persisted.deals ? persisted.deals.map((dd) => ({ ...dd })) : [];
+      deals = persisted.deals ? persisted.deals.map(cloneDeal) : [];
       console.log(
         `[sb-tod] Hydrated "${storageKey}" (saved ${new Date(persisted.savedAt).toISOString()}): preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}, deals=${deals.length}. Storage keys: [${storageKeys.join(', ')}]`
       );
@@ -401,6 +498,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         replayed: 0,
         baselineShift: 0,
         missingPoint: 0,
+        splitChildrenRemoved: 0,
+        originalPopsReset: 0,
         fromStorage: false,
       };
       deals = [];
@@ -422,6 +521,9 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     }
 
     initialized = true;
+    if (rescueNegativeBudgetFromUnappliedDeal()) {
+      await persist();
+    }
     return true;
   }
 
@@ -444,15 +546,12 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     return mutator;
   }
 
-  async function persist(): Promise<boolean> {
-    if (!mutator) {
-      lastPersistOk = false;
-      return false;
-    }
+  function buildPersistedPayload(savedAt: number): PersistedState | null {
+    if (!mutator) return null;
     const snap = mutator.snapshot();
-    const payload: PersistedState = {
+    return {
       version: 1,
-      savedAt: Date.now(),
+      savedAt,
       baselineDemand: [...snap.baselineDemand.entries()].map(([id, b]) => [
         id,
         { jobs: b.jobs, residents: b.residents },
@@ -472,8 +571,59 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         id,
         [...children],
       ]),
-      deals: deals.map((dd) => ({ ...dd, appliedSoFar: { ...dd.appliedSoFar } })),
+      deals: deals.map(cloneDeal),
     };
+  }
+
+  function refreshDemandBinding(): boolean {
+    if (!initialized || !mutator) return demand !== null;
+    const live = getDemand();
+    if (!live || !live.points || !live.popsMap) return false;
+    if (live === demand) return true;
+
+    const persisted = buildPersistedPayload(Date.now());
+    demand = live;
+    mutator = createMutator(live, mutatorOptions);
+    if (persisted) {
+      lastHydrate = applyPersisted(mutator, live, persisted);
+      console.log(
+        `[sb-tod] Rebound mutator to refreshed DemandData: preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}`
+      );
+    } else {
+      mutator.captureBaselines();
+    }
+    return true;
+  }
+
+  async function persist(): Promise<boolean> {
+    if (!mutator) {
+      lastPersistOk = false;
+      return false;
+    }
+    let bound = false;
+    try {
+      bound = refreshDemandBinding();
+    } catch (err) {
+      console.warn('[sb-tod] refreshDemandBinding failed during persist:', err);
+      lastPersistOk = false;
+      return false;
+    }
+    if (!bound) {
+      lastPersistOk = false;
+      return false;
+    }
+    let payload: PersistedState | null = null;
+    try {
+      payload = buildPersistedPayload(Date.now());
+    } catch (err) {
+      console.warn('[sb-tod] buildPersistedPayload failed during persist:', err);
+      lastPersistOk = false;
+      return false;
+    }
+    if (!payload) {
+      lastPersistOk = false;
+      return false;
+    }
     const storageKey = makeStorageKey(currentSaveName);
     try {
       await backend.set(storageKey, payload);
@@ -511,19 +661,42 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   function onDayTick(day: number): void {
     dayTicks++;
     lastDay = day;
+    lastTickStartedAt = Date.now();
+    lastTickCompletedAt = null;
+    lastTickError = null;
     if (!initialized) {
       // Try to init opportunistically — demand is almost certainly available
       // by the first day tick.
+      dayTickPhase = 'init';
       ensureInit().catch((e) => console.warn('[sb-tod] ensureInit on day tick failed:', e));
       return;
     }
 
-    // Apply each active deal's daily delta. Done before the persist below
-    // so the saved state reflects today's progress.
-    lastTickReports = applyActiveDealsForDay(day);
+    try {
+      dayTickPhase = 'refresh-demand';
+      if (!refreshDemandBinding()) return;
 
-    if (dirty && dayTicks % persistEveryNDays === 0) {
-      void persist();
+      // Apply each active deal's daily delta. Done before the persist below
+      // so the saved state reflects today's progress.
+      dayTickPhase = 'apply-deals';
+      lastTickReports = applyActiveDealsForDay(day);
+
+      if (dirty && dayTicks % persistEveryNDays === 0) {
+        dayTickPhase = 'persist';
+        void persist();
+      }
+    } catch (err) {
+      lastTickError = err instanceof Error ? err.message : String(err);
+      console.warn('[sb-tod] day tick failed:', err);
+      try {
+        uiApi.showNotification(`TOD day tick failed: ${lastTickError}`, 'error');
+      } catch {
+        /* ignore */
+      }
+    } finally {
+      lastTickActiveDealId = null;
+      lastTickCompletedAt = Date.now();
+      dayTickPhase = 'idle';
     }
   }
 
@@ -532,6 +705,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     const reports: DealTickReport[] = [];
     for (const deal of deals) {
       if (deal.state !== 'active') continue;
+      lastTickActiveDealId = deal.id;
       // Don't tick on a day before the deal started (defensive against
       // weird load ordering — shouldn't normally happen).
       if (day < deal.startDay) continue;
@@ -652,6 +826,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     isReady,
     mutator: requireMutator,
     applyDensityDelta(pointId, delta, source) {
+      refreshDemandBinding();
       const r = requireMutator().applyDensityDelta(pointId, delta, source);
       if (r.ok) dirty = true;
       return r;
@@ -691,11 +866,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         fractions.length > 0 ? fractions.reduce((s, f) => s + f, 0) / fractions.length : 0;
       const refund = Math.round(d.totalCost * (1 - deliveredFraction));
       if (refund > 0) {
-        try {
-          actionsApi.addMoney(refund, 'TOD Deal refund');
-        } catch (e) {
-          console.warn('[sb-tod] refund addMoney failed:', e);
-        }
+        refundDealMoney(refund, 'TOD Deal refund');
       }
       d.state = 'cancelled';
       dirty = true;
@@ -722,6 +893,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       return { dealsCleared, pointsReverted };
     },
     debugReconcileAll() {
+      refreshDemandBinding();
       if (!mutator) return { points: 0, created: 0, removed: 0 };
       const snap = mutator.snapshot();
       let points = 0;
@@ -737,6 +909,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       return { points, created, removed };
     },
     debugCompleteDeal(dealId) {
+      refreshDemandBinding();
       if (!mutator || !demand) return false;
       const d = deals.find((dd) => dd.id === dealId);
       if (!d || d.state !== 'active') return false;
@@ -803,6 +976,11 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         completedDeals: completedDealsCount,
         cancelledDeals: cancelledDealsCount,
         lastTickReports,
+        dayTickPhase,
+        lastTickStartedAt,
+        lastTickCompletedAt,
+        lastTickActiveDealId,
+        lastTickError,
       };
     },
     _setStorage(s) {
@@ -829,6 +1007,8 @@ function applyPersisted(
     replayed: 0,
     baselineShift: 0,
     missingPoint: 0,
+    splitChildrenRemoved: 0,
+    originalPopsReset: 0,
     fromStorage: true,
   };
 
@@ -837,6 +1017,15 @@ function applyPersisted(
   // values). We'll selectively re-apply via applyDensityDelta below
   // where the game-preserved path doesn't hold.
   mutator.hydrateTracking(persisted);
+
+  // Runtime split children are synthetic, and older builds may have
+  // left stale/orphaned children in the game save. Rebuild them from
+  // baseline + cumulative deltas instead of trusting preserved child
+  // objects. DemandPoint aggregates are left untouched for the
+  // preserved/reset checks below.
+  const canonical = mutator.canonicalizeSplits();
+  report.splitChildrenRemoved = canonical.removed;
+  report.originalPopsReset = canonical.originalsReset;
 
   // Now walk each persisted point and decide.
   for (const [pointId, delta] of persisted.cumulativeDeltas) {

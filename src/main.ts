@@ -8,12 +8,13 @@
  */
 
 import { hooks, ui, apiVersion } from './api';
+import { ensureRuntimeTraceSampler } from './diagnostics/runtimeTrace';
 import { TodPanel } from './ui/TodPanel';
 import { initMapHighlight } from './ui/mapHighlight';
 import { getModState } from './state/mod-state';
 
 const MOD_ID = 'dev.hazel.sb-tod';
-const MOD_VERSION = '0.2.0';
+const MOD_VERSION = '0.2.1';
 const TAG = '[sb-tod]';
 
 console.log(`${TAG} v${MOD_VERSION} loading | API v${apiVersion}`);
@@ -37,6 +38,7 @@ hooks.onMapReady(() => {
     });
 
     initMapHighlight();
+    ensureRuntimeTraceSampler();
 
     // Best-effort init. Demand may not be ready yet; the first day tick
     // or panel interaction will retry if this returns false.

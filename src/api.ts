@@ -40,11 +40,29 @@ export const gameState = {
   getCurrentDay(): number {
     return getRaw().gameState.getCurrentDay();
   },
+  getCurrentHour(): number {
+    return getRaw().gameState.getCurrentHour();
+  },
+  getElapsedSeconds(): number {
+    return getRaw().gameState.getElapsedSeconds();
+  },
+  getGameSpeed() {
+    return getRaw().gameState.getGameSpeed();
+  },
   isPaused(): boolean {
     return getRaw().gameState.isPaused();
   },
   getBudget(): number {
     return getRaw().gameState.getBudget();
+  },
+  getRidershipStats() {
+    return getRaw().gameState.getRidershipStats();
+  },
+  getModeChoiceStats() {
+    return getRaw().gameState.getModeChoiceStats();
+  },
+  getCompletedCommutes() {
+    return getRaw().gameState.getCompletedCommutes();
   },
   getSaveName(): string | null {
     const name = (getRaw().gameState as any).getSaveName?.();
@@ -89,6 +107,9 @@ export const hooks = {
   onDemandChange(cb: (popCount: number) => void): void {
     getRaw().hooks.onDemandChange(cb);
   },
+  onMoneyChanged(cb: (newBalance: number, change: number, type: 'revenue' | 'expense', category?: string) => void): void {
+    getRaw().hooks.onMoneyChanged(cb);
+  },
 };
 
 export const actions = {
@@ -97,6 +118,9 @@ export const actions = {
   },
   addMoney(amount: number, category?: string): void {
     getRaw().actions.addMoney(amount, category);
+  },
+  setMoney(amount: number): void {
+    getRaw().actions.setMoney(amount);
   },
 };
 

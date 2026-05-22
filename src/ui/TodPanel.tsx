@@ -6,8 +6,13 @@
  * contextual map pins.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { actions, gameState, getMap, hooks, ui, utils } from '../api';
+import {
+  ensureRuntimeTraceSampler,
+  runtimeTraceSnapshot,
+  sampleRuntimeTrace,
+} from '../diagnostics/runtimeTrace';
 import {
   confirmProposal,
   DEFAULT_TIER_TABLE,
@@ -15,10 +20,12 @@ import {
   dealProgressFraction,
   validateProposal,
   type Deal,
+  type DealChargeAudit,
   type DealKind,
   type ProposalResult,
   type DealTier,
 } from '../sim/deals';
+import { SPLIT_POP_PREFIX } from '../sim/mutate';
 import {
   scoreAllStationsDetailed,
   type CalibrationInfo,
@@ -116,6 +123,245 @@ const FALLBACK_CALIBRATION: CalibrationInfo = {
 
 const dayListeners = new Set<(day: number) => void>();
 let dayHookRegistered = false;
+const BUILD_LOCK_WINDOW_MS = 10000;
+const BUDGET_SAMPLE_DELAYS_MS = [0, 50, 150, 400, 1000, 2500, 5000];
+const MONEY_TRACE_LIMIT = 2000;
+
+interface BuildLockState {
+  inFlight: boolean;
+  recent: Map<string, number>;
+}
+
+function getBuildLockState(): BuildLockState {
+  const root = globalThis as typeof globalThis & {
+    __sbTodBuildLockState?: BuildLockState;
+  };
+  if (!root.__sbTodBuildLockState) {
+    root.__sbTodBuildLockState = { inFlight: false, recent: new Map() };
+  }
+  return root.__sbTodBuildLockState;
+}
+
+function buildLockToken(row: ScoredStation, kind: DealKind, tier: DealTier): string {
+  return `${row.id}:${kind}:${tier}:day-${safeCurrentDay()}`;
+}
+
+function buildLockStorageKey(token: string): string {
+  return `sb-tod:build-lock:${token}`;
+}
+
+function readStoredBuildLock(token: string, now: number): boolean {
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    const raw = localStorage.getItem(buildLockStorageKey(token));
+    if (!raw) return false;
+    const parsed = JSON.parse(raw) as { expiresAt?: unknown };
+    const expiresAt = typeof parsed.expiresAt === 'number' ? parsed.expiresAt : 0;
+    if (expiresAt > now) return true;
+    localStorage.removeItem(buildLockStorageKey(token));
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function writeStoredBuildLock(token: string, expiresAt: number): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(buildLockStorageKey(token), JSON.stringify({ expiresAt }));
+  } catch {
+    /* best effort only */
+  }
+}
+
+function clearStoredBuildLock(token: string): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.removeItem(buildLockStorageKey(token));
+  } catch {
+    /* best effort only */
+  }
+}
+
+function acquireBuildLock(token: string): boolean {
+  const locks = getBuildLockState();
+  const now = Date.now();
+  for (const [key, expiresAt] of locks.recent) {
+    if (expiresAt <= now) locks.recent.delete(key);
+  }
+  if (locks.inFlight || locks.recent.has(token) || readStoredBuildLock(token, now)) return false;
+  locks.inFlight = true;
+  const expiresAt = now + BUILD_LOCK_WINDOW_MS;
+  locks.recent.set(token, expiresAt);
+  writeStoredBuildLock(token, expiresAt);
+  return true;
+}
+
+function releaseBuildLock(token: string, keepCooldown: boolean): void {
+  const locks = getBuildLockState();
+  locks.inFlight = false;
+  if (keepCooldown) {
+    const expiresAt = Date.now() + BUILD_LOCK_WINDOW_MS;
+    locks.recent.set(token, expiresAt);
+    writeStoredBuildLock(token, expiresAt);
+  } else {
+    locks.recent.delete(token);
+    clearStoredBuildLock(token);
+  }
+}
+
+type MoneyTraceEntry =
+  | {
+      type:
+        | 'build-enter'
+        | 'subtract-before'
+        | 'subtract-after'
+        | 'charge-correction'
+        | 'build-rejected'
+        | 'build-stored'
+        | 'build-failed';
+      at: number;
+      traceId: string;
+      budget: number;
+      detail?: Record<string, unknown>;
+    }
+  | {
+      type: 'budget-sample';
+      at: number;
+      traceId: string;
+      budget: number;
+      delayMs: number;
+    }
+  | {
+      type: 'money-event';
+      at: number;
+      newBalance: number;
+      change: number;
+      moneyType: 'revenue' | 'expense';
+      category?: string;
+    };
+
+interface MoneyTraceState {
+  entries: MoneyTraceEntry[];
+  nextId: number;
+  hookRegistered: boolean;
+}
+
+function getMoneyTraceState(): MoneyTraceState {
+  const root = globalThis as typeof globalThis & {
+    __sbTodMoneyTrace?: MoneyTraceState;
+  };
+  if (!root.__sbTodMoneyTrace) {
+    root.__sbTodMoneyTrace = { entries: [], nextId: 1, hookRegistered: false };
+  }
+  return root.__sbTodMoneyTrace;
+}
+
+function pushMoneyTrace(entry: MoneyTraceEntry): void {
+  const state = getMoneyTraceState();
+  state.entries.push(entry);
+  if (state.entries.length > MONEY_TRACE_LIMIT) {
+    state.entries.splice(0, state.entries.length - MONEY_TRACE_LIMIT);
+  }
+}
+
+function nextMoneyTraceId(): string {
+  const state = getMoneyTraceState();
+  const id = state.nextId++;
+  return `money-${Date.now().toString(36)}-${id.toString(36)}`;
+}
+
+function ensureMoneyTraceHook(): void {
+  const state = getMoneyTraceState();
+  if (state.hookRegistered) return;
+  state.hookRegistered = true;
+  try {
+    hooks.onMoneyChanged((newBalance, change, moneyType, category) => {
+      pushMoneyTrace({
+        type: 'money-event',
+        at: Date.now(),
+        newBalance,
+        change,
+        moneyType,
+        category,
+      });
+    });
+  } catch (err) {
+    console.warn('[sb-tod] money trace hook registration failed:', err);
+  }
+}
+
+function moneyTraceSnapshot(): MoneyTraceEntry[] {
+  return [...getMoneyTraceState().entries];
+}
+
+function recordBuildTrace(
+  type: Extract<
+    MoneyTraceEntry['type'],
+    | 'build-enter'
+    | 'subtract-before'
+    | 'subtract-after'
+    | 'charge-correction'
+    | 'build-rejected'
+    | 'build-stored'
+    | 'build-failed'
+  >,
+  traceId: string,
+  detail?: Record<string, unknown>
+): void {
+  const entry: MoneyTraceEntry = {
+    type,
+    at: Date.now(),
+    traceId,
+    budget: safeBudget(),
+    detail,
+  };
+  pushMoneyTrace(entry);
+}
+
+function scheduleBudgetSamples(traceId: string): void {
+  for (const delayMs of BUDGET_SAMPLE_DELAYS_MS) {
+    window.setTimeout(() => {
+      const entry: MoneyTraceEntry = {
+        type: 'budget-sample',
+        at: Date.now(),
+        traceId,
+        delayMs,
+        budget: safeBudget(),
+      };
+      pushMoneyTrace(entry);
+    }, delayMs);
+  }
+}
+
+async function setBudgetExactly(
+  targetBudget: number,
+  traceId: string,
+  detail: Record<string, unknown>
+): Promise<number> {
+  const beforeCorrection = safeBudget();
+  try {
+    actions.setMoney(targetBudget);
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+  } catch (err) {
+    console.warn('[sb-tod] setMoney budget correction failed:', err);
+    recordBuildTrace('build-failed', traceId, {
+      ...detail,
+      targetBudget,
+      beforeCorrection,
+      correctionError: String(err),
+    });
+  }
+  const afterCorrection = safeBudget();
+  recordBuildTrace('charge-correction', traceId, {
+    ...detail,
+    targetBudget,
+    beforeCorrection,
+    afterCorrection,
+    correctedBy: afterCorrection - beforeCorrection,
+  });
+  return afterCorrection;
+}
 
 function subscribeDayChange(listener: (day: number) => void): () => void {
   if (!dayHookRegistered) {
@@ -166,6 +412,122 @@ function safeCurrentDay(): number {
   }
 }
 
+function safeBudget(): number {
+  try {
+    const budget = gameState.getBudget();
+    return Number.isFinite(budget) ? budget : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function chargeDealCost(cost: number): Promise<
+  | { ok: true; audit: DealChargeAudit }
+  | { ok: false; message: string }
+> {
+  const traceId = nextMoneyTraceId();
+  const before = safeBudget();
+  recordBuildTrace('subtract-before', traceId, { cost });
+  if (before < cost) {
+    return {
+      ok: false,
+      message: `deal costs ${fmtMoney(cost)}; budget is ${fmtMoney(before)}`,
+    };
+  }
+
+  try {
+    actions.subtractMoney(cost, 'TOD Deal');
+    scheduleBudgetSamples(traceId);
+  } catch (err) {
+    console.warn('[sb-tod] subtractMoney failed:', err);
+    recordBuildTrace('build-failed', traceId, { cost, reason: 'subtractMoney threw', error: String(err) });
+    return { ok: false, message: 'Could not charge the TOD deal cost.' };
+  }
+
+  const expectedAfter = before - cost;
+  await new Promise((resolve) => window.setTimeout(resolve, 100));
+  let after = safeBudget();
+  const observedDelta = before - after;
+  recordBuildTrace('subtract-after', traceId, { cost, expectedAfter, observedDelta });
+
+  if (Math.abs(after - expectedAfter) > 1) {
+    after = await setBudgetExactly(expectedAfter, traceId, {
+      cost,
+      reason: 'observed charge did not match expected deal cost',
+      expectedAfter,
+      observedAfter: after,
+      observedDelta,
+    });
+  }
+
+  if (Math.abs(after - expectedAfter) > 1) {
+    const restored = await setBudgetExactly(before, traceId, {
+      cost,
+      reason: 'charge correction failed; restoring pre-charge budget',
+      expectedAfter,
+      observedAfter: after,
+    });
+    return {
+      ok: false,
+      message:
+        Math.abs(restored - before) <= 1
+          ? 'TOD charge could not be verified. The budget was restored; try again.'
+          : 'TOD charge could not be verified and automatic budget recovery failed.',
+    };
+  }
+
+  if (after < 0) {
+    recordBuildTrace('build-failed', traceId, { cost, reason: 'negative budget after charge', expectedAfter });
+    try {
+      actions.addMoney(cost, 'TOD Deal refund');
+    } catch (err) {
+      console.warn('[sb-tod] refund after negative budget failed:', err);
+    }
+    return {
+      ok: false,
+      message: 'TOD deal charge would put the budget below zero. The cost was refunded.',
+    };
+  }
+
+  return {
+    ok: true,
+    audit: {
+      budgetBefore: before,
+      expectedBudgetAfter: expectedAfter,
+      budgetAfter: after,
+      traceId,
+      chargedAt: Date.now(),
+    },
+  };
+}
+
+function refundChargedDeal(
+  cost: number,
+  category: string,
+  traceId: string,
+  detail?: Record<string, unknown>
+): boolean {
+  if (cost <= 0) return true;
+  try {
+    actions.addMoney(cost, category);
+    recordBuildTrace('build-failed', traceId, {
+      cost,
+      refunded: true,
+      ...detail,
+    });
+    return true;
+  } catch (err) {
+    console.warn('[sb-tod] refund after charged deal failed:', err);
+    recordBuildTrace('build-failed', traceId, {
+      cost,
+      refunded: false,
+      refundError: String(err),
+      ...detail,
+    });
+    return false;
+  }
+}
+
 export function TodPanel() {
   const [snapshot, setSnapshot] = useState<Snapshot>(() => readSnapshot());
   const [highlighted, setHighlighted] = useState<HighlightState | null>(null);
@@ -173,6 +535,13 @@ export function TodPanel() {
   const [proposalTier, setProposalTier] = useState<DealTier>('S');
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [dealVersion, setDealVersion] = useState(0);
+  const [buildPending, setBuildPending] = useState(false);
+  const buildInFlightRef = useRef(false);
+
+  useEffect(() => {
+    ensureRuntimeTraceSampler();
+    sampleRuntimeTrace('panel-open');
+  }, []);
 
   const selectedStation = useMemo(
     () => (highlighted ? snapshot.scored.find((row) => row.id === highlighted.id) ?? null : null),
@@ -224,83 +593,136 @@ export function TodPanel() {
 
   const onConfirmDeal = useCallback(
     async (row: ScoredStation, kind: DealKind, tier: DealTier) => {
-      const demand = gameState.getDemandData();
-      const state = getModState();
-      const ready = await state.ensureInit(demand);
-      const sectionKind = sectionKindForDeal(kind);
-      selectStation(row, sectionKind);
-
-      if (!ready) {
-        ui.showNotification('TOD state is not ready yet. Try again after the next game day tick.', 'warning');
+      const lockToken = buildLockToken(row, kind, tier);
+      const enterTraceId = nextMoneyTraceId();
+      if (buildInFlightRef.current) {
+        recordBuildTrace('build-rejected', enterTraceId, {
+          lockToken,
+          stationId: row.id,
+          stationName: row.name,
+          kind,
+          tier,
+          reason: 'component in-flight',
+        });
+        ui.showNotification('A TOD build is already being processed. Try again in a moment.', 'info');
         return;
       }
-
-      const proposal = validateProposal({
+      if (!acquireBuildLock(lockToken)) {
+        recordBuildTrace('build-rejected', enterTraceId, {
+          lockToken,
+          stationId: row.id,
+          stationName: row.name,
+          kind,
+          tier,
+          reason: 'transaction lock held',
+        });
+        ui.showNotification('A TOD build is already being processed. Try again in a moment.', 'info');
+        return;
+      }
+      buildInFlightRef.current = true;
+      setBuildPending(true);
+      let started = false;
+      let charged = false;
+      recordBuildTrace('build-enter', enterTraceId, {
+        lockToken,
+        stationId: row.id,
+        stationName: row.name,
         kind,
         tier,
-        centerLngLat: row.center,
-        radiusMeters: HIGHLIGHT_RADIUS_M,
-        walkshedPoints: demand.points.values(),
-        budget: gameState.getBudget(),
-        costMultiplier: DEAL_COST_MULTIPLIER,
+        day: safeCurrentDay(),
       });
-      if (!proposal.ok) {
-        ui.showNotification(`Cannot build at ${displayName(row.name, row.id)}: ${proposal.message}`, 'warning');
-        return;
-      }
-
-      const persistenceReady = await state.persist();
-      if (!persistenceReady) {
-        setDealVersion((v) => v + 1);
-        ui.showNotification(
-          'TOD persistence is not available. New development is disabled until storage can save and read back data.',
-          'error'
-        );
-        return;
-      }
-
-      const deal = confirmProposal({
-        proposal,
-        startDay: safeCurrentDay(),
-        centerStationGroupId: row.id,
-        centerStationGroupName: row.name,
-        centerLngLat: row.center,
-        radiusMeters: HIGHLIGHT_RADIUS_M,
-      });
-
       try {
-        actions.subtractMoney(deal.totalCost, 'TOD Deal');
-      } catch (err) {
-        console.warn('[sb-tod] subtractMoney failed:', err);
-        ui.showNotification('Could not charge the TOD deal cost. Deal was not started.', 'error');
-        return;
-      }
+        const demand = gameState.getDemandData();
+        const state = getModState();
+        const ready = await state.ensureInit(demand);
+        const sectionKind = sectionKindForDeal(kind);
+        selectStation(row, sectionKind);
 
-      const stored = await state.addDeal(deal);
-      if (!stored) {
-        try {
-          actions.addMoney(deal.totalCost, 'TOD Deal refund');
-        } catch (err) {
-          console.warn('[sb-tod] refund after failed deal persist failed:', err);
+        if (!ready) {
+          ui.showNotification('TOD state is not ready yet. Try again after the next game day tick.', 'warning');
+          return;
         }
+
+        const proposal = validateProposal({
+          kind,
+          tier,
+          centerLngLat: row.center,
+          radiusMeters: HIGHLIGHT_RADIUS_M,
+          walkshedPoints: demand.points.values(),
+          budget: safeBudget(),
+          costMultiplier: DEAL_COST_MULTIPLIER,
+        });
+        if (!proposal.ok) {
+          ui.showNotification(`Cannot build at ${displayName(row.name, row.id)}: ${proposal.message}`, 'warning');
+          return;
+        }
+
+        const deal = confirmProposal({
+          proposal,
+          startDay: safeCurrentDay(),
+          centerStationGroupId: row.id,
+          centerStationGroupName: row.name,
+          centerLngLat: row.center,
+          radiusMeters: HIGHLIGHT_RADIUS_M,
+        });
+
+        const charge = await chargeDealCost(deal.totalCost);
+        if (!charge.ok) {
+          ui.showNotification(`Cannot build at ${displayName(row.name, row.id)}: ${charge.message}`, 'warning');
+          return;
+        }
+        charged = true;
+        deal.chargeAudit = charge.audit;
+
+        let stored = false;
+        try {
+          stored = await state.addDeal(deal);
+        } catch (err) {
+          console.warn('[sb-tod] addDeal threw after charging:', err);
+          recordBuildTrace('build-failed', charge.audit.traceId ?? nextMoneyTraceId(), {
+            dealId: deal.id,
+            cost: deal.totalCost,
+            reason: 'addDeal threw after charge',
+            error: String(err),
+          });
+        }
+        if (!stored) {
+          refundChargedDeal(deal.totalCost, 'TOD Deal refund', charge.audit.traceId ?? nextMoneyTraceId(), {
+            dealId: deal.id,
+            reason: 'deal not stored after charge',
+          });
+          setDealVersion((v) => v + 1);
+          ui.showNotification(
+            'TOD deal could not be saved after charging. The cost was refunded and the deal was not started.',
+            'error'
+          );
+          return;
+        }
+        started = true;
+        recordBuildTrace('build-stored', charge.audit.traceId ?? nextMoneyTraceId(), {
+          dealId: deal.id,
+          cost: deal.totalCost,
+        });
+        setSnapshot(readSnapshot());
         setDealVersion((v) => v + 1);
         ui.showNotification(
-          'TOD persistence failed after charging. The deal was not started and the cost was refunded.',
-          'error'
+          `Started ${deal.kind}/${deal.tier} at ${displayName(row.name, row.id)}: ${dealSummary(deal)} over ${deal.durationDays} days.`,
+          'success'
         );
-        return;
+      } finally {
+        buildInFlightRef.current = false;
+        releaseBuildLock(lockToken, started || charged);
+        setBuildPending(false);
       }
-      setSnapshot(readSnapshot());
-      setDealVersion((v) => v + 1);
-      ui.showNotification(
-        `Started ${deal.kind}/${deal.tier} at ${displayName(row.name, row.id)}: ${dealSummary(deal)} over ${deal.durationDays} days.`,
-        'success'
-      );
     },
     [selectStation]
   );
 
   // ESC clears a selected pin before the game handles the key for panel chrome.
+  useEffect(() => {
+    ensureMoneyTraceHook();
+  }, []);
+
   useEffect(() => {
     if (!highlighted) return;
     const onKey = (e: KeyboardEvent) => {
@@ -434,6 +856,7 @@ export function TodPanel() {
         proposalTier={proposalTier}
         proposalPreview={proposalPreview}
         persistenceBlocked={persistenceBlocked}
+        buildPending={buildPending}
         onKindChange={setProposalKind}
         onTierChange={setProposalTier}
         onConfirm={() => {
@@ -541,6 +964,7 @@ function BuildSection({
   proposalTier,
   proposalPreview,
   persistenceBlocked,
+  buildPending,
   onKindChange,
   onTierChange,
   onConfirm,
@@ -550,6 +974,7 @@ function BuildSection({
   proposalTier: DealTier;
   proposalPreview: ProposalResult | null;
   persistenceBlocked: boolean;
+  buildPending: boolean;
   onKindChange: (kind: DealKind) => void;
   onTierChange: (tier: DealTier) => void;
   onConfirm: () => void;
@@ -565,7 +990,7 @@ function BuildSection({
       : proposalPreview.ok
         ? `${fmtMoney(proposalPreview.totalCost)} · ${densitySummary(proposalPreview.totalDensity)} · ${proposalPreview.durationDays} days · ${proposalPreview.eligiblePoints.length} points`
         : proposalPreview.message;
-  const buildDisabled = !station || !previewOk || persistenceBlocked;
+  const buildDisabled = buildPending || !station || !previewOk || persistenceBlocked;
 
   return (
     <section style={{ ...buildPanelStyle, borderColor: `${color}55` }}>
@@ -612,7 +1037,7 @@ function BuildSection({
           }}
           onClick={onConfirm}
         >
-          Build
+          {buildPending ? 'Building' : 'Build'}
         </button>
       </div>
     </section>
@@ -950,6 +1375,12 @@ function StateSummary() {
   const hydrate = stats.lastHydrate?.fromStorage
     ? `stored · kept ${stats.lastHydrate.preserved} · replayed ${stats.lastHydrate.replayed} · shifted ${stats.lastHydrate.baselineShift}`
     : 'fresh';
+  const trace = runtimeTraceSnapshot();
+  const lastTrace = trace[trace.length - 1];
+  const traceGameTime =
+    lastTrace?.game.currentHour == null
+      ? ''
+      : ` · h${Math.floor(lastTrace.game.currentHour).toString().padStart(2, '0')}`;
 
   return (
     <div style={calibrationGridStyle}>
@@ -966,6 +1397,10 @@ function StateSummary() {
       <DiagnosticRow
         label="Persist"
         value={stats.lastPersistOk == null ? 'not yet' : stats.lastPersistOk ? 'ok' : 'failed'}
+      />
+      <DiagnosticRow
+        label="Trace"
+        value={`${trace.length.toLocaleString()} samples${traceGameTime}`}
       />
     </div>
   );
@@ -993,7 +1428,7 @@ function readProposalPreview(
       centerLngLat: row.center,
       radiusMeters: HIGHLIGHT_RADIUS_M,
       walkshedPoints: demand.points.values(),
-      budget: gameState.getBudget(),
+      budget: safeBudget(),
       costMultiplier: DEAL_COST_MULTIPLIER,
     });
   } catch {
@@ -1482,6 +1917,7 @@ const diagnosticValueStyle: React.CSSProperties = {
 };
 
 function downloadDebug(snapshot: Snapshot) {
+  sampleRuntimeTrace('debug-download');
   const dump = (s: ScoredStation) => ({
     id: s.id,
     name: s.name,
@@ -1509,15 +1945,17 @@ function downloadDebug(snapshot: Snapshot) {
     .slice(0, TOP_N)
     .map(dump);
   const state = getModState();
+  const runtimeTrace = runtimeTraceSnapshot();
   const payload = {
     timestamp: new Date().toISOString(),
-    bundleVersion: 'panel-v14-storage-fallback',
+    bundleVersion: 'panel-v26-runtime-freeze-trace',
     counts: {
       stations: snapshot.stations,
       demandPoints: snapshot.demandPoints,
       pops: snapshot.pops,
       scoredLength: snapshot.scored.length,
       currentDay: snapshot.currentDay,
+      budget: safeBudget(),
       riskExcludedZeroRidership: snapshot.scored.length - riskCandidates.length,
     },
     calibration: snapshot.calibration,
@@ -1527,8 +1965,13 @@ function downloadDebug(snapshot: Snapshot) {
     topRisk,
     modState: state.stats(),
     deals: state.getDeals(),
+    moneyTrace: moneyTraceSnapshot(),
+    runtimeTrace,
+    runtimeProbe: probeRuntimeState(runtimeTrace),
     groupProbe: probeStationGroups(snapshot.scored),
     demandShapeProbe: probeDemandShape(),
+    demandIntegrity: probeDemandIntegrity(state),
+    splitTimingProbe: probeSplitTiming(state),
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -1603,6 +2046,611 @@ function probeDemandShape(): unknown {
         full: deepShape(jobsHeavy, 0),
       },
       samplePopsFromResidentsHeavy: samplePops.map((p) => deepShape(p, 0)),
+    };
+  } catch (err) {
+    return { __error: String(err) };
+  }
+}
+
+function probeRuntimeState(runtimeTrace: ReturnType<typeof runtimeTraceSnapshot>): unknown {
+  return {
+    currentDay: describe(() => gameState.getCurrentDay()),
+    currentHour: describe(() => gameState.getCurrentHour()),
+    elapsedSeconds: describe(() => gameState.getElapsedSeconds()),
+    gameSpeed: describe(() => gameState.getGameSpeed()),
+    paused: describe(() => gameState.isPaused()),
+    budget: describe(() => gameState.getBudget()),
+    ridershipStats: describe(() => gameState.getRidershipStats()),
+    modeChoiceStats: describe(() => gameState.getModeChoiceStats()),
+    completedCommutes: describe(() => summarizeCompletedCommutes(gameState.getCompletedCommutes())),
+    traceCount: runtimeTrace.length,
+    traceTail: runtimeTrace.slice(-20),
+  };
+}
+
+function summarizeCompletedCommutes(commutes: unknown[]): unknown {
+  const byOrigin: Record<string, number> = {};
+  let splitPopCount = 0;
+  const splitExamples: unknown[] = [];
+  for (const commute of commutes as any[]) {
+    const origin = typeof commute?.origin === 'string' ? commute.origin : 'unknown';
+    byOrigin[origin] = (byOrigin[origin] ?? 0) + 1;
+    const popId = typeof commute?.popId === 'string' ? commute.popId : '';
+    if (popId.startsWith(SPLIT_POP_PREFIX)) {
+      splitPopCount++;
+      if (splitExamples.length < 12) {
+        splitExamples.push({
+          popId,
+          size: commute.size,
+          origin: commute.origin,
+          journeyStart: commute.journeyStart,
+          journeyEnd: commute.journeyEnd,
+          stationRoutes: shape(commute.stationRoutes, 0),
+        });
+      }
+    }
+  }
+  return {
+    count: commutes.length,
+    splitPopCount,
+    byOrigin,
+    splitExamples,
+  };
+}
+
+function inferSplitOriginId(childId: string, childToOrigin: Map<string, string>): string | null {
+  const tracked = childToOrigin.get(childId);
+  if (tracked) return tracked;
+  if (!childId.startsWith(SPLIT_POP_PREFIX)) return null;
+  const rest = childId.slice(SPLIT_POP_PREFIX.length);
+  const firstColon = rest.indexOf(':');
+  return firstColon > 0 ? rest.slice(0, firstColon) : null;
+}
+
+function safeSecondOfDay(): number | null {
+  try {
+    const elapsed = gameState.getElapsedSeconds();
+    if (typeof elapsed === 'number' && Number.isFinite(elapsed)) {
+      return ((elapsed % 86_400) + 86_400) % 86_400;
+    }
+  } catch {
+    /* fall back to hour below */
+  }
+  try {
+    const hour = gameState.getCurrentHour();
+    if (typeof hour === 'number' && Number.isFinite(hour)) {
+      return Math.max(0, Math.min(23, Math.floor(hour))) * 3600;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function formatSecond(value: unknown): string | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  const sec = ((Math.floor(value) % 86_400) + 86_400) % 86_400;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s
+    .toString()
+    .padStart(2, '0')}`;
+}
+
+function hourBucket(value: unknown): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'bad';
+  const sec = ((value % 86_400) + 86_400) % 86_400;
+  return Math.floor(sec / 3600).toString().padStart(2, '0');
+}
+
+function secondsUntil(from: number, to: unknown): number | null {
+  if (typeof to !== 'number' || !Number.isFinite(to)) return null;
+  const target = ((to % 86_400) + 86_400) % 86_400;
+  return (target - from + 86_400) % 86_400;
+}
+
+function bumpCount(map: Record<string, number>, key: string, amount = 1): void {
+  map[key] = (map[key] ?? 0) + amount;
+}
+
+function bumpSized(
+  map: Record<string, { count: number; size: number }>,
+  key: string,
+  size: number
+): void {
+  const row = map[key] ?? { count: 0, size: 0 };
+  row.count++;
+  row.size += size;
+  map[key] = row;
+}
+
+function topCountMap(map: Record<string, number>, limit = 20): Array<{ key: string; count: number }> {
+  return Object.entries(map)
+    .map(([key, count]) => ({ key, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+}
+
+function readTransitPaths(pop: any): any[] {
+  const paths = pop?.lastCommute?.transitPaths;
+  return Array.isArray(paths) ? paths : [];
+}
+
+function routeIdsFor(paths: any[]): string[] {
+  const ids = new Set<string>();
+  for (const path of paths) {
+    if (typeof path?.routeId === 'string' && path.routeId.length > 0) ids.add(path.routeId);
+  }
+  return [...ids].slice(0, 8);
+}
+
+function pathSignature(paths: any[]): string {
+  if (paths.length === 0) return 'empty';
+  return paths
+    .slice(0, 5)
+    .map((p) => `${p?.routeId ?? '?'}:${p?.fromStopId ?? '?'}>${p?.toStopId ?? '?'}`)
+    .join('|');
+}
+
+function splitPopSummary(pop: any, demand: ReturnType<typeof gameState.getDemandData>, childToOrigin: Map<string, string>) {
+  const residence = demand.points.get(pop.residenceId);
+  const job = demand.points.get(pop.jobId);
+  const paths = readTransitPaths(pop);
+  const inResidence = residence ? endpointHasPopId(residence, pop.id) : false;
+  const inJob = job ? endpointHasPopId(job, pop.id) : false;
+  const role = inResidence && inJob ? 'both' : inResidence ? 'residence' : inJob ? 'job' : 'neither';
+  return {
+    id: pop.id,
+    originId: inferSplitOriginId(pop.id, childToOrigin),
+    role,
+    size: pop.size,
+    residenceId: pop.residenceId,
+    jobId: pop.jobId,
+    homeDepartureTime: pop.homeDepartureTime,
+    homeDepartureClock: formatSecond(pop.homeDepartureTime),
+    workDepartureTime: pop.workDepartureTime,
+    workDepartureClock: formatSecond(pop.workDepartureTime),
+    modeChoice: pop.lastCommute?.modeChoice,
+    modeTotal: modeChoiceTotal(pop.lastCommute?.modeChoice),
+    transitPathCount: paths.length,
+    routeIds: routeIdsFor(paths),
+    firstTransitPath: paths[0]
+      ? {
+          routeId: paths[0].routeId,
+          fromStopId: paths[0].fromStopId,
+          toStopId: paths[0].toStopId,
+          departureTime: paths[0].departureTime,
+          departureClock: formatSecond(paths[0].departureTime),
+          arrivalTime: paths[0].arrivalTime,
+          arrivalClock: formatSecond(paths[0].arrivalTime),
+          isWalking: paths[0].isWalking,
+          isDriving: paths[0].isDriving,
+        }
+      : null,
+  };
+}
+
+function probeSplitTiming(state: ReturnType<typeof getModState>): unknown {
+  try {
+    const demand = gameState.getDemandData();
+    const snap = state.isReady() ? state.mutator().snapshot() : null;
+    const childToOrigin = new Map<string, string>();
+    if (snap) {
+      for (const [originId, childIds] of snap.splitChildren) {
+        for (const childId of childIds) childToOrigin.set(childId, originId);
+      }
+    }
+
+    const now = safeSecondOfDay();
+    const homeDepartureHours: Record<string, { count: number; size: number }> = {};
+    const workDepartureHours: Record<string, { count: number; size: number }> = {};
+    const pathDepartureHours: Record<string, { count: number; size: number }> = {};
+    const pathArrivalHours: Record<string, { count: number; size: number }> = {};
+    const routeCounts: Record<string, number> = {};
+    const signatureCounts: Record<string, number> = {};
+    const originCounts: Record<string, number> = {};
+    const endpointCounts: Record<string, number> = {};
+    const pathAnomalies: Record<string, number> = {
+      emptyTransitPaths: 0,
+      transitModeWithoutPath: 0,
+      pathWithoutTransitMode: 0,
+      badPathTimes: 0,
+      backwardPathSegments: 0,
+      boundaryClampedTimes: 0,
+      missingRouteId: 0,
+      missingStopId: 0,
+    };
+    const splitSamples: unknown[] = [];
+    const anomalyExamples: unknown[] = [];
+    const upcoming: unknown[] = [];
+
+    let splitPops = 0;
+    let splitSize = 0;
+    let residenceSide = 0;
+    let jobSide = 0;
+    let bothSide = 0;
+    let neitherSide = 0;
+
+    for (const pop of demand.popsMap.values() as Iterable<any>) {
+      if (typeof pop?.id !== 'string' || !pop.id.startsWith(SPLIT_POP_PREFIX)) continue;
+      splitPops++;
+      const size = typeof pop.size === 'number' && Number.isFinite(pop.size) ? pop.size : 0;
+      splitSize += size;
+
+      const originId = inferSplitOriginId(pop.id, childToOrigin) ?? 'unknown';
+      bumpCount(originCounts, originId);
+      bumpSized(homeDepartureHours, hourBucket(pop.homeDepartureTime), size);
+      bumpSized(workDepartureHours, hourBucket(pop.workDepartureTime), size);
+
+      const residence = demand.points.get(pop.residenceId);
+      const job = demand.points.get(pop.jobId);
+      const inResidence = residence ? endpointHasPopId(residence, pop.id) : false;
+      const inJob = job ? endpointHasPopId(job, pop.id) : false;
+      const role = inResidence && inJob ? 'both' : inResidence ? 'residence' : inJob ? 'job' : 'neither';
+      bumpCount(endpointCounts, role);
+      if (role === 'both') bothSide++;
+      else if (role === 'residence') residenceSide++;
+      else if (role === 'job') jobSide++;
+      else neitherSide++;
+
+      const paths = readTransitPaths(pop);
+      const transitMode = numField(pop.lastCommute?.modeChoice, 'transit');
+      if (paths.length === 0) pathAnomalies.emptyTransitPaths++;
+      if (transitMode > 1 && paths.length === 0) pathAnomalies.transitModeWithoutPath++;
+      if (transitMode <= 1 && paths.length > 0) pathAnomalies.pathWithoutTransitMode++;
+
+      bumpCount(signatureCounts, pathSignature(paths));
+      for (const routeId of routeIdsFor(paths)) bumpCount(routeCounts, routeId);
+
+      let popHadPathAnomaly = false;
+      for (const path of paths) {
+        const dep = path?.departureTime;
+        const arr = path?.arrivalTime;
+        bumpSized(pathDepartureHours, hourBucket(dep), size);
+        bumpSized(pathArrivalHours, hourBucket(arr), size);
+        if (typeof path?.routeId !== 'string' || path.routeId.length === 0) {
+          pathAnomalies.missingRouteId++;
+          popHadPathAnomaly = true;
+        }
+        if (
+          typeof path?.fromStopId !== 'string' ||
+          typeof path?.toStopId !== 'string' ||
+          path.fromStopId.length === 0 ||
+          path.toStopId.length === 0
+        ) {
+          pathAnomalies.missingStopId++;
+          popHadPathAnomaly = true;
+        }
+        if (
+          typeof dep !== 'number' ||
+          !Number.isFinite(dep) ||
+          typeof arr !== 'number' ||
+          !Number.isFinite(arr)
+        ) {
+          pathAnomalies.badPathTimes++;
+          popHadPathAnomaly = true;
+          continue;
+        }
+        if (arr < dep) {
+          pathAnomalies.backwardPathSegments++;
+          popHadPathAnomaly = true;
+        }
+        if (dep <= 0 || dep >= 86_399 || arr <= 0 || arr >= 86_399) {
+          pathAnomalies.boundaryClampedTimes++;
+          popHadPathAnomaly = true;
+        }
+      }
+
+      if (splitSamples.length < 18) {
+        splitSamples.push(splitPopSummary(pop, demand, childToOrigin));
+      }
+      if (popHadPathAnomaly && anomalyExamples.length < 18) {
+        anomalyExamples.push(splitPopSummary(pop, demand, childToOrigin));
+      }
+
+      if (now != null) {
+        const homeUntil = secondsUntil(now, pop.homeDepartureTime);
+        const workUntil = secondsUntil(now, pop.workDepartureTime);
+        if (homeUntil != null) {
+          upcoming.push({
+            popId: pop.id,
+            originId,
+            kind: 'home',
+            secondsUntil: homeUntil,
+            at: pop.homeDepartureTime,
+            clock: formatSecond(pop.homeDepartureTime),
+            role,
+            routeIds: routeIdsFor(paths),
+            transitPathCount: paths.length,
+          });
+        }
+        if (workUntil != null) {
+          upcoming.push({
+            popId: pop.id,
+            originId,
+            kind: 'work',
+            secondsUntil: workUntil,
+            at: pop.workDepartureTime,
+            clock: formatSecond(pop.workDepartureTime),
+            role,
+            routeIds: routeIdsFor(paths),
+            transitPathCount: paths.length,
+          });
+        }
+      }
+    }
+
+    upcoming.sort((a: any, b: any) => a.secondsUntil - b.secondsUntil);
+
+    return {
+      currentTime: {
+        secondOfDay: now,
+        clock: now == null ? null : formatSecond(now),
+        currentDay: describe(() => gameState.getCurrentDay()),
+        currentHour: describe(() => gameState.getCurrentHour()),
+        elapsedSeconds: describe(() => gameState.getElapsedSeconds()),
+      },
+      counts: {
+        splitPops,
+        splitSize,
+        trackedSplitChildren: childToOrigin.size,
+        residenceSide,
+        jobSide,
+        bothSide,
+        neitherSide,
+      },
+      homeDepartureHours,
+      workDepartureHours,
+      pathDepartureHours,
+      pathArrivalHours,
+      pathAnomalies,
+      endpointCounts: topCountMap(endpointCounts),
+      topOriginCounts: topCountMap(originCounts),
+      topRouteIds: topCountMap(routeCounts),
+      topPathSignatures: topCountMap(signatureCounts, 12),
+      upcomingDepartures: upcoming.slice(0, 32),
+      splitSamples,
+      anomalyExamples,
+    };
+  } catch (err) {
+    return { __error: String(err) };
+  }
+}
+
+function numField(v: unknown, key: string): number {
+  const n = (v as Record<string, unknown> | null | undefined)?.[key];
+  return typeof n === 'number' && Number.isFinite(n) ? n : 0;
+}
+
+function modeChoiceTotal(value: unknown): number {
+  return (
+    numField(value, 'walking') +
+    numField(value, 'driving') +
+    numField(value, 'transit') +
+    numField(value, 'unknown')
+  );
+}
+
+function endpointHasPopId(point: unknown, popId: string): boolean {
+  const ids = (point as { popIds?: unknown })?.popIds;
+  return Array.isArray(ids) && ids.includes(popId);
+}
+
+function probeDemandIntegrity(state: ReturnType<typeof getModState>): unknown {
+  try {
+    const demand = gameState.getDemandData();
+    const points = Array.from(demand.points.values());
+    const pops = Array.from(demand.popsMap.values());
+    const snap = state.isReady() ? state.mutator().snapshot() : null;
+
+    const residenceSums = new Map<string, number>();
+    const jobSums = new Map<string, number>();
+    const residenceCounts = new Map<string, number>();
+    const jobCounts = new Map<string, number>();
+    const splitResidenceCounts = new Map<string, number>();
+    const splitJobCounts = new Map<string, number>();
+    const anomalies: Record<string, number> = {
+      splitPops: 0,
+      orphanSplitPops: 0,
+      trackedSplitChildren: 0,
+      missingTrackedChildren: 0,
+      missingResidencePoint: 0,
+      missingJobPoint: 0,
+      splitResidenceMemberships: 0,
+      splitJobMemberships: 0,
+      splitMissingAllMembership: 0,
+      splitMissingResidenceMembership: 0,
+      splitMissingJobMembership: 0,
+      nonFiniteSize: 0,
+      oversizedSplitPops: 0,
+      modeChoiceMismatch: 0,
+      nonFiniteDepartureTimes: 0,
+      pointDuplicatePopIds: 0,
+      pointMissingPopIds: 0,
+    };
+    const splitExamples: unknown[] = [];
+    const popAnomalyExamples: unknown[] = [];
+
+    const trackedSplitIds = new Set<string>();
+    if (snap) {
+      for (const ids of snap.splitChildren.values()) {
+        for (const id of ids) trackedSplitIds.add(id);
+      }
+    }
+    anomalies.trackedSplitChildren = trackedSplitIds.size;
+    for (const id of trackedSplitIds) {
+      if (!demand.popsMap.has(id)) anomalies.missingTrackedChildren++;
+    }
+
+    for (const pop of pops as any[]) {
+      const isSplit = typeof pop.id === 'string' && pop.id.startsWith(SPLIT_POP_PREFIX);
+      if (isSplit) anomalies.splitPops++;
+      if (isSplit && !trackedSplitIds.has(pop.id)) anomalies.orphanSplitPops++;
+      if (typeof pop.size !== 'number' || !Number.isFinite(pop.size)) {
+        anomalies.nonFiniteSize++;
+      }
+      if (isSplit && pop.size > 200) anomalies.oversizedSplitPops++;
+
+      const residence = demand.points.get(pop.residenceId);
+      const job = demand.points.get(pop.jobId);
+      if (!residence) anomalies.missingResidencePoint++;
+      if (!job) anomalies.missingJobPoint++;
+      const inResidence = residence ? endpointHasPopId(residence, pop.id) : false;
+      const inJob = job ? endpointHasPopId(job, pop.id) : false;
+
+      if (inResidence) {
+        residenceSums.set(pop.residenceId, (residenceSums.get(pop.residenceId) ?? 0) + pop.size);
+        residenceCounts.set(pop.residenceId, (residenceCounts.get(pop.residenceId) ?? 0) + 1);
+      }
+      if (inJob) {
+        jobSums.set(pop.jobId, (jobSums.get(pop.jobId) ?? 0) + pop.size);
+        jobCounts.set(pop.jobId, (jobCounts.get(pop.jobId) ?? 0) + 1);
+      }
+      if (isSplit) {
+        if (inResidence) {
+          splitResidenceCounts.set(pop.residenceId, (splitResidenceCounts.get(pop.residenceId) ?? 0) + 1);
+          anomalies.splitResidenceMemberships++;
+        }
+        if (inJob) {
+          splitJobCounts.set(pop.jobId, (splitJobCounts.get(pop.jobId) ?? 0) + 1);
+          anomalies.splitJobMemberships++;
+        }
+        if (!inResidence && !inJob) anomalies.splitMissingAllMembership++;
+      }
+
+      const modeTotal = modeChoiceTotal(pop.lastCommute?.modeChoice);
+      if (Math.abs(modeTotal - pop.size) > 1) {
+        anomalies.modeChoiceMismatch++;
+        if (popAnomalyExamples.length < 12) {
+          popAnomalyExamples.push({
+            id: pop.id,
+            size: pop.size,
+            modeTotal,
+            residenceId: pop.residenceId,
+            jobId: pop.jobId,
+            isSplit,
+          });
+        }
+      }
+      if (
+        typeof pop.homeDepartureTime !== 'number' ||
+        !Number.isFinite(pop.homeDepartureTime) ||
+        typeof pop.workDepartureTime !== 'number' ||
+        !Number.isFinite(pop.workDepartureTime)
+      ) {
+        anomalies.nonFiniteDepartureTimes++;
+      }
+      if (isSplit && splitExamples.length < 16) {
+        splitExamples.push({
+          id: pop.id,
+          size: pop.size,
+          residenceId: pop.residenceId,
+          jobId: pop.jobId,
+          inResidencePopIds: residence ? endpointHasPopId(residence, pop.id) : false,
+          inJobPopIds: job ? endpointHasPopId(job, pop.id) : false,
+          homeDepartureTime: pop.homeDepartureTime,
+          workDepartureTime: pop.workDepartureTime,
+          modeTotal,
+        });
+      }
+    }
+
+    const residentMismatches: unknown[] = [];
+    const jobMismatches: unknown[] = [];
+    const modeShareMismatches: unknown[] = [];
+    for (const point of points as any[]) {
+      const popIds = Array.isArray(point.popIds) ? point.popIds : [];
+      const unique = new Set(popIds);
+      if (unique.size !== popIds.length) anomalies.pointDuplicatePopIds++;
+      for (const id of popIds) {
+        if (!demand.popsMap.has(id)) anomalies.pointMissingPopIds++;
+      }
+
+      const residentPopSize = residenceSums.get(point.id) ?? 0;
+      const jobPopSize = jobSums.get(point.id) ?? 0;
+      const residentDiff = point.residents - residentPopSize;
+      const jobDiff = point.jobs - jobPopSize;
+      if (Math.abs(residentDiff) > 1) {
+        residentMismatches.push({
+          id: point.id,
+          residents: point.residents,
+          residentPopSize,
+          diff: residentDiff,
+          residencePopCount: residenceCounts.get(point.id) ?? 0,
+          splitResidenceCount: splitResidenceCounts.get(point.id) ?? 0,
+        });
+      }
+      if (Math.abs(jobDiff) > 1) {
+        jobMismatches.push({
+          id: point.id,
+          jobs: point.jobs,
+          jobPopSize,
+          diff: jobDiff,
+          jobPopCount: jobCounts.get(point.id) ?? 0,
+          splitJobCount: splitJobCounts.get(point.id) ?? 0,
+        });
+      }
+      const residentModeTotal = modeChoiceTotal(point.residentModeShare);
+      const workerModeTotal = modeChoiceTotal(point.workerModeShare);
+      if (
+        Math.abs(residentModeTotal - point.residents) > 1 ||
+        Math.abs(workerModeTotal - point.jobs) > 1
+      ) {
+        modeShareMismatches.push({
+          id: point.id,
+          residents: point.residents,
+          residentModeTotal,
+          jobs: point.jobs,
+          workerModeTotal,
+        });
+      }
+    }
+
+    const byAbsDiff = (a: any, b: any) => Math.abs(b.diff) - Math.abs(a.diff);
+    residentMismatches.sort(byAbsDiff);
+    jobMismatches.sort(byAbsDiff);
+
+    const trackedPointAudits: unknown[] = [];
+    if (snap) {
+      for (const [pointId, delta] of snap.cumulativeDeltas) {
+        const point = demand.points.get(pointId) as any;
+        const baseline = snap.baselineDemand.get(pointId);
+        if (!point || !baseline) continue;
+        const cumulativeResidents =
+          delta.residents.fromDeals + delta.residents.fromOrganic;
+        const cumulativeJobs = delta.jobs.fromDeals + delta.jobs.fromOrganic;
+        trackedPointAudits.push({
+          id: pointId,
+          live: { residents: point.residents, jobs: point.jobs },
+          baseline,
+          cumulative: { residents: cumulativeResidents, jobs: cumulativeJobs },
+          expectedLive: {
+            residents: baseline.residents + cumulativeResidents,
+            jobs: baseline.jobs + cumulativeJobs,
+          },
+          residencePopSize: residenceSums.get(pointId) ?? 0,
+          jobPopSize: jobSums.get(pointId) ?? 0,
+          residencePopCount: residenceCounts.get(pointId) ?? 0,
+          jobPopCount: jobCounts.get(pointId) ?? 0,
+          splitResidenceCount: splitResidenceCounts.get(pointId) ?? 0,
+          splitJobCount: splitJobCounts.get(pointId) ?? 0,
+        });
+      }
+    }
+
+    return {
+      counts: {
+        points: points.length,
+        pops: pops.length,
+      },
+      anomalies,
+      topResidentAggregateMismatches: residentMismatches.slice(0, 20),
+      topJobAggregateMismatches: jobMismatches.slice(0, 20),
+      modeShareMismatches: modeShareMismatches.slice(0, 20),
+      splitExamples,
+      popAnomalyExamples,
+      trackedPointAudits: trackedPointAudits.slice(0, 40),
     };
   } catch (err) {
     return { __error: String(err) };
