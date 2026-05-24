@@ -55,11 +55,13 @@ if the game refreshes demand behind the scenes.
 Persistence tries the official `api.storage` backend first and verifies
 every write with an immediate readback. If the game runtime no-ops that
 API, the mod falls back to Electron settings storage, then localStorage,
-and reports the backend in Diagnostics. New deals are disabled only if no
-backend can round-trip, so a development can't charge the player unless
-it can also survive save/load. Save names are read before first init,
-Save As copies state into the new slot, and dirty state flushes on game
-end.
+and reports the backend in Diagnostics. Deals are accepted into in-memory
+state immediately after charging, then flushed by game save/end hooks so
+normal build and day-tick paths do not synchronously stringify storage.
+If a later write cannot round-trip, Diagnostics reports it and the panel
+blocks additional builds until storage recovers. Save names are read
+before first init, Save As copies state into the new slot, and dirty
+state flushes on game end.
 
 The build flow guards against duplicate clicks, validates the live
 budget immediately before charging, and records a money trace in Debug
@@ -69,11 +71,14 @@ save already contains a zero-progress active deal with a negative budget,
 load recovery cancels/refunds that stuck deal. The trace is kept in a
 bounded in-memory buffer and is not logged on every money event.
 
-Debug DL also keeps a rolling runtime trace for freeze diagnosis: current
-game time, speed, budget, ridership/mode-choice stats, completed commute
-counts, day-tick phase, and TOD split-pop counts. The export includes
-split-pop timing histograms and transit-path sanity checks so freezes can
-be correlated with the synthetic commute batch that was about to run.
+When the Diagnostics "Freeze trace" toggle is enabled, Debug DL keeps a
+rolling runtime trace for freeze diagnosis: current game time, speed,
+budget, ridership/mode-choice stats, bounded completed-commute samples,
+day-tick phase, and TOD split-pop counts. With Freeze trace off, normal
+play does not run the sampler; Debug DL still takes one on-demand full
+sample when clicked. The export includes split-pop timing histograms and
+transit-path sanity checks so freezes can be correlated with the
+synthetic commute batch that was about to run.
 
 When deals add population, the mutator updates both DemandPoint
 aggregates and Pops. New demand materializes as separate split child

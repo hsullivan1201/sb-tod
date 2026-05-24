@@ -2289,7 +2289,7 @@ function downloadDebug(snapshot: Snapshot) {
   const flightRecorder = flightRecorderSnapshot();
   const payload = {
     timestamp: new Date().toISOString(),
-    bundleVersion: 'panel-v43-save-slot-self-heal',
+    bundleVersion: 'panel-v45-save-sync-loop-guard',
     counts: {
       stations: snapshot.stations,
       demandPoints: snapshot.demandPoints,

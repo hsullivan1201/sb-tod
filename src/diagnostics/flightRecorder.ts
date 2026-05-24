@@ -185,14 +185,12 @@ export function clearFlightRecorder(): void {
   state.entries = [];
 }
 
-export function recordFlightEvent(
+function appendFlightEvent(
+  state: FlightRecorderState,
   type: string,
   detail?: unknown,
   options: RecordFlightEventOptions = {}
 ): void {
-  const state = getState();
-  if (!state.enabled) return;
-
   const entry: FlightRecorderEntry = {
     seq: state.nextSeq++,
     at: Date.now(),
@@ -205,6 +203,26 @@ export function recordFlightEvent(
   if (state.entries.length > FLIGHT_RECORDER_LIMIT) {
     state.entries.splice(0, state.entries.length - FLIGHT_RECORDER_LIMIT);
   }
+}
+
+export function recordFlightEvent(
+  type: string,
+  detail?: unknown,
+  options: RecordFlightEventOptions = {}
+): void {
+  const state = getState();
+  if (!state.enabled) return;
+  appendFlightEvent(state, type, detail, options);
+}
+
+export function recordFlightEventLazy(
+  type: string,
+  detail: () => unknown,
+  options: RecordFlightEventOptions = {}
+): void {
+  const state = getState();
+  if (!state.enabled) return;
+  appendFlightEvent(state, type, detail(), options);
 }
 
 export function flightRecorderSnapshot(): FlightRecorderSnapshot {

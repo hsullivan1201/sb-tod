@@ -48,7 +48,7 @@
  */
 
 import type { DemandData, DemandPoint, Pop, PointDelta } from '../types';
-import { recordFlightEvent } from '../diagnostics/flightRecorder';
+import { recordFlightEventLazy } from '../diagnostics/flightRecorder';
 
 export type DeltaSourceKind = 'deals' | 'organic';
 
@@ -622,22 +622,23 @@ export function createMutator(
       });
     }
     if (dropped > 0) {
-      recordFlightEvent(
+      recordFlightEventLazy(
         'mutate.transit-paths.filtered',
-        context
-          ? {
-              ...context,
-              sourcePaths: paths.length,
-              clonedPaths: cloned.length,
-              dropped,
-              offsetSeconds,
-            }
-          : {
-              sourcePaths: paths.length,
-              clonedPaths: cloned.length,
-              dropped,
-              offsetSeconds,
-            },
+        () =>
+          context
+            ? {
+                ...context,
+                sourcePaths: paths.length,
+                clonedPaths: cloned.length,
+                dropped,
+                offsetSeconds,
+              }
+            : {
+                sourcePaths: paths.length,
+                clonedPaths: cloned.length,
+                dropped,
+                offsetSeconds,
+              },
         { includeGame: false }
       );
     }
@@ -679,13 +680,13 @@ export function createMutator(
     });
     const hadTransit = (originalCommute?.modeChoice?.transit ?? 0) > 0;
     if (hadTransit && transitPaths.length === 0) {
-      recordFlightEvent(
+      recordFlightEventLazy(
         'mutate.transit-mode-fallback',
-        {
+        () => ({
           originalPopId: originalPop.id,
           childId,
           targetSize: safeSize,
-        },
+        }),
         { includeGame: false }
       );
     }
@@ -879,16 +880,20 @@ export function createMutator(
     delta: DemandDelta,
     source: DeltaSourceKind
   ): ApplyResult {
-    recordFlightEvent('mutate.apply-density-delta.start', { pointId, delta, source }, { includeGame: false });
+    recordFlightEventLazy(
+      'mutate.apply-density-delta.start',
+      () => ({ pointId, delta, source }),
+      { includeGame: false }
+    );
     const result = applyDensityDeltaInternal(pointId, delta, source, buildOriginalPopIndex());
-    recordFlightEvent(
+    recordFlightEventLazy(
       'mutate.apply-density-delta.end',
-      {
+      () => ({
         pointId,
         source,
         ok: result.ok,
         reason: result.ok ? null : result.reason,
-      },
+      }),
       { includeGame: false }
     );
     return result;
@@ -898,18 +903,18 @@ export function createMutator(
     targets: Array<{ pointId: string; delta: DemandDelta }>,
     source: DeltaSourceKind
   ): ApplyResult[] {
-    recordFlightEvent(
+    recordFlightEventLazy(
       'mutate.apply-density-deltas.start',
-      { targets: targets.length, source },
+      () => ({ targets: targets.length, source }),
       { includeGame: false }
     );
     const index = buildOriginalPopIndex();
     const results = targets.map((target) =>
       applyDensityDeltaInternal(target.pointId, target.delta, source, index)
     );
-    recordFlightEvent(
+    recordFlightEventLazy(
       'mutate.apply-density-deltas.end',
-      { targets: targets.length, results: results.length, source },
+      () => ({ targets: targets.length, results: results.length, source }),
       { includeGame: false }
     );
     return results;

@@ -14,7 +14,6 @@ import { getModState } from '../state/mod-state';
 import type { DemandData } from '../types';
 import { isFlightRecorderEnabled } from './flightRecorder';
 
-const RUNTIME_TRACE_INTERVAL_MS = 2500;
 const RUNTIME_TRACE_LIMIT = 240;
 const RUNTIME_TRACE_DEMAND_SCAN_LIMIT = 2000;
 const RUNTIME_TRACE_COMMUTE_SCAN_LIMIT = 1000;
@@ -24,15 +23,6 @@ export interface RuntimeTraceSampleOptions {
   includeCompletedCommutes?: boolean;
   /** Expensive: scans complete demand/commute collections instead of bounded samples. */
   fullScan?: boolean;
-}
-
-export interface RuntimeTraceSamplerOptions {
-  /**
-   * Off by default. The sampler used to run every 2.5s in normal play,
-   * which made the freeze diagnostic path a potential freeze source.
-   */
-  interval?: boolean;
-  intervalMs?: number;
 }
 
 export interface RuntimeTraceEntry {
@@ -83,10 +73,8 @@ export interface RuntimeTraceEntry {
 interface RuntimeTraceState {
   entries: RuntimeTraceEntry[];
   hookRegistered: boolean;
-  intervalId: number | null;
   demandEventsSinceLastSample: number;
   lastDemandEventAt: number | null;
-  lastSampleAt: number | null;
 }
 
 function getRuntimeTraceState(): RuntimeTraceState {
@@ -97,10 +85,8 @@ function getRuntimeTraceState(): RuntimeTraceState {
     root.__sbTodRuntimeTrace = {
       entries: [],
       hookRegistered: false,
-      intervalId: null,
       demandEventsSinceLastSample: 0,
       lastDemandEventAt: null,
-      lastSampleAt: null,
     };
   }
   return root.__sbTodRuntimeTrace;
@@ -241,13 +227,12 @@ export function sampleRuntimeTrace(
     state.entries.splice(0, state.entries.length - RUNTIME_TRACE_LIMIT);
   }
   state.demandEventsSinceLastSample = 0;
-  state.lastSampleAt = entry.at;
   return entry;
 }
 
-export function ensureRuntimeTraceSampler(options: RuntimeTraceSamplerOptions = {}): void {
-  const state = getRuntimeTraceState();
+export function ensureRuntimeTraceSampler(): void {
   if (!isFlightRecorderEnabled()) return;
+  const state = getRuntimeTraceState();
   if (!state.hookRegistered) {
     state.hookRegistered = true;
 
@@ -271,12 +256,6 @@ export function ensureRuntimeTraceSampler(options: RuntimeTraceSamplerOptions = 
     }
 
     sampleRuntimeTrace('start');
-  }
-
-  if (options.interval && typeof window !== 'undefined' && state.intervalId == null) {
-    state.intervalId = window.setInterval(() => {
-      sampleRuntimeTrace('interval');
-    }, options.intervalMs ?? RUNTIME_TRACE_INTERVAL_MS);
   }
 }
 

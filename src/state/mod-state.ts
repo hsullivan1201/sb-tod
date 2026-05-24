@@ -47,7 +47,11 @@ import {
   type AdaptiveStorage,
   type StorageBackendKind,
 } from './storage-adapter';
-import { recordFlightEvent } from '../diagnostics/flightRecorder';
+import {
+  isFlightRecorderEnabled,
+  recordFlightEvent,
+  recordFlightEventLazy,
+} from '../diagnostics/flightRecorder';
 
 const STORAGE_KEY_PREFIX = 'sb-tod:state:v1:';
 const LEGACY_UNSEGMENTED_KEY = 'sb-tod:state:v1'; // pre-per-save key, cleaned up on init
@@ -109,7 +113,7 @@ export interface ModStateStats {
   /** Last day's deal application reports — most recent first. */
   lastTickReports: DealTickReport[];
   /** Current day-tick phase, for diagnosing freezes around day changes. */
-  dayTickPhase: 'idle' | 'init' | 'refresh-demand' | 'apply-deals' | 'persist';
+  dayTickPhase: 'idle' | 'init' | 'refresh-demand' | 'apply-deals';
   lastTickStartedAt: number | null;
   lastTickCompletedAt: number | null;
   lastTickActiveDealId: string | null;
@@ -315,8 +319,6 @@ export interface CreateModStateOptions {
   getBudget?: () => number;
   /** Override budget refund action for tests. Defaults to actions.addMoney. */
   addMoney?: (amount: number, category?: string) => void;
-  /** Persist every N day ticks. Default 1 (every day). */
-  persistEveryNDays?: number;
   /** Initial save name. Default null (uses the `_unsaved` slot). */
   initialSaveName?: string | null;
   /** Current save-name accessor. Defaults to gameState.getSaveName(). */
@@ -336,7 +338,6 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   const getSaveName = options.getSaveName ?? (() => gameState.getSaveName());
   const getBudget = options.getBudget ?? (() => gameState.getBudget());
   const addMoney = options.addMoney ?? ((amount: number, category?: string) => actionsApi.addMoney(amount, category));
-  const persistEveryNDays = options.persistEveryNDays ?? 1;
   // Strict 200-sized pops by default: matches the game's natural Pop
   // granularity (every game-authored Pop has size 200). Keeps split
   // children indistinguishable from natural pops to the rest of the
@@ -367,6 +368,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let lastTickError: string | null = null;
   let slotBootstrap: { storageKey: string; payload: PersistedState; reason: string } | null = null;
   let saveNameSyncPromise: Promise<void> | null = null;
+  let saveNameSwitchDepth = 0;
 
   function isZeroDensity(total: { jobs?: number; residents?: number } | undefined): boolean {
     return (total?.jobs ?? 0) === 0 && (total?.residents ?? 0) === 0;
@@ -720,6 +722,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   }
 
   async function syncLiveSaveName(reason: string): Promise<boolean> {
+    if (saveNameSwitchDepth > 0) return false;
     const liveName = liveSaveNameNeedingSync();
     if (liveName == null) return false;
     if (!saveNameSyncPromise) {
@@ -748,6 +751,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   }
 
   function syncLiveSaveNameSoon(reason: string): boolean {
+    if (saveNameSwitchDepth > 0) return true;
     if (saveNameSyncPromise) return true;
     const liveName = liveSaveNameNeedingSync();
     if (liveName == null) return false;
@@ -792,7 +796,9 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       localStorageHasOurKey: initProbe.localStorageHasOurKey,
       otherSaveKeys: initProbe.otherSaveKeys.length,
     });
-    console.log('[sb-tod] init probe:', initProbe);
+    if (isFlightRecorderEnabled()) {
+      console.log('[sb-tod] init probe:', initProbe);
+    }
 
     let persisted: PersistedState | null = null;
     let storageKeys: string[] = [];
@@ -867,9 +873,11 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         originalPopsReset: lastHydrate.originalPopsReset,
         deals: deals.length,
       });
-      console.log(
-        `[sb-tod] Hydrated "${storageKey}" (saved ${new Date(persisted.savedAt).toISOString()}): preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}, deals=${deals.length}. Storage keys: [${storageKeys.join(', ')}]`
-      );
+      if (isFlightRecorderEnabled()) {
+        console.log(
+          `[sb-tod] Hydrated "${storageKey}" (saved ${new Date(persisted.savedAt).toISOString()}): preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}, deals=${deals.length}. Storage keys: [${storageKeys.join(', ')}]`
+        );
+      }
     } else {
       // Fresh game (or first run, or persisted state was dropped). Capture
       // baselines from live demand. Record the reason so the panel can
@@ -893,9 +901,11 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         baselinePopSizes: counts.baselinePopSizes,
         storageKeys: storageKeys.length,
       });
-      console.log(
-        `[sb-tod] No persisted state found at "${storageKey}". Captured ${counts.baselineDemand} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install or different save slot).`
-      );
+      if (isFlightRecorderEnabled()) {
+        console.log(
+          `[sb-tod] No persisted state found at "${storageKey}". Captured ${counts.baselineDemand} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install or different save slot).`
+        );
+      }
     }
 
     // One-shot cleanup: the pre-namespacing key sb-tod:state:v1 (no slot
@@ -976,62 +986,66 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     };
   }
 
-  function refreshDemandBinding(): boolean {
-    if (syncLiveSaveNameSoon('refresh-demand')) {
-      recordFlightEvent('mod-state.refresh-demand.defer-live-save-sync', {
+  function refreshDemandBinding(options: { allowLiveSaveSync?: boolean } = {}): boolean {
+    if (options.allowLiveSaveSync !== false && syncLiveSaveNameSoon('refresh-demand')) {
+      recordFlightEventLazy('mod-state.refresh-demand.defer-live-save-sync', () => ({
         currentSaveName,
         liveName: readLiveSaveName(),
-      });
+      }));
       return false;
     }
     if (!initialized || !mutator) return demand !== null;
-    recordFlightEvent('mod-state.refresh-demand.start', {
+    recordFlightEventLazy('mod-state.refresh-demand.start', () => ({
       hasDemand: demand !== null,
-    });
+    }));
     const live = getDemand();
     if (!live || !live.points || !live.popsMap) {
-      recordFlightEvent('mod-state.refresh-demand.no-live-demand', { hasLive: !!live });
+      recordFlightEventLazy('mod-state.refresh-demand.no-live-demand', () => ({ hasLive: !!live }));
       return false;
     }
     if (live === demand) {
-      recordFlightEvent('mod-state.refresh-demand.same-object', {
+      recordFlightEventLazy('mod-state.refresh-demand.same-object', () => ({
         points: live.points.size,
         pops: live.popsMap.size,
-      });
+      }));
       return true;
     }
 
     const persisted = buildPersistedPayload(Date.now());
-    recordFlightEvent('mod-state.refresh-demand.rebind.start', {
+    recordFlightEventLazy('mod-state.refresh-demand.rebind.start', () => ({
       points: live.points.size,
       pops: live.popsMap.size,
       hadPersistedPayload: !!persisted,
-    });
+    }));
     demand = live;
     mutator = createMutator(live, mutatorOptions);
+    const reboundMutator = mutator;
     if (persisted) {
-      lastHydrate = applyPersisted(mutator, live, persisted, {
+      const hydrate = applyPersisted(reboundMutator, live, persisted, {
         canonicalizeSplits: false,
       });
-      console.log(
-        `[sb-tod] Rebound mutator to refreshed DemandData: preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}`
-      );
-      recordFlightEvent('mod-state.refresh-demand.rebind.end', {
-        preserved: lastHydrate.preserved,
-        replayed: lastHydrate.replayed,
-        baselineShift: lastHydrate.baselineShift,
-        missingPoint: lastHydrate.missingPoint,
-      });
+      lastHydrate = hydrate;
+      if (isFlightRecorderEnabled()) {
+        console.log(
+          `[sb-tod] Rebound mutator to refreshed DemandData: preserved=${hydrate.preserved}, replayed=${hydrate.replayed}, baselineShift=${hydrate.baselineShift}, missingPoint=${hydrate.missingPoint}`
+        );
+      }
+      recordFlightEventLazy('mod-state.refresh-demand.rebind.end', () => ({
+        preserved: hydrate.preserved,
+        replayed: hydrate.replayed,
+        baselineShift: hydrate.baselineShift,
+        missingPoint: hydrate.missingPoint,
+      }));
     } else {
-      mutator.captureBaselines();
-      recordFlightEvent('mod-state.refresh-demand.rebind.fresh-baseline', {
-        tracked: mutator.trackingCounts(),
-      });
+      reboundMutator.captureBaselines();
+      recordFlightEventLazy('mod-state.refresh-demand.rebind.fresh-baseline', () => ({
+        tracked: reboundMutator.trackingCounts(),
+      }));
     }
     return true;
   }
 
-  async function persist(): Promise<boolean> {
+  async function persist(options: { allowLiveSaveSync?: boolean } = {}): Promise<boolean> {
     recordFlightEvent('mod-state.persist.start', {
       saveName: currentSaveName,
       dirty,
@@ -1044,7 +1058,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     }
     let bound = false;
     try {
-      bound = refreshDemandBinding();
+      bound = refreshDemandBinding({ allowLiveSaveSync: options.allowLiveSaveSync });
     } catch (err) {
       console.warn('[sb-tod] refreshDemandBinding failed during persist:', err);
       lastPersistOk = false;
@@ -1139,11 +1153,11 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
 
   function onDayTick(day: number): void {
     if (liveSaveNameNeedingSync() != null) {
-      recordFlightEvent('mod-state.day-tick.defer-live-save-sync', {
+      recordFlightEventLazy('mod-state.day-tick.defer-live-save-sync', () => ({
         day,
         currentSaveName,
         liveName: readLiveSaveName(),
-      });
+      }));
       void syncLiveSaveName('day-tick')
         .then(() => onDayTick(day))
         .catch((e) => console.warn('[sb-tod] live save-name sync on day tick failed:', e));
@@ -1154,18 +1168,18 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     lastTickStartedAt = Date.now();
     lastTickCompletedAt = null;
     lastTickError = null;
-    recordFlightEvent('mod-state.day-tick.enter', {
+    recordFlightEventLazy('mod-state.day-tick.enter', () => ({
       day,
       dayTicks,
       initialized,
       activeDeals: deals.filter((deal) => deal.state === 'active').length,
       dirty,
-    });
+    }));
     if (!initialized) {
       // Try to init opportunistically — demand is almost certainly available
       // by the first day tick.
       dayTickPhase = 'init';
-      recordFlightEvent('mod-state.day-tick.init.start', { day });
+      recordFlightEventLazy('mod-state.day-tick.init.start', () => ({ day }));
       ensureInit().catch((e) => console.warn('[sb-tod] ensureInit on day tick failed:', e));
       return;
     }
@@ -1173,20 +1187,20 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     try {
       dayTickPhase = 'refresh-demand';
       if (!refreshDemandBinding()) {
-        recordFlightEvent('mod-state.day-tick.refresh-demand.failed', { day });
+        recordFlightEventLazy('mod-state.day-tick.refresh-demand.failed', () => ({ day }));
         return;
       }
 
       // Apply each active deal's daily delta. Done before the persist below
       // so the saved state reflects today's progress.
       dayTickPhase = 'apply-deals';
-      recordFlightEvent('mod-state.day-tick.apply-deals.start', { day });
+      recordFlightEventLazy('mod-state.day-tick.apply-deals.start', () => ({ day }));
       lastTickReports = applyActiveDealsForDay(day);
-      recordFlightEvent('mod-state.day-tick.apply-deals.end', {
+      recordFlightEventLazy('mod-state.day-tick.apply-deals.end', () => ({
         day,
         reports: lastTickReports,
         dirty,
-      });
+      }));
 
       // Storage writes are intentionally save-hook driven. Persisting
       // automatically from the sim/day/build paths has repeatedly lined
@@ -1194,12 +1208,12 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     } catch (err) {
       lastTickError = err instanceof Error ? err.message : String(err);
       console.warn('[sb-tod] day tick failed:', err);
-      recordFlightEvent('mod-state.day-tick.throw', {
+      recordFlightEventLazy('mod-state.day-tick.throw', () => ({
         day,
         phase: dayTickPhase,
         activeDealId: lastTickActiveDealId,
         error: String(err),
-      });
+      }));
       try {
         uiApi.showNotification(`TOD day tick failed: ${lastTickError}`, 'error');
       } catch {
@@ -1209,31 +1223,33 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       lastTickActiveDealId = null;
       lastTickCompletedAt = Date.now();
       dayTickPhase = 'idle';
-      recordFlightEvent('mod-state.day-tick.exit', {
+      recordFlightEventLazy('mod-state.day-tick.exit', () => ({
         day,
         durationMs:
           lastTickStartedAt != null && lastTickCompletedAt != null
             ? lastTickCompletedAt - lastTickStartedAt
             : null,
         error: lastTickError,
-      });
+      }));
     }
   }
 
   function applyActiveDealsForDay(day: number): DealTickReport[] {
     if (!mutator || !demand) return [];
+    const currentMutator = mutator;
+    const currentDemand = demand;
     const reports: DealTickReport[] = [];
     const suppressedDuplicates = suppressDuplicateActiveDeals();
     const activeDeals = deals.filter((deal) => deal.state === 'active');
-    recordFlightEvent('mod-state.deals.apply-all.start', {
+    recordFlightEventLazy('mod-state.deals.apply-all.start', () => ({
       day,
       activeDeals: activeDeals.length,
       suppressedDuplicates,
-      points: demand.points.size,
-      pops: demand.popsMap.size,
-    });
+      points: currentDemand.points.size,
+      pops: currentDemand.popsMap.size,
+    }));
     const walkshedIndex =
-      activeDeals.length > 0 ? createWalkshedIndex(demand.points.values()) : null;
+      activeDeals.length > 0 ? createWalkshedIndex(currentDemand.points.values()) : null;
     for (const deal of activeDeals) {
       lastTickActiveDealId = deal.id;
       // Don't tick on a day before the deal started (defensive against
@@ -1242,10 +1258,10 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       const plan = computeDailyApply({
         deal,
         currentDay: day,
-        walkshedPoints: demand.points.values(),
+        walkshedPoints: currentDemand.points.values(),
         walkshedIndex: walkshedIndex ?? undefined,
       });
-      recordFlightEvent('mod-state.deal.plan', {
+      recordFlightEventLazy('mod-state.deal.plan', () => ({
         day,
         dealId: deal.id,
         kind: deal.kind,
@@ -1253,22 +1269,23 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         targets: plan.targets.length,
         marksCompletion: plan.marksCompletion,
         newPending: plan.newPending,
-      });
+      }));
       let applied = { jobs: 0, residents: 0 };
       let pointsAffected = 0;
       let rejections = 0;
-      recordFlightEvent('mod-state.deal.mutate.start', {
+      recordFlightEventLazy('mod-state.deal.mutate.start', () => ({
         day,
         dealId: deal.id,
         targets: plan.targets.length,
-      });
-      const results = plan.targets.length > 0 ? mutator.applyDensityDeltas(plan.targets, 'deals') : [];
-      recordFlightEvent('mod-state.deal.mutate.end', {
+      }));
+      const results =
+        plan.targets.length > 0 ? currentMutator.applyDensityDeltas(plan.targets, 'deals') : [];
+      recordFlightEventLazy('mod-state.deal.mutate.end', () => ({
         day,
         dealId: deal.id,
         targets: plan.targets.length,
         results: results.length,
-      });
+      }));
       for (let i = 0; i < plan.targets.length; i++) {
         const target = plan.targets[i];
         const r = results[i];
@@ -1287,22 +1304,24 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
           );
         }
       }
-      recordFlightEvent('mod-state.deal.results-processed', {
+      recordFlightEventLazy('mod-state.deal.results-processed', () => ({
         day,
         dealId: deal.id,
         applied,
         pointsAffected,
         rejections,
-      });
+      }));
       deal.appliedSoFar.residents += applied.residents;
       deal.appliedSoFar.jobs += applied.jobs;
       deal.pending = plan.newPending;
       if (plan.marksCompletion) {
         deal.state = 'completed';
         dirty = true;
-        console.log(
-          `[sb-tod] deal ${deal.id} (${deal.kind}/${deal.tier}) completed on day ${day}: delivered ${deal.appliedSoFar.residents.toFixed(0)}r / ${deal.appliedSoFar.jobs.toFixed(0)}j of ${deal.totalDensity.residents}r / ${deal.totalDensity.jobs}j planned.`
-        );
+        if (isFlightRecorderEnabled()) {
+          console.log(
+            `[sb-tod] deal ${deal.id} (${deal.kind}/${deal.tier}) completed on day ${day}: delivered ${deal.appliedSoFar.residents.toFixed(0)}r / ${deal.appliedSoFar.jobs.toFixed(0)}j of ${deal.totalDensity.residents}r / ${deal.totalDensity.jobs}j planned.`
+          );
+        }
         try {
           const summary = formatDeliverySummary(deal);
           uiApi.showNotification(
@@ -1322,11 +1341,11 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         marksCompletion: plan.marksCompletion,
       });
     }
-    recordFlightEvent('mod-state.deals.apply-all.end', {
+    recordFlightEventLazy('mod-state.deals.apply-all.end', () => ({
       day,
       reports,
       dirty,
-    });
+    }));
     return reports;
   }
 
@@ -1345,12 +1364,12 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       const hasProgress =
         Math.abs(deal.appliedSoFar.residents) > 1e-6 ||
         Math.abs(deal.appliedSoFar.jobs) > 1e-6;
-      recordFlightEvent('mod-state.duplicate-active-deal', {
+      recordFlightEventLazy('mod-state.duplicate-active-deal', () => ({
         duplicateDealId: deal.id,
         originalDealId: original.id,
         hasProgress,
         totalCost: deal.totalCost,
-      });
+      }));
       if (!hasProgress) {
         deal.state = 'cancelled';
         dirty = true;
@@ -1439,61 +1458,70 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       dirty,
       previousShape: describeShape(previousPayload),
     });
-    // Persist current state under the OLD name before switching, so any
-    // unsaved deltas don't vanish on cross-save load.
-    if (initialized && dirty) {
-      await persist().catch((e) => console.warn('[sb-tod] persist before save-switch failed:', e));
-    }
-
-    let preparedBootstrapForSwitch = false;
-    if (name != null) {
-      const targetStorageKey = makeStorageKey(name);
-      let targetPayload: PersistedState | null = null;
-      try {
-        targetPayload = await backend.get<PersistedState | null>(targetStorageKey, null);
-      } catch (e) {
-        recordFlightEvent('mod-state.save-slot.target-get.throw', {
-          targetStorageKey,
-          error: String(e),
-        });
+    saveNameSwitchDepth++;
+    try {
+      // Persist current state under the OLD name before switching, so any
+      // unsaved deltas don't vanish on cross-save load. Suppress live-name
+      // sync while doing this: the whole point of this call is to leave the
+      // old slot clean before adopting the already-known new name.
+      if (initialized && dirty) {
+        await persist({ allowLiveSaveSync: false }).catch((e) =>
+          console.warn('[sb-tod] persist before save-switch failed:', e)
+        );
       }
-      const selected = await selectBootstrapForNamedSlot(
-        name,
-        targetStorageKey,
-        targetPayload,
-        previousPayload,
-        previousSaveName == null ? makeStorageKey(null) : makeStorageKey(previousSaveName)
-      );
-      if (selected) {
-        slotBootstrap = {
-          storageKey: targetStorageKey,
-          payload: selected.payload,
-          reason: 'compatible-existing-save-richer-than-named-slot',
-        };
-        preparedBootstrapForSwitch = true;
-        recordFlightEvent('mod-state.save-slot.bootstrap-prepared', {
-          targetStorageKey,
-          source: selected.source,
-          score: selected.score,
-          previousShape: describeShape(previousPayload),
-          targetShape: describeShape(targetPayload),
-          bootstrapShape: describeShape(slotBootstrap.payload),
-        });
-      }
-    }
 
-    currentSaveName = name;
-    initialized = false;
-    initPromise = null;
-    mutator = null;
-    demand = null;
-    await ensureInit().catch((e) => console.warn('[sb-tod] re-init after save-switch failed:', e));
-    if (preparedBootstrapForSwitch) dirty = true;
-    recordFlightEvent('mod-state.save-slot.switch.end', {
-      currentSaveName,
-      initialized,
-      dirty,
-    });
+      let preparedBootstrapForSwitch = false;
+      if (name != null) {
+        const targetStorageKey = makeStorageKey(name);
+        let targetPayload: PersistedState | null = null;
+        try {
+          targetPayload = await backend.get<PersistedState | null>(targetStorageKey, null);
+        } catch (e) {
+          recordFlightEvent('mod-state.save-slot.target-get.throw', {
+            targetStorageKey,
+            error: String(e),
+          });
+        }
+        const selected = await selectBootstrapForNamedSlot(
+          name,
+          targetStorageKey,
+          targetPayload,
+          previousPayload,
+          previousSaveName == null ? makeStorageKey(null) : makeStorageKey(previousSaveName)
+        );
+        if (selected) {
+          slotBootstrap = {
+            storageKey: targetStorageKey,
+            payload: selected.payload,
+            reason: 'compatible-existing-save-richer-than-named-slot',
+          };
+          preparedBootstrapForSwitch = true;
+          recordFlightEvent('mod-state.save-slot.bootstrap-prepared', {
+            targetStorageKey,
+            source: selected.source,
+            score: selected.score,
+            previousShape: describeShape(previousPayload),
+            targetShape: describeShape(targetPayload),
+            bootstrapShape: describeShape(slotBootstrap.payload),
+          });
+        }
+      }
+
+      currentSaveName = name;
+      initialized = false;
+      initPromise = null;
+      mutator = null;
+      demand = null;
+      await ensureInit().catch((e) => console.warn('[sb-tod] re-init after save-switch failed:', e));
+      if (preparedBootstrapForSwitch) dirty = true;
+      recordFlightEvent('mod-state.save-slot.switch.end', {
+        currentSaveName,
+        initialized,
+        dirty,
+      });
+    } finally {
+      saveNameSwitchDepth--;
+    }
   }
 
   return {

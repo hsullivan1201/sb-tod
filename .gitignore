@@ -2,5 +2,6 @@ node_modules/
 dist/
 debug/
 *.log
+sb-tod-v*.zip
 .DS_Store
 .claude/

@@ -600,6 +600,28 @@ describe('mod state — applyDensityDelta + revert', () => {
     expect(state.mutator().getCumulativeDeltaTotal('P')).toEqual({ jobs: 0, residents: 0 });
   });
 
+  it('does not recursively live-sync while persisting a dirty old slot during save switch', async () => {
+    const storage = makeStorage();
+    const A = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    let liveName = 'old';
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => fixture([A], [x]),
+      getSaveName: () => liveName,
+      initialSaveName: 'old',
+    });
+    await state.ensureInit();
+    state.markDirty();
+
+    liveName = 'new';
+    await state.setCurrentSaveName('new');
+
+    expect(state.getCurrentSaveName()).toBe('new');
+    expect(storage._data.has('sb-tod:state:v1:old')).toBe(true);
+  });
+
   it('migrates richer legacy _unsaved state when the named save slot is skinny', async () => {
     const storage = makeStorage();
     const legacyDeal = deal('legacy-deal', { state: 'completed' });
