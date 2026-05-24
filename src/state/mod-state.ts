@@ -37,6 +37,8 @@ import {
 } from '../sim/mutate';
 import {
   computeDailyApply,
+  developmentIdentityKey,
+  findDuplicateDevelopment,
   type Deal,
 } from '../sim/deals';
 import { createWalkshedIndex } from '../scoring/walkshed';
@@ -45,6 +47,7 @@ import {
   type AdaptiveStorage,
   type StorageBackendKind,
 } from './storage-adapter';
+import { recordFlightEvent } from '../diagnostics/flightRecorder';
 
 const STORAGE_KEY_PREFIX = 'sb-tod:state:v1:';
 const LEGACY_UNSEGMENTED_KEY = 'sb-tod:state:v1'; // pre-per-save key, cleaned up on init
@@ -101,6 +104,8 @@ export interface ModStateStats {
   activeDeals: number;
   completedDeals: number;
   cancelledDeals: number;
+  /** Dirty in-memory state waiting for the next game-save/end persist. */
+  dirty: boolean;
   /** Last day's deal application reports — most recent first. */
   lastTickReports: DealTickReport[];
   /** Current day-tick phase, for diagnosing freezes around day changes. */
@@ -360,6 +365,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let lastTickCompletedAt: number | null = null;
   let lastTickActiveDealId: string | null = null;
   let lastTickError: string | null = null;
+  let slotBootstrap: { storageKey: string; payload: PersistedState; reason: string } | null = null;
+  let saveNameSyncPromise: Promise<void> | null = null;
 
   function isZeroDensity(total: { jobs?: number; residents?: number } | undefined): boolean {
     return (total?.jobs ?? 0) === 0 && (total?.residents ?? 0) === 0;
@@ -389,6 +396,265 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
             chargedAt: d.chargeAudit.chargedAt,
           }
         : undefined,
+    };
+  }
+
+  function persistedCounts(persisted: PersistedState | null): {
+    baselines: number;
+    popBaselines: number;
+    deltas: number;
+    splitChildren: number;
+    deals: number;
+  } {
+    return {
+      baselines: persisted?.baselineDemand.length ?? 0,
+      popBaselines: persisted?.baselinePopSizes.length ?? 0,
+      deltas: persisted?.cumulativeDeltas.length ?? 0,
+      splitChildren: persisted?.splitChildren?.length ?? 0,
+      deals: persisted?.deals?.length ?? 0,
+    };
+  }
+
+  function shouldBootstrapNamedSlot(
+    previous: PersistedState | null,
+    target: PersistedState | null
+  ): boolean {
+    if (!previous) return false;
+    const prev = persistedCounts(previous);
+    const next = persistedCounts(target);
+    if (!target) return prev.deltas > 0 || prev.deals > 0 || prev.baselines > 0;
+    if (prev.deltas > 0 && next.deltas === 0) return true;
+    if (prev.baselines > 0 && next.baselines === 0 && (prev.deltas > 0 || prev.deals > next.deals)) {
+      return true;
+    }
+    return false;
+  }
+
+  function isPersistedState(value: unknown): value is PersistedState {
+    if (!value || typeof value !== 'object') return false;
+    const v = value as Partial<PersistedState>;
+    return (
+      v.version === 1 &&
+      typeof v.savedAt === 'number' &&
+      Array.isArray(v.baselineDemand) &&
+      Array.isArray(v.baselinePopSizes) &&
+      Array.isArray(v.cumulativeDeltas)
+    );
+  }
+
+  function normalizeStateStorageKey(key: string): string | null {
+    const raw =
+      key.startsWith('local:') || key.startsWith('api:') || key.startsWith('electron:')
+        ? key.slice(key.indexOf(':') + 1)
+        : key;
+    return raw.startsWith(STORAGE_KEY_PREFIX) ? raw : null;
+  }
+
+  async function listKnownStateStorageKeys(): Promise<string[]> {
+    const keys = new Set<string>();
+    try {
+      const listed = await (
+        (backend as StorageLike & { keys?: () => Promise<string[]> }).keys?.() ??
+        Promise.resolve([])
+      );
+      for (const key of listed) {
+        const normalized = normalizeStateStorageKey(key);
+        if (normalized) keys.add(normalized);
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (typeof localStorage !== 'undefined') {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key?.startsWith(STORAGE_KEY_PREFIX)) keys.add(key);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return [...keys];
+  }
+
+  async function readPersistedAtStorageKey(storageKey: string): Promise<PersistedState | null> {
+    try {
+      const viaBackend = await backend.get<unknown>(storageKey, null);
+      if (isPersistedState(viaBackend)) return viaBackend;
+    } catch {
+      /* fall through to direct local probe */
+    }
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const raw = localStorage.getItem(storageKey);
+        if (raw != null) {
+          const parsed = JSON.parse(raw) as unknown;
+          if (isPersistedState(parsed)) return parsed;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  function scoreBootstrapCompatibility(persisted: PersistedState, liveDemand: DemandData): {
+    deltaCount: number;
+    matchedDeltas: number;
+    preserved: number;
+    reset: number;
+    missing: number;
+    baselineShift: number;
+    dealCount: number;
+    splitChildren: number;
+    rank: number;
+  } {
+    const baselines = new Map(persisted.baselineDemand);
+    let preserved = 0;
+    let reset = 0;
+    let missing = 0;
+    let baselineShift = 0;
+    for (const [pointId, delta] of persisted.cumulativeDeltas) {
+      const point = liveDemand.points.get(pointId);
+      const baseline = baselines.get(pointId);
+      if (!point || !baseline) {
+        missing++;
+        continue;
+      }
+      const total = totalDelta(delta);
+      const matchesPreserved =
+        approxEq(point.jobs, baseline.jobs + total.jobs) &&
+        approxEq(point.residents, baseline.residents + total.residents);
+      const matchesReset =
+        approxEq(point.jobs, baseline.jobs) && approxEq(point.residents, baseline.residents);
+      if (matchesPreserved) preserved++;
+      else if (matchesReset) reset++;
+      else baselineShift++;
+    }
+    const deltaCount = persisted.cumulativeDeltas.length;
+    const matchedDeltas = preserved + reset;
+    const dealCount = persisted.deals?.length ?? 0;
+    const splitChildren = persisted.splitChildren?.length ?? 0;
+    return {
+      deltaCount,
+      matchedDeltas,
+      preserved,
+      reset,
+      missing,
+      baselineShift,
+      dealCount,
+      splitChildren,
+      rank: matchedDeltas * 1_000_000 + deltaCount * 10_000 + dealCount * 100 + splitChildren,
+    };
+  }
+
+  function bootstrapScoreIsCompatible(score: ReturnType<typeof scoreBootstrapCompatibility>): boolean {
+    if (score.deltaCount <= 0 || score.matchedDeltas <= 0) return false;
+    const requiredMatches = Math.max(1, Math.ceil(score.deltaCount * 0.5));
+    return score.matchedDeltas >= requiredMatches && score.baselineShift <= Math.max(2, score.matchedDeltas);
+  }
+
+  async function selectBootstrapForNamedSlot(
+    targetSaveName: string | null,
+    targetStorageKey: string,
+    targetPayload: PersistedState | null,
+    previousPayload: PersistedState | null,
+    previousSource: string | null
+  ): Promise<
+    | {
+        payload: PersistedState;
+        source: string;
+        score: ReturnType<typeof scoreBootstrapCompatibility>;
+      }
+    | null
+  > {
+    if (targetSaveName == null) return null;
+    const targetCounts = persistedCounts(targetPayload);
+    if (targetCounts.deltas > 0) return null;
+    const liveDemand = getDemand() ?? demand;
+    if (!liveDemand?.points) return null;
+
+    const candidates: Array<{
+      payload: PersistedState;
+      source: string;
+      score: ReturnType<typeof scoreBootstrapCompatibility>;
+    }> = [];
+    const seenSources = new Set<string>();
+    const addCandidate = (source: string, payload: PersistedState | null) => {
+      if (!payload || seenSources.has(source)) return;
+      seenSources.add(source);
+      if (!shouldBootstrapNamedSlot(payload, targetPayload)) return;
+      const score = scoreBootstrapCompatibility(payload, liveDemand);
+      recordFlightEvent('mod-state.save-slot.bootstrap-candidate', {
+        targetStorageKey,
+        source,
+        shape: describeShape(payload),
+        score,
+      });
+      if (!bootstrapScoreIsCompatible(score)) return;
+      candidates.push({ payload, source, score });
+    };
+
+    if (previousPayload && previousSource) {
+      addCandidate(previousSource, previousPayload);
+    }
+
+    const keys = await listKnownStateStorageKeys();
+    for (const key of keys) {
+      if (key === targetStorageKey || key === LEGACY_UNSEGMENTED_KEY) continue;
+      addCandidate(key, await readPersistedAtStorageKey(key));
+    }
+
+    candidates.sort((a, b) => {
+      if (b.score.rank !== a.score.rank) return b.score.rank - a.score.rank;
+      return (b.payload.savedAt ?? 0) - (a.payload.savedAt ?? 0);
+    });
+    const best = candidates[0];
+    if (!best) return null;
+    return {
+      source: best.source,
+      score: best.score,
+      payload: mergePersistedPayloads(best.payload, targetPayload, Date.now()),
+    };
+  }
+
+  function mergePersistedPayloads(
+    primary: PersistedState,
+    secondary: PersistedState | null,
+    savedAt: number
+  ): PersistedState {
+    const mergedDeals = (primary.deals ?? []).map(cloneDeal);
+    const seenDealIds = new Set(mergedDeals.map((deal) => deal.id));
+    for (const deal of secondary?.deals ?? []) {
+      if (seenDealIds.has(deal.id)) continue;
+      const cloned = cloneDeal(deal);
+      if (findDuplicateDevelopment(mergedDeals, cloned)) continue;
+      mergedDeals.push(cloned);
+      seenDealIds.add(cloned.id);
+    }
+    return {
+      version: 1,
+      savedAt,
+      baselineDemand: primary.baselineDemand.map(([id, baseline]) => [
+        id,
+        { jobs: baseline.jobs, residents: baseline.residents },
+      ]),
+      baselinePopSizes: primary.baselinePopSizes.map(([id, size]) => [id, size]),
+      cumulativeDeltas: primary.cumulativeDeltas.map(([id, delta]) => [
+        id,
+        {
+          jobs: {
+            fromDeals: delta.jobs.fromDeals,
+            fromOrganic: delta.jobs.fromOrganic,
+          },
+          residents: {
+            fromDeals: delta.residents.fromDeals,
+            fromOrganic: delta.residents.fromOrganic,
+          },
+        },
+      ]),
+      splitChildren: primary.splitChildren?.map(([id, children]) => [id, [...children]]),
+      deals: mergedDeals,
     };
   }
 
@@ -448,12 +714,63 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     }
   }
 
+  function liveSaveNameNeedingSync(): string | null {
+    const liveName = readLiveSaveName();
+    return liveName != null && liveName !== currentSaveName ? liveName : null;
+  }
+
+  async function syncLiveSaveName(reason: string): Promise<boolean> {
+    const liveName = liveSaveNameNeedingSync();
+    if (liveName == null) return false;
+    if (!saveNameSyncPromise) {
+      recordFlightEvent('mod-state.save-slot.live-sync.start', {
+        reason,
+        from: currentSaveName,
+        to: liveName,
+        initialized,
+        dirty,
+      });
+      saveNameSyncPromise = setCurrentSaveName(liveName)
+        .then(() => {
+          recordFlightEvent('mod-state.save-slot.live-sync.end', {
+            reason,
+            currentSaveName,
+            initialized,
+            dirty,
+          });
+        })
+        .finally(() => {
+          saveNameSyncPromise = null;
+        });
+    }
+    await saveNameSyncPromise;
+    return true;
+  }
+
+  function syncLiveSaveNameSoon(reason: string): boolean {
+    if (saveNameSyncPromise) return true;
+    const liveName = liveSaveNameNeedingSync();
+    if (liveName == null) return false;
+    void syncLiveSaveName(reason).catch((e) =>
+      console.warn('[sb-tod] live save-name sync failed:', e)
+    );
+    return true;
+  }
+
   async function doInit(providedDemand?: DemandData): Promise<boolean> {
     if (currentSaveName == null) {
       currentSaveName = readLiveSaveName();
     }
+    recordFlightEvent('mod-state.init.start', {
+      saveName: currentSaveName,
+      providedDemand: !!providedDemand,
+    });
     const d = providedDemand ?? getDemand();
     if (!d || !d.points || !d.popsMap) {
+      recordFlightEvent('mod-state.init.no-demand', {
+        saveName: currentSaveName,
+        hasDemand: !!d,
+      });
       return false;
     }
     demand = d;
@@ -465,16 +782,64 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     // panel can show exactly what we saw, regardless of what the
     // adapter chose to surface. Crucial for diagnosing post-restart
     // "where did my data go?" cases — and for spotting cross-save bleed.
+    recordFlightEvent('mod-state.init.probe.start', { storageKey });
     initProbe = await captureInitProbe(currentSaveName, storageKey);
+    recordFlightEvent('mod-state.init.probe.end', {
+      storageKey,
+      apiKeys: initProbe.apiKeysAtInit.length,
+      localStorageKeys: initProbe.localStorageKeysAtInit.length,
+      apiHasOurKey: initProbe.apiHasOurKey,
+      localStorageHasOurKey: initProbe.localStorageHasOurKey,
+      otherSaveKeys: initProbe.otherSaveKeys.length,
+    });
     console.log('[sb-tod] init probe:', initProbe);
 
     let persisted: PersistedState | null = null;
     let storageKeys: string[] = [];
     try {
+      recordFlightEvent('mod-state.init.storage-get.start', { storageKey });
       persisted = await backend.get<PersistedState | null>(storageKey, null);
+      recordFlightEvent('mod-state.init.storage-get.end', {
+        storageKey,
+        hasPersisted: !!persisted,
+        shape: describeShape(persisted),
+      });
     } catch (err) {
       console.warn('[sb-tod] storage.get threw during init:', err);
+      recordFlightEvent('mod-state.init.storage-get.throw', {
+        storageKey,
+        error: String(err),
+      });
       persisted = null;
+    }
+    if (slotBootstrap?.storageKey === storageKey) {
+      recordFlightEvent('mod-state.init.slot-bootstrap', {
+        storageKey,
+        reason: slotBootstrap.reason,
+        targetShape: describeShape(persisted),
+        bootstrapShape: describeShape(slotBootstrap.payload),
+      });
+      persisted = slotBootstrap.payload;
+      slotBootstrap = null;
+    } else if (currentSaveName != null) {
+      const selected = await selectBootstrapForNamedSlot(
+        currentSaveName,
+        storageKey,
+        persisted,
+        null,
+        null
+      );
+      if (selected) {
+        recordFlightEvent('mod-state.init.named-slot-bootstrap-selected', {
+          storageKey,
+          source: selected.source,
+          targetShape: describeShape(persisted),
+          bootstrapShape: describeShape(selected.payload),
+          score: selected.score,
+        });
+        persisted = selected.payload;
+        dirty = true;
+      }
     }
     try {
       storageKeys = await ((backend as StorageLike & { keys?: () => Promise<string[]> }).keys?.() ?? Promise.resolve([]));
@@ -483,8 +848,25 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     }
 
     if (persisted && persisted.version === 1) {
+      recordFlightEvent('mod-state.init.hydrate.start', {
+        storageKey,
+        baselineDemand: persisted.baselineDemand.length,
+        baselinePopSizes: persisted.baselinePopSizes.length,
+        cumulativeDeltas: persisted.cumulativeDeltas.length,
+        deals: persisted.deals?.length ?? 0,
+      });
       lastHydrate = applyPersisted(mutator, d, persisted);
       deals = persisted.deals ? persisted.deals.map(cloneDeal) : [];
+      recordFlightEvent('mod-state.init.hydrate.end', {
+        storageKey,
+        preserved: lastHydrate.preserved,
+        replayed: lastHydrate.replayed,
+        baselineShift: lastHydrate.baselineShift,
+        missingPoint: lastHydrate.missingPoint,
+        splitChildrenRemoved: lastHydrate.splitChildrenRemoved,
+        originalPopsReset: lastHydrate.originalPopsReset,
+        deals: deals.length,
+      });
       console.log(
         `[sb-tod] Hydrated "${storageKey}" (saved ${new Date(persisted.savedAt).toISOString()}): preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}, deals=${deals.length}. Storage keys: [${storageKeys.join(', ')}]`
       );
@@ -505,6 +887,12 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       };
       deals = [];
       const counts = mutator.trackingCounts();
+      recordFlightEvent('mod-state.init.fresh-baseline', {
+        storageKey,
+        baselineDemand: counts.baselineDemand,
+        baselinePopSizes: counts.baselinePopSizes,
+        storageKeys: storageKeys.length,
+      });
       console.log(
         `[sb-tod] No persisted state found at "${storageKey}". Captured ${counts.baselineDemand} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install or different save slot).`
       );
@@ -523,6 +911,12 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     }
 
     initialized = true;
+    recordFlightEvent('mod-state.init.ready', {
+      saveName: currentSaveName,
+      storageKey,
+      deals: deals.length,
+      tracked: mutator.trackingCounts(),
+    });
     if (rescueNegativeBudgetFromUnappliedDeal()) {
       await persist();
     }
@@ -530,13 +924,18 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   }
 
   async function ensureInit(providedDemand?: DemandData): Promise<boolean> {
-    if (initialized) return true;
+    if (initialized) {
+      await syncLiveSaveName('ensure-init');
+      return true;
+    }
     if (!initPromise) {
       initPromise = doInit(providedDemand).finally(() => {
         if (!initialized) initPromise = null;
       });
     }
-    return initPromise;
+    const ok = await initPromise;
+    if (ok) await syncLiveSaveName('ensure-init-after-init');
+    return ok;
   }
 
   function isReady(): boolean {
@@ -578,12 +977,36 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   }
 
   function refreshDemandBinding(): boolean {
+    if (syncLiveSaveNameSoon('refresh-demand')) {
+      recordFlightEvent('mod-state.refresh-demand.defer-live-save-sync', {
+        currentSaveName,
+        liveName: readLiveSaveName(),
+      });
+      return false;
+    }
     if (!initialized || !mutator) return demand !== null;
+    recordFlightEvent('mod-state.refresh-demand.start', {
+      hasDemand: demand !== null,
+    });
     const live = getDemand();
-    if (!live || !live.points || !live.popsMap) return false;
-    if (live === demand) return true;
+    if (!live || !live.points || !live.popsMap) {
+      recordFlightEvent('mod-state.refresh-demand.no-live-demand', { hasLive: !!live });
+      return false;
+    }
+    if (live === demand) {
+      recordFlightEvent('mod-state.refresh-demand.same-object', {
+        points: live.points.size,
+        pops: live.popsMap.size,
+      });
+      return true;
+    }
 
     const persisted = buildPersistedPayload(Date.now());
+    recordFlightEvent('mod-state.refresh-demand.rebind.start', {
+      points: live.points.size,
+      pops: live.popsMap.size,
+      hadPersistedPayload: !!persisted,
+    });
     demand = live;
     mutator = createMutator(live, mutatorOptions);
     if (persisted) {
@@ -593,15 +1016,30 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       console.log(
         `[sb-tod] Rebound mutator to refreshed DemandData: preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}`
       );
+      recordFlightEvent('mod-state.refresh-demand.rebind.end', {
+        preserved: lastHydrate.preserved,
+        replayed: lastHydrate.replayed,
+        baselineShift: lastHydrate.baselineShift,
+        missingPoint: lastHydrate.missingPoint,
+      });
     } else {
       mutator.captureBaselines();
+      recordFlightEvent('mod-state.refresh-demand.rebind.fresh-baseline', {
+        tracked: mutator.trackingCounts(),
+      });
     }
     return true;
   }
 
   async function persist(): Promise<boolean> {
+    recordFlightEvent('mod-state.persist.start', {
+      saveName: currentSaveName,
+      dirty,
+      hasMutator: !!mutator,
+    });
     if (!mutator) {
       lastPersistOk = false;
+      recordFlightEvent('mod-state.persist.no-mutator');
       return false;
     }
     let bound = false;
@@ -610,10 +1048,12 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     } catch (err) {
       console.warn('[sb-tod] refreshDemandBinding failed during persist:', err);
       lastPersistOk = false;
+      recordFlightEvent('mod-state.persist.refresh-demand.throw', { error: String(err) });
       return false;
     }
     if (!bound) {
       lastPersistOk = false;
+      recordFlightEvent('mod-state.persist.refresh-demand.failed');
       return false;
     }
     let payload: PersistedState | null = null;
@@ -622,24 +1062,46 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     } catch (err) {
       console.warn('[sb-tod] buildPersistedPayload failed during persist:', err);
       lastPersistOk = false;
+      recordFlightEvent('mod-state.persist.payload.throw', { error: String(err) });
       return false;
     }
     if (!payload) {
       lastPersistOk = false;
+      recordFlightEvent('mod-state.persist.payload.null');
       return false;
     }
     const storageKey = makeStorageKey(currentSaveName);
+    recordFlightEvent('mod-state.persist.payload.ready', {
+      storageKey,
+      baselineDemand: payload.baselineDemand.length,
+      baselinePopSizes: payload.baselinePopSizes.length,
+      cumulativeDeltas: payload.cumulativeDeltas.length,
+      splitChildren: payload.splitChildren?.length ?? 0,
+      deals: payload.deals?.length ?? 0,
+    });
     try {
+      recordFlightEvent('mod-state.persist.set.start', { storageKey });
       await backend.set(storageKey, payload);
+      recordFlightEvent('mod-state.persist.set.end', { storageKey });
       // Immediate round-trip verify. Probe 1 caught a case where set()
       // resolved but get() returned undefined — silent drop. If that's
       // happening here, surface it loudly; persistence is effectively
       // broken and we need to know before the user counts on a reload.
       let readback: PersistedState | null = null;
       try {
+        recordFlightEvent('mod-state.persist.readback.start', { storageKey });
         readback = await backend.get<PersistedState | null>(storageKey, null);
+        recordFlightEvent('mod-state.persist.readback.end', {
+          storageKey,
+          hasReadback: !!readback,
+          savedAt: readback?.savedAt ?? null,
+        });
       } catch (e) {
         console.warn('[sb-tod] readback during persist verify threw:', e);
+        recordFlightEvent('mod-state.persist.readback.throw', {
+          storageKey,
+          error: String(e),
+        });
       }
       const matches = !!readback && readback.savedAt === payload.savedAt;
       storageRoundTripOk = matches;
@@ -648,50 +1110,96 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
           `[sb-tod] storage round-trip MISMATCH after set("${storageKey}"): wrote savedAt=${payload.savedAt} but readback=${readback ? `savedAt=${readback.savedAt}` : 'null'}. Data will not survive restart. (Browser mode? Known game flake? Check Electron / api.storage.)`
         );
         lastPersistOk = false;
+        recordFlightEvent('mod-state.persist.roundtrip.mismatch', {
+          storageKey,
+          wroteSavedAt: payload.savedAt,
+          readbackSavedAt: readback?.savedAt ?? null,
+        });
         return false;
       }
       lastPersistOk = true;
       lastPersistAt = payload.savedAt;
       dirty = false;
+      recordFlightEvent('mod-state.persist.ok', {
+        storageKey,
+        savedAt: payload.savedAt,
+      });
       return true;
     } catch (err) {
       console.warn('[sb-tod] storage.set failed:', err);
       lastPersistOk = false;
       storageRoundTripOk = false;
+      recordFlightEvent('mod-state.persist.throw', {
+        storageKey,
+        error: String(err),
+      });
       return false;
     }
   }
 
   function onDayTick(day: number): void {
+    if (liveSaveNameNeedingSync() != null) {
+      recordFlightEvent('mod-state.day-tick.defer-live-save-sync', {
+        day,
+        currentSaveName,
+        liveName: readLiveSaveName(),
+      });
+      void syncLiveSaveName('day-tick')
+        .then(() => onDayTick(day))
+        .catch((e) => console.warn('[sb-tod] live save-name sync on day tick failed:', e));
+      return;
+    }
     dayTicks++;
     lastDay = day;
     lastTickStartedAt = Date.now();
     lastTickCompletedAt = null;
     lastTickError = null;
+    recordFlightEvent('mod-state.day-tick.enter', {
+      day,
+      dayTicks,
+      initialized,
+      activeDeals: deals.filter((deal) => deal.state === 'active').length,
+      dirty,
+    });
     if (!initialized) {
       // Try to init opportunistically — demand is almost certainly available
       // by the first day tick.
       dayTickPhase = 'init';
+      recordFlightEvent('mod-state.day-tick.init.start', { day });
       ensureInit().catch((e) => console.warn('[sb-tod] ensureInit on day tick failed:', e));
       return;
     }
 
     try {
       dayTickPhase = 'refresh-demand';
-      if (!refreshDemandBinding()) return;
+      if (!refreshDemandBinding()) {
+        recordFlightEvent('mod-state.day-tick.refresh-demand.failed', { day });
+        return;
+      }
 
       // Apply each active deal's daily delta. Done before the persist below
       // so the saved state reflects today's progress.
       dayTickPhase = 'apply-deals';
+      recordFlightEvent('mod-state.day-tick.apply-deals.start', { day });
       lastTickReports = applyActiveDealsForDay(day);
+      recordFlightEvent('mod-state.day-tick.apply-deals.end', {
+        day,
+        reports: lastTickReports,
+        dirty,
+      });
 
-      if (dirty && dayTicks % persistEveryNDays === 0) {
-        dayTickPhase = 'persist';
-        schedulePersist();
-      }
+      // Storage writes are intentionally save-hook driven. Persisting
+      // automatically from the sim/day/build paths has repeatedly lined
+      // up with player-visible freezes on large saves.
     } catch (err) {
       lastTickError = err instanceof Error ? err.message : String(err);
       console.warn('[sb-tod] day tick failed:', err);
+      recordFlightEvent('mod-state.day-tick.throw', {
+        day,
+        phase: dayTickPhase,
+        activeDealId: lastTickActiveDealId,
+        error: String(err),
+      });
       try {
         uiApi.showNotification(`TOD day tick failed: ${lastTickError}`, 'error');
       } catch {
@@ -701,13 +1209,29 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       lastTickActiveDealId = null;
       lastTickCompletedAt = Date.now();
       dayTickPhase = 'idle';
+      recordFlightEvent('mod-state.day-tick.exit', {
+        day,
+        durationMs:
+          lastTickStartedAt != null && lastTickCompletedAt != null
+            ? lastTickCompletedAt - lastTickStartedAt
+            : null,
+        error: lastTickError,
+      });
     }
   }
 
   function applyActiveDealsForDay(day: number): DealTickReport[] {
     if (!mutator || !demand) return [];
     const reports: DealTickReport[] = [];
+    const suppressedDuplicates = suppressDuplicateActiveDeals();
     const activeDeals = deals.filter((deal) => deal.state === 'active');
+    recordFlightEvent('mod-state.deals.apply-all.start', {
+      day,
+      activeDeals: activeDeals.length,
+      suppressedDuplicates,
+      points: demand.points.size,
+      pops: demand.popsMap.size,
+    });
     const walkshedIndex =
       activeDeals.length > 0 ? createWalkshedIndex(demand.points.values()) : null;
     for (const deal of activeDeals) {
@@ -721,10 +1245,30 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         walkshedPoints: demand.points.values(),
         walkshedIndex: walkshedIndex ?? undefined,
       });
+      recordFlightEvent('mod-state.deal.plan', {
+        day,
+        dealId: deal.id,
+        kind: deal.kind,
+        tier: deal.tier,
+        targets: plan.targets.length,
+        marksCompletion: plan.marksCompletion,
+        newPending: plan.newPending,
+      });
       let applied = { jobs: 0, residents: 0 };
       let pointsAffected = 0;
       let rejections = 0;
+      recordFlightEvent('mod-state.deal.mutate.start', {
+        day,
+        dealId: deal.id,
+        targets: plan.targets.length,
+      });
       const results = plan.targets.length > 0 ? mutator.applyDensityDeltas(plan.targets, 'deals') : [];
+      recordFlightEvent('mod-state.deal.mutate.end', {
+        day,
+        dealId: deal.id,
+        targets: plan.targets.length,
+        results: results.length,
+      });
       for (let i = 0; i < plan.targets.length; i++) {
         const target = plan.targets[i];
         const r = results[i];
@@ -743,6 +1287,13 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
           );
         }
       }
+      recordFlightEvent('mod-state.deal.results-processed', {
+        day,
+        dealId: deal.id,
+        applied,
+        pointsAffected,
+        rejections,
+      });
       deal.appliedSoFar.residents += applied.residents;
       deal.appliedSoFar.jobs += applied.jobs;
       deal.pending = plan.newPending;
@@ -771,7 +1322,53 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         marksCompletion: plan.marksCompletion,
       });
     }
+    recordFlightEvent('mod-state.deals.apply-all.end', {
+      day,
+      reports,
+      dirty,
+    });
     return reports;
+  }
+
+  function suppressDuplicateActiveDeals(): number {
+    const seen = new Map<string, Deal>();
+    let suppressed = 0;
+    for (const deal of deals) {
+      if (deal.state !== 'active') continue;
+      const key = developmentIdentityKey(deal);
+      const original = seen.get(key);
+      if (!original) {
+        seen.set(key, deal);
+        continue;
+      }
+
+      const hasProgress =
+        Math.abs(deal.appliedSoFar.residents) > 1e-6 ||
+        Math.abs(deal.appliedSoFar.jobs) > 1e-6;
+      recordFlightEvent('mod-state.duplicate-active-deal', {
+        duplicateDealId: deal.id,
+        originalDealId: original.id,
+        hasProgress,
+        totalCost: deal.totalCost,
+      });
+      if (!hasProgress) {
+        deal.state = 'cancelled';
+        dirty = true;
+        suppressed++;
+        if (deal.totalCost > 0) {
+          refundDealMoney(deal.totalCost, 'TOD Deal refund');
+        }
+        try {
+          uiApi.showNotification(
+            `Cancelled duplicate TOD deal at ${deal.centerStationGroupName}. Refunded $${deal.totalCost.toLocaleString()}.`,
+            'warning'
+          );
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return suppressed;
   }
 
   function onDemandChangeFired(): void {
@@ -785,6 +1382,14 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     // the key without dropping in-memory; persist immediately.
     const nextName = typeof saveName === 'string' && saveName.length > 0 ? saveName : readLiveSaveName();
     const nameChanged = nextName !== null && nextName !== currentSaveName;
+    recordFlightEvent('mod-state.game-saved', {
+      saveName,
+      nextName,
+      currentSaveName,
+      nameChanged,
+      initialized,
+      dirty,
+    });
     if (nameChanged) {
       currentSaveName = nextName;
     }
@@ -793,6 +1398,13 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
 
   function onGameLoadedFired(saveName?: string): void {
     const nextName = typeof saveName === 'string' && saveName.length > 0 ? saveName : readLiveSaveName();
+    recordFlightEvent('mod-state.game-loaded', {
+      saveName,
+      nextName,
+      currentSaveName,
+      initialized,
+      dirty,
+    });
     // Loading a different save means switching slots: dump in-memory and
     // hydrate from the new save's storage. setCurrentSaveName persists
     // any unsaved deltas under the OLD name first, so nothing is lost.
@@ -812,32 +1424,76 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   }
 
   function onGameEndFired(): void {
+    recordFlightEvent('mod-state.game-end', { initialized, dirty, currentSaveName });
     if (initialized && dirty) void persist();
-  }
-
-  function schedulePersist(): void {
-    if (typeof window !== 'undefined') {
-      window.setTimeout(() => {
-        void persist();
-      }, 0);
-      return;
-    }
-    void Promise.resolve().then(() => persist());
   }
 
   async function setCurrentSaveName(name: string | null): Promise<void> {
     if (name === currentSaveName) return;
+    const previousSaveName = currentSaveName;
+    const previousPayload = initialized ? buildPersistedPayload(Date.now()) : null;
+    recordFlightEvent('mod-state.save-slot.switch.start', {
+      from: previousSaveName,
+      to: name,
+      initialized,
+      dirty,
+      previousShape: describeShape(previousPayload),
+    });
     // Persist current state under the OLD name before switching, so any
     // unsaved deltas don't vanish on cross-save load.
     if (initialized && dirty) {
       await persist().catch((e) => console.warn('[sb-tod] persist before save-switch failed:', e));
     }
+
+    let preparedBootstrapForSwitch = false;
+    if (name != null) {
+      const targetStorageKey = makeStorageKey(name);
+      let targetPayload: PersistedState | null = null;
+      try {
+        targetPayload = await backend.get<PersistedState | null>(targetStorageKey, null);
+      } catch (e) {
+        recordFlightEvent('mod-state.save-slot.target-get.throw', {
+          targetStorageKey,
+          error: String(e),
+        });
+      }
+      const selected = await selectBootstrapForNamedSlot(
+        name,
+        targetStorageKey,
+        targetPayload,
+        previousPayload,
+        previousSaveName == null ? makeStorageKey(null) : makeStorageKey(previousSaveName)
+      );
+      if (selected) {
+        slotBootstrap = {
+          storageKey: targetStorageKey,
+          payload: selected.payload,
+          reason: 'compatible-existing-save-richer-than-named-slot',
+        };
+        preparedBootstrapForSwitch = true;
+        recordFlightEvent('mod-state.save-slot.bootstrap-prepared', {
+          targetStorageKey,
+          source: selected.source,
+          score: selected.score,
+          previousShape: describeShape(previousPayload),
+          targetShape: describeShape(targetPayload),
+          bootstrapShape: describeShape(slotBootstrap.payload),
+        });
+      }
+    }
+
     currentSaveName = name;
     initialized = false;
     initPromise = null;
     mutator = null;
     demand = null;
     await ensureInit().catch((e) => console.warn('[sb-tod] re-init after save-switch failed:', e));
+    if (preparedBootstrapForSwitch) dirty = true;
+    recordFlightEvent('mod-state.save-slot.switch.end', {
+      currentSaveName,
+      initialized,
+      dirty,
+    });
   }
 
   return {
@@ -854,23 +1510,46 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       dirty = true;
     },
     persist,
-    getDeals: () => deals,
+    getDeals: () => {
+      syncLiveSaveNameSoon('get-deals');
+      return deals;
+    },
     async addDeal(deal) {
+      recordFlightEvent('mod-state.add-deal', {
+        dealId: deal.id,
+        kind: deal.kind,
+        tier: deal.tier,
+        startDay: deal.startDay,
+        totalDensity: deal.totalDensity,
+        totalCost: deal.totalCost,
+        dealsBefore: deals.length,
+      });
+      const duplicate = findDuplicateDevelopment(deals, deal);
+      if (duplicate) {
+        recordFlightEvent('mod-state.add-deal.duplicate', {
+          dealId: deal.id,
+          duplicateDealId: duplicate.id,
+          duplicateState: duplicate.state,
+        });
+        return false;
+      }
       deals.push(deal);
       dirty = true;
-      // Persist immediately so the deal is durable before the caller
-      // treats it as started. Otherwise a confirm-then-quit before any
-      // day passes loses the deal.
-      const ok = await persist();
-      if (!ok) {
-        deals = deals.filter((d) => d.id !== deal.id);
-        dirty = true;
-      }
-      return ok;
+      // Accept the deal into in-memory state immediately. Durability is
+      // provided by the game save/end hooks; writing storage on a build
+      // timer has lined up with the remaining freeze reports.
+      return true;
     },
     cancelDeal(dealId) {
       const d = deals.find((dd) => dd.id === dealId);
-      if (!d || d.state !== 'active') return false;
+      if (!d || d.state !== 'active') {
+        recordFlightEvent('mod-state.cancel-deal.rejected', {
+          dealId,
+          found: !!d,
+          state: d?.state ?? null,
+        });
+        return false;
+      }
       // Refund the unspent fraction. We use the average delivered
       // fraction across active dimensions (residents + jobs that this
       // deal targets) — same calc the UI progress bar uses.
@@ -884,12 +1563,16 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       const deliveredFraction =
         fractions.length > 0 ? fractions.reduce((s, f) => s + f, 0) / fractions.length : 0;
       const refund = Math.round(d.totalCost * (1 - deliveredFraction));
+      recordFlightEvent('mod-state.cancel-deal.accepted', {
+        dealId,
+        deliveredFraction,
+        refund,
+      });
       if (refund > 0) {
         refundDealMoney(refund, 'TOD Deal refund');
       }
       d.state = 'cancelled';
       dirty = true;
-      void persist();
       try {
         uiApi.showNotification(
           `Cancelled ${d.kind}/${d.tier} at ${d.centerStationGroupName}. Refunded $${refund.toLocaleString()} (${Math.round((1 - deliveredFraction) * 100)}% unspent).`,
@@ -955,17 +1638,20 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       d.pending = plan.newPending;
       d.state = 'completed';
       dirty = true;
-      void persist();
       return true;
     },
     setCurrentSaveName,
-    getCurrentSaveName: () => currentSaveName,
+    getCurrentSaveName: () => {
+      syncLiveSaveNameSoon('get-current-save-name');
+      return currentSaveName;
+    },
     onDayTick,
     onDemandChangeFired,
     onGameSavedFired,
     onGameLoadedFired,
     onGameEndFired,
     stats() {
+      syncLiveSaveNameSoon('stats');
       const counts = mutator?.trackingCounts();
       const storageBackend: StorageBackendKind =
         (backend as Partial<AdaptiveStorage>).lastBackend?.() ?? 'api';
@@ -984,6 +1670,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         lastDay,
         currentSaveName,
         currentStorageKey: makeStorageKey(currentSaveName),
+        dirty,
         lastPersistOk,
         lastPersistAt,
         storageRoundTripOk,
@@ -1077,33 +1764,18 @@ function applyPersisted(
     if (matchesPreserved) {
       report.preserved++;
       report.perPoint.set(pointId, 'preserved');
-      // The game preserved point.residents / point.jobs (the
-      // DemandPoint aggregates), but it does NOT preserve our
-      // runtime-added split-child pops in popsMap — those are
-      // serialized as part of our mod state, not the game's. So
-      // even on the "preserved" path we need to recreate any missing
-      // children to make pop count match the (already-correct)
-      // aggregate. reconcilePoint is idempotent: no-op if everything
-      // is already there, recreates missing children otherwise.
-      mutator.reconcilePoint(pointId);
+      if (options.canonicalizeSplits !== false) {
+        // Initial load can repair old/corrupt save data by rebuilding split
+        // children. Routine live DemandData rebinds run with canonicalization
+        // disabled, so they trust preserved aggregates and avoid rewriting
+        // hundreds of already-authored split pops during the hot day tick.
+        replayPersistedDelta(mutator, pointId, delta);
+      }
     } else if (matchesReset) {
       // Game reset our mutations. Replay per-source so the delta
       // buckets remain correctly attributed. We must clear the seeded
       // cumulative first or applyDensityDelta will double it.
-      resetCumulativeFor(mutator, pointId);
-      const sources: Array<[DeltaSourceKind, DemandDelta]> = [
-        ['deals', { jobs: delta.jobs.fromDeals, residents: delta.residents.fromDeals }],
-        ['organic', { jobs: delta.jobs.fromOrganic, residents: delta.residents.fromOrganic }],
-      ];
-      for (const [source, d] of sources) {
-        if ((d.jobs ?? 0) === 0 && (d.residents ?? 0) === 0) continue;
-        const r = mutator.applyDensityDelta(pointId, d, source);
-        if (!r.ok) {
-          console.warn(
-            `[sb-tod] replay of persisted delta on point "${pointId}" failed (${source}): ${r.reason}`
-          );
-        }
-      }
+      replayPersistedDelta(mutator, pointId, delta);
       report.replayed++;
       report.perPoint.set(pointId, 'replayed');
     } else {
@@ -1125,6 +1797,27 @@ function applyPersisted(
   mutator.capturePointBaselines(demand.points.values());
 
   return report;
+}
+
+function replayPersistedDelta(
+  mutator: DemandMutator,
+  pointId: string,
+  delta: PointDelta
+): void {
+  resetCumulativeFor(mutator, pointId);
+  const sources: Array<[DeltaSourceKind, DemandDelta]> = [
+    ['deals', { jobs: delta.jobs.fromDeals, residents: delta.residents.fromDeals }],
+    ['organic', { jobs: delta.jobs.fromOrganic, residents: delta.residents.fromOrganic }],
+  ];
+  for (const [source, d] of sources) {
+    if ((d.jobs ?? 0) === 0 && (d.residents ?? 0) === 0) continue;
+    const r = mutator.applyDensityDelta(pointId, d, source);
+    if (!r.ok) {
+      console.warn(
+        `[sb-tod] replay of persisted delta on point "${pointId}" failed (${source}): ${r.reason}`
+      );
+    }
+  }
 }
 
 function resetCumulativeFor(mutator: DemandMutator, pointId: string): void {

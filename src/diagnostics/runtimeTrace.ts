@@ -12,6 +12,7 @@ import { gameState, hooks } from '../api';
 import { SPLIT_POP_PREFIX } from '../sim/mutate';
 import { getModState } from '../state/mod-state';
 import type { DemandData } from '../types';
+import { isFlightRecorderEnabled } from './flightRecorder';
 
 const RUNTIME_TRACE_INTERVAL_MS = 2500;
 const RUNTIME_TRACE_LIMIT = 240;
@@ -246,11 +247,13 @@ export function sampleRuntimeTrace(
 
 export function ensureRuntimeTraceSampler(options: RuntimeTraceSamplerOptions = {}): void {
   const state = getRuntimeTraceState();
+  if (!isFlightRecorderEnabled()) return;
   if (!state.hookRegistered) {
     state.hookRegistered = true;
 
     try {
       hooks.onDayChange((day) => {
+        if (!isFlightRecorderEnabled()) return;
         sampleRuntimeTrace(`day-change:${day}`);
       });
     } catch (err) {
@@ -259,6 +262,7 @@ export function ensureRuntimeTraceSampler(options: RuntimeTraceSamplerOptions = 
 
     try {
       hooks.onDemandChange(() => {
+        if (!isFlightRecorderEnabled()) return;
         state.demandEventsSinceLastSample++;
         state.lastDemandEventAt = Date.now();
       });

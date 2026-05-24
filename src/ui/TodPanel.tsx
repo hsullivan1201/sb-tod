@@ -14,10 +14,18 @@ import {
   sampleRuntimeTrace,
 } from '../diagnostics/runtimeTrace';
 import {
+  clearFlightRecorder,
+  flightRecorderSnapshot,
+  isFlightRecorderEnabled,
+  recordFlightEvent,
+  setFlightRecorderEnabled,
+} from '../diagnostics/flightRecorder';
+import {
   confirmProposal,
   DEFAULT_TIER_TABLE,
   DEAL_COST_MULTIPLIER,
   dealProgressFraction,
+  findDuplicateDevelopment,
   validateProposal,
   type Deal,
   type DealChargeAudit,
@@ -124,8 +132,9 @@ const FALLBACK_CALIBRATION: CalibrationInfo = {
 const dayListeners = new Set<(day: number) => void>();
 let dayHookRegistered = false;
 const BUILD_LOCK_WINDOW_MS = 10000;
-const BUDGET_SAMPLE_DELAYS_MS = [0, 50, 150, 400, 1000, 2500, 5000];
-const MONEY_TRACE_LIMIT = 2000;
+const BUDGET_SAMPLE_DELAYS_MS = [0, 250, 1000];
+const MONEY_TRACE_LIMIT = 512;
+const MONEY_EVENT_SAMPLE_MS = 500;
 
 interface BuildLockState {
   inFlight: boolean;
@@ -239,12 +248,15 @@ type MoneyTraceEntry =
       change: number;
       moneyType: 'revenue' | 'expense';
       category?: string;
+      skipped?: number;
     };
 
 interface MoneyTraceState {
   entries: MoneyTraceEntry[];
   nextId: number;
   hookRegistered: boolean;
+  lastMoneyEventTraceAt: number | null;
+  skippedMoneyEvents: number;
 }
 
 function getMoneyTraceState(): MoneyTraceState {
@@ -252,7 +264,16 @@ function getMoneyTraceState(): MoneyTraceState {
     __sbTodMoneyTrace?: MoneyTraceState;
   };
   if (!root.__sbTodMoneyTrace) {
-    root.__sbTodMoneyTrace = { entries: [], nextId: 1, hookRegistered: false };
+    root.__sbTodMoneyTrace = {
+      entries: [],
+      nextId: 1,
+      hookRegistered: false,
+      lastMoneyEventTraceAt: null,
+      skippedMoneyEvents: 0,
+    };
+  } else {
+    root.__sbTodMoneyTrace.lastMoneyEventTraceAt ??= null;
+    root.__sbTodMoneyTrace.skippedMoneyEvents ??= 0;
   }
   return root.__sbTodMoneyTrace;
 }
@@ -277,13 +298,33 @@ function ensureMoneyTraceHook(): void {
   state.hookRegistered = true;
   try {
     hooks.onMoneyChanged((newBalance, change, moneyType, category) => {
+      const now = Date.now();
+      const verboseTrace = isFlightRecorderEnabled();
+      const important =
+        category === 'TOD Deal' ||
+        category === 'TOD Deal refund' ||
+        category === 'mod-setMoney' ||
+        (verboseTrace && category === 'other');
+      if (!important && !verboseTrace) return;
+      if (
+        !important &&
+        state.lastMoneyEventTraceAt != null &&
+        now - state.lastMoneyEventTraceAt < MONEY_EVENT_SAMPLE_MS
+      ) {
+        state.skippedMoneyEvents++;
+        return;
+      }
+      const skipped = state.skippedMoneyEvents > 0 ? state.skippedMoneyEvents : undefined;
+      state.skippedMoneyEvents = 0;
+      state.lastMoneyEventTraceAt = now;
       pushMoneyTrace({
         type: 'money-event',
-        at: Date.now(),
+        at: now,
         newBalance,
         change,
         moneyType,
         category,
+        skipped,
       });
     });
   } catch (err) {
@@ -317,6 +358,7 @@ function recordBuildTrace(
     detail,
   };
   pushMoneyTrace(entry);
+  recordFlightEvent(`ui.${type}`, detail ? { traceId, ...detail } : { traceId });
 }
 
 function scheduleBudgetSamples(traceId: string): void {
@@ -427,7 +469,8 @@ async function chargeDealCost(cost: number): Promise<
 > {
   const traceId = nextMoneyTraceId();
   const before = safeBudget();
-  recordBuildTrace('subtract-before', traceId, { cost });
+  const expectedAfter = before - cost;
+  recordBuildTrace('subtract-before', traceId, { cost, method: 'setMoney', expectedAfter });
   if (before < cost) {
     return {
       ok: false,
@@ -436,19 +479,22 @@ async function chargeDealCost(cost: number): Promise<
   }
 
   try {
-    actions.subtractMoney(cost, 'TOD Deal');
+    // In some game builds subtractMoney emits the requested category debit
+    // and then a second generic "other" debit. Set the exact target balance
+    // instead so TOD never briefly drives the player negative or needs a
+    // corrective money mutation in the middle of a sim tick.
+    actions.setMoney(expectedAfter);
     scheduleBudgetSamples(traceId);
   } catch (err) {
-    console.warn('[sb-tod] subtractMoney failed:', err);
-    recordBuildTrace('build-failed', traceId, { cost, reason: 'subtractMoney threw', error: String(err) });
+    console.warn('[sb-tod] setMoney charge failed:', err);
+    recordBuildTrace('build-failed', traceId, { cost, reason: 'setMoney charge threw', error: String(err) });
     return { ok: false, message: 'Could not charge the TOD deal cost.' };
   }
 
-  const expectedAfter = before - cost;
-  await new Promise((resolve) => window.setTimeout(resolve, 100));
+  await new Promise((resolve) => window.setTimeout(resolve, 0));
   let after = safeBudget();
   const observedDelta = before - after;
-  recordBuildTrace('subtract-after', traceId, { cost, expectedAfter, observedDelta });
+  recordBuildTrace('subtract-after', traceId, { cost, method: 'setMoney', expectedAfter, observedDelta });
 
   if (Math.abs(after - expectedAfter) > 1) {
     after = await setBudgetExactly(expectedAfter, traceId, {
@@ -534,6 +580,9 @@ export function TodPanel() {
   const [proposalKind, setProposalKind] = useState<DealKind>('housing');
   const [proposalTier, setProposalTier] = useState<DealTier>('S');
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [flightRecorderArmed, setFlightRecorderArmed] = useState(() =>
+    isFlightRecorderEnabled()
+  );
   const [dealVersion, setDealVersion] = useState(0);
   const [buildPending, setBuildPending] = useState(false);
   const [themeStyle, setThemeStyle] = useState<TodThemeStyle>(() => readTodThemeStyle());
@@ -541,8 +590,24 @@ export function TodPanel() {
   const buildInFlightRef = useRef(false);
 
   useEffect(() => {
+    if (!isFlightRecorderEnabled()) return;
     ensureRuntimeTraceSampler();
     sampleRuntimeTrace('panel-open');
+  }, []);
+
+  const toggleFlightRecorder = useCallback((enabled: boolean) => {
+    setFlightRecorderEnabled(enabled);
+    setFlightRecorderArmed(enabled);
+    if (enabled) {
+      ensureRuntimeTraceSampler();
+      sampleRuntimeTrace('flight-recorder-enabled');
+    }
+  }, []);
+
+  const clearFlightRecorderEntries = useCallback(() => {
+    clearFlightRecorder();
+    recordFlightEvent('flight-recorder.cleared', undefined, { includeGame: true });
+    setDealVersion((v) => v + 1);
   }, []);
 
   useEffect(() => {
@@ -590,6 +655,14 @@ export function TodPanel() {
     setDealVersion((v) => v + 1);
   }, []);
 
+  const scheduleRefresh = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      window.setTimeout(refresh, 0);
+      return;
+    }
+    void Promise.resolve().then(refresh);
+  }, [refresh]);
+
   const clearSelection = useCallback(() => {
     clearHighlight();
     setHighlighted(null);
@@ -632,6 +705,14 @@ export function TodPanel() {
     async (row: ScoredStation, kind: DealKind, tier: DealTier) => {
       const lockToken = buildLockToken(row, kind, tier);
       const enterTraceId = nextMoneyTraceId();
+      recordFlightEvent('build.confirm.enter', {
+        traceId: enterTraceId,
+        lockToken,
+        stationId: row.id,
+        stationName: row.name,
+        kind,
+        tier,
+      });
       if (buildInFlightRef.current) {
         recordBuildTrace('build-rejected', enterTraceId, {
           lockToken,
@@ -660,6 +741,7 @@ export function TodPanel() {
       setBuildPending(true);
       let started = false;
       let charged = false;
+      recordFlightEvent('build.lock.acquired', { traceId: enterTraceId, lockToken });
       recordBuildTrace('build-enter', enterTraceId, {
         lockToken,
         stationId: row.id,
@@ -669,17 +751,31 @@ export function TodPanel() {
         day: safeCurrentDay(),
       });
       try {
+        recordFlightEvent('build.demand-read.start', { traceId: enterTraceId });
         const demand = gameState.getDemandData();
+        recordFlightEvent('build.demand-read.end', {
+          traceId: enterTraceId,
+          points: demand.points?.size ?? null,
+          pops: demand.popsMap?.size ?? null,
+        });
         const state = getModState();
-        const ready = await state.ensureInit(demand);
-        const sectionKind = sectionKindForDeal(kind);
-        selectStation(row, sectionKind);
+        recordFlightEvent('build.ensure-init.start', {
+          traceId: enterTraceId,
+          alreadyReady: state.isReady(),
+        });
+        const ready = state.isReady() || (await state.ensureInit(demand));
+        recordFlightEvent('build.ensure-init.end', { traceId: enterTraceId, ready });
 
         if (!ready) {
           ui.showNotification('TOD state is not ready yet. Try again after the next game day tick.', 'warning');
           return;
         }
 
+        recordFlightEvent('build.validate.start', {
+          traceId: enterTraceId,
+          budget: safeBudget(),
+          radiusMeters: HIGHLIGHT_RADIUS_M,
+        });
         const proposal = validateProposal({
           kind,
           tier,
@@ -688,6 +784,13 @@ export function TodPanel() {
           walkshedPoints: demand.points.values(),
           budget: safeBudget(),
           costMultiplier: DEAL_COST_MULTIPLIER,
+        });
+        recordFlightEvent('build.validate.end', {
+          traceId: enterTraceId,
+          ok: proposal.ok,
+          reason: proposal.ok ? null : proposal.reason,
+          eligiblePoints: proposal.ok ? proposal.eligiblePoints.length : 0,
+          totalCost: proposal.ok ? proposal.totalCost : null,
         });
         if (!proposal.ok) {
           ui.showNotification(`Cannot build at ${displayName(row.name, row.id)}: ${proposal.message}`, 'warning');
@@ -702,8 +805,33 @@ export function TodPanel() {
           centerLngLat: row.center,
           radiusMeters: HIGHLIGHT_RADIUS_M,
         });
+        const duplicateDeal = findDuplicateDevelopment(state.getDeals(), deal);
+        if (duplicateDeal) {
+          recordFlightEvent('build.duplicate.rejected', {
+            traceId: enterTraceId,
+            dealId: deal.id,
+            duplicateDealId: duplicateDeal.id,
+            duplicateState: duplicateDeal.state,
+          });
+          ui.showNotification(
+            `TOD development already funded at ${displayName(row.name, row.id)} for day ${deal.startDay}.`,
+            'info'
+          );
+          return;
+        }
 
+        recordFlightEvent('build.charge.start', {
+          traceId: enterTraceId,
+          dealId: deal.id,
+          cost: deal.totalCost,
+        });
         const charge = await chargeDealCost(deal.totalCost);
+        recordFlightEvent('build.charge.end', {
+          traceId: enterTraceId,
+          dealId: deal.id,
+          ok: charge.ok,
+          chargeTraceId: charge.ok ? charge.audit.traceId : null,
+        });
         if (!charge.ok) {
           ui.showNotification(`Cannot build at ${displayName(row.name, row.id)}: ${charge.message}`, 'warning');
           return;
@@ -713,9 +841,23 @@ export function TodPanel() {
 
         let stored = false;
         try {
+          recordFlightEvent('build.add-deal.start', {
+            traceId: charge.audit.traceId ?? enterTraceId,
+            dealId: deal.id,
+          });
           stored = await state.addDeal(deal);
+          recordFlightEvent('build.add-deal.end', {
+            traceId: charge.audit.traceId ?? enterTraceId,
+            dealId: deal.id,
+            stored,
+          });
         } catch (err) {
           console.warn('[sb-tod] addDeal threw after charging:', err);
+          recordFlightEvent('build.add-deal.throw', {
+            traceId: charge.audit.traceId ?? enterTraceId,
+            dealId: deal.id,
+            error: String(err),
+          });
           recordBuildTrace('build-failed', charge.audit.traceId ?? nextMoneyTraceId(), {
             dealId: deal.id,
             cost: deal.totalCost,
@@ -740,19 +882,20 @@ export function TodPanel() {
           dealId: deal.id,
           cost: deal.totalCost,
         });
-        setSnapshot(readSnapshot());
         setDealVersion((v) => v + 1);
-        ui.showNotification(
-          `Started ${deal.kind}/${deal.tier} at ${displayName(row.name, row.id)}: ${dealSummary(deal)} over ${deal.durationDays} days.`,
-          'success'
-        );
       } finally {
         buildInFlightRef.current = false;
-        releaseBuildLock(lockToken, started || charged);
+        releaseBuildLock(lockToken, charged && !started);
         setBuildPending(false);
+        recordFlightEvent('build.confirm.finally', {
+          traceId: enterTraceId,
+          lockToken,
+          started,
+          charged,
+        });
       }
     },
-    [selectStation]
+    []
   );
 
   // ESC clears a selected pin before the game handles the key for panel chrome.
@@ -805,11 +948,8 @@ export function TodPanel() {
 
   useEffect(() => {
     if (!autoRefresh) return undefined;
-    return subscribeDayChange(() => {
-      setSnapshot(readSnapshot());
-      setDealVersion((v) => v + 1);
-    });
-  }, [autoRefresh]);
+    return subscribeDayChange(scheduleRefresh);
+  }, [autoRefresh, scheduleRefresh]);
 
   const topResidential = useMemo(
     () =>
@@ -850,10 +990,23 @@ export function TodPanel() {
   const dealStats = useMemo(() => summarizeDeals(deals), [deals]);
   const stateStats = useMemo(() => getModState().stats(), [snapshot, dealVersion]);
   const persistenceBlocked = stateStats.storageRoundTripOk === false;
+  const buildDay = Math.max(snapshot.currentDay, safeCurrentDay());
   const proposalPreview = useMemo(
     () => (selectedStation ? readProposalPreview(selectedStation, proposalKind, proposalTier) : null),
     [selectedStation, proposalKind, proposalTier, snapshot, dealVersion]
   );
+  const duplicateDevelopment = useMemo(() => {
+    if (!selectedStation || proposalPreview?.ok !== true) return null;
+    return findDuplicateDevelopment(getModState().getDeals(), {
+      kind: proposalKind,
+      tier: proposalTier,
+      centerStationGroupId: selectedStation.id,
+      startDay: buildDay,
+      durationDays: proposalPreview.durationDays,
+      totalDensity: proposalPreview.totalDensity,
+      totalCost: proposalPreview.totalCost,
+    });
+  }, [selectedStation, proposalKind, proposalTier, proposalPreview, buildDay, dealVersion]);
 
   return (
     <div ref={panelRef} className="text-sm" style={{ ...panelStyle, ...themeStyle }}>
@@ -892,6 +1045,8 @@ export function TodPanel() {
         proposalKind={proposalKind}
         proposalTier={proposalTier}
         proposalPreview={proposalPreview}
+        duplicateDevelopment={duplicateDevelopment}
+        buildDay={buildDay}
         persistenceBlocked={persistenceBlocked}
         buildPending={buildPending}
         onKindChange={setProposalKind}
@@ -967,7 +1122,7 @@ export function TodPanel() {
         onCancel={(deal) => {
           if (!getModState().cancelDeal(deal.id)) return;
           setDealVersion((v) => v + 1);
-          setSnapshot(readSnapshot());
+          scheduleRefresh();
         }}
       />
 
@@ -982,11 +1137,22 @@ export function TodPanel() {
             />
             Auto-refresh each day
           </label>
+          <label style={checkboxLabelStyle}>
+            <input
+              type="checkbox"
+              checked={flightRecorderArmed}
+              onChange={(e) => toggleFlightRecorder(e.currentTarget.checked)}
+            />
+            Freeze trace
+          </label>
           <CalibrationSummary calibration={snapshot.calibration} />
           <StateSummary />
           <div style={{ display: 'flex', gap: 8 }}>
             <Button variant="secondary" onClick={() => downloadDebug(snapshot)}>
               Debug DL
+            </Button>
+            <Button variant="secondary" onClick={clearFlightRecorderEntries}>
+              Clear trace
             </Button>
           </div>
         </div>
@@ -1000,6 +1166,8 @@ function BuildSection({
   proposalKind,
   proposalTier,
   proposalPreview,
+  duplicateDevelopment,
+  buildDay,
   persistenceBlocked,
   buildPending,
   onKindChange,
@@ -1010,6 +1178,8 @@ function BuildSection({
   proposalKind: DealKind;
   proposalTier: DealTier;
   proposalPreview: ProposalResult | null;
+  duplicateDevelopment: Deal | null;
+  buildDay: number;
   persistenceBlocked: boolean;
   buildPending: boolean;
   onKindChange: (kind: DealKind) => void;
@@ -1022,12 +1192,14 @@ function BuildSection({
   const previewText =
     persistenceBlocked
       ? 'Persistence unavailable; new deals are disabled.'
+      : duplicateDevelopment
+      ? `Already funded on day ${buildDay} (${duplicateDevelopment.state}).`
       : proposalPreview == null
       ? `${fmtMoney(Math.round(tierConfig.cost * DEAL_COST_MULTIPLIER))} · ${densitySummary(tierConfig.totalDensity)} · ${tierConfig.duration} days`
       : proposalPreview.ok
         ? `${fmtMoney(proposalPreview.totalCost)} · ${densitySummary(proposalPreview.totalDensity)} · ${proposalPreview.durationDays} days · ${proposalPreview.eligiblePoints.length} points`
         : proposalPreview.message;
-  const buildDisabled = buildPending || !station || !previewOk || persistenceBlocked;
+  const buildDisabled = buildPending || !station || !previewOk || persistenceBlocked || !!duplicateDevelopment;
 
   return (
     <section style={{ ...buildPanelStyle, borderColor: `${color}55` }}>
@@ -1413,6 +1585,7 @@ function StateSummary() {
     ? `stored · kept ${stats.lastHydrate.preserved} · replayed ${stats.lastHydrate.replayed} · shifted ${stats.lastHydrate.baselineShift}`
     : 'fresh';
   const trace = runtimeTraceSnapshot();
+  const flight = flightRecorderSnapshot();
   const lastTrace = trace[trace.length - 1];
   const traceGameTime =
     lastTrace?.game.currentHour == null
@@ -1438,6 +1611,10 @@ function StateSummary() {
       <DiagnosticRow
         label="Trace"
         value={`${trace.length.toLocaleString()} samples${traceGameTime}`}
+      />
+      <DiagnosticRow
+        label="Freeze trace"
+        value={`${flight.enabled ? 'armed' : 'off'} · ${flight.count.toLocaleString()} events`}
       />
     </div>
   );
@@ -2072,6 +2249,11 @@ const diagnosticValueStyle: React.CSSProperties = {
 };
 
 function downloadDebug(snapshot: Snapshot) {
+  recordFlightEvent('debug.download.start', {
+    stations: snapshot.stations,
+    demandPoints: snapshot.demandPoints,
+    pops: snapshot.pops,
+  });
   sampleRuntimeTrace('debug-download', {
     includeCompletedCommutes: true,
     fullScan: true,
@@ -2104,9 +2286,10 @@ function downloadDebug(snapshot: Snapshot) {
     .map(dump);
   const state = getModState();
   const runtimeTrace = runtimeTraceSnapshot();
+  const flightRecorder = flightRecorderSnapshot();
   const payload = {
     timestamp: new Date().toISOString(),
-    bundleVersion: 'panel-v26-runtime-freeze-trace',
+    bundleVersion: 'panel-v43-save-slot-self-heal',
     counts: {
       stations: snapshot.stations,
       demandPoints: snapshot.demandPoints,
@@ -2125,7 +2308,9 @@ function downloadDebug(snapshot: Snapshot) {
     deals: state.getDeals(),
     moneyTrace: moneyTraceSnapshot(),
     runtimeTrace,
+    flightRecorder,
     runtimeProbe: probeRuntimeState(runtimeTrace),
+    flightRecorderProbe: probeFlightRecorder(flightRecorder),
     groupProbe: probeStationGroups(snapshot.scored),
     demandShapeProbe: probeDemandShape(),
     demandIntegrity: probeDemandIntegrity(state),
@@ -2223,6 +2408,22 @@ function probeRuntimeState(runtimeTrace: ReturnType<typeof runtimeTraceSnapshot>
     completedCommutes: describe(() => summarizeCompletedCommutes(gameState.getCompletedCommutes())),
     traceCount: runtimeTrace.length,
     traceTail: runtimeTrace.slice(-20),
+  };
+}
+
+function probeFlightRecorder(flight: ReturnType<typeof flightRecorderSnapshot>): unknown {
+  const byType: Record<string, number> = {};
+  for (const entry of flight.entries) {
+    byType[entry.type] = (byType[entry.type] ?? 0) + 1;
+  }
+  return {
+    enabled: flight.enabled,
+    count: flight.count,
+    firstSeq: flight.entries[0]?.seq ?? null,
+    lastSeq: flight.entries[flight.entries.length - 1]?.seq ?? null,
+    lastType: flight.entries[flight.entries.length - 1]?.type ?? null,
+    byType,
+    tail: flight.entries.slice(-80),
   };
 }
 
@@ -2419,6 +2620,12 @@ function probeSplitTiming(state: ReturnType<typeof getModState>): unknown {
       missingRouteId: 0,
       missingStopId: 0,
     };
+    const departureAnomalies: Record<string, number> = {
+      badHomeDepartures: 0,
+      badWorkDepartures: 0,
+      boundaryHomeDepartures: 0,
+      boundaryWorkDepartures: 0,
+    };
     const splitSamples: unknown[] = [];
     const anomalyExamples: unknown[] = [];
     const upcoming: unknown[] = [];
@@ -2440,6 +2647,16 @@ function probeSplitTiming(state: ReturnType<typeof getModState>): unknown {
       bumpCount(originCounts, originId);
       bumpSized(homeDepartureHours, hourBucket(pop.homeDepartureTime), size);
       bumpSized(workDepartureHours, hourBucket(pop.workDepartureTime), size);
+      if (typeof pop.homeDepartureTime !== 'number' || !Number.isFinite(pop.homeDepartureTime)) {
+        departureAnomalies.badHomeDepartures++;
+      } else if (pop.homeDepartureTime <= 0 || pop.homeDepartureTime >= 86_399) {
+        departureAnomalies.boundaryHomeDepartures++;
+      }
+      if (typeof pop.workDepartureTime !== 'number' || !Number.isFinite(pop.workDepartureTime)) {
+        departureAnomalies.badWorkDepartures++;
+      } else if (pop.workDepartureTime <= 0 || pop.workDepartureTime >= 86_399) {
+        departureAnomalies.boundaryWorkDepartures++;
+      }
 
       const residence = demand.points.get(pop.residenceId);
       const job = demand.points.get(pop.jobId);
@@ -2563,6 +2780,7 @@ function probeSplitTiming(state: ReturnType<typeof getModState>): unknown {
       pathDepartureHours,
       pathArrivalHours,
       pathAnomalies,
+      departureAnomalies,
       endpointCounts: topCountMap(endpointCounts),
       topOriginCounts: topCountMap(originCounts),
       topRouteIds: topCountMap(routeCounts),

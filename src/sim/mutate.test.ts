@@ -593,7 +593,7 @@ describe('strict unit-size mode', () => {
     expect(demand.popsMap.get(splitIds[0])!.size).toBe(200);
   });
 
-  it('split children are one-sided, deep-cloned, and departure-staggered', () => {
+  it('split children are one-sided, path-cached, and departure-staggered', () => {
     const P = point('P', 0, 200, ['x']);
     const Q = point('Q', 200, 0, []);
     const x = pop('x', 'P', 'Q', 200);
@@ -625,9 +625,87 @@ describe('strict unit-size mode', () => {
     expect(child!.lastCommute.modeChoice).not.toBe(x.lastCommute.modeChoice);
     expect(child!.homeDepartureTime).not.toBe(x.homeDepartureTime);
     expect(child!.workDepartureTime).not.toBe(x.workDepartureTime);
-    expect(child!.lastCommute.transitPaths[0].departureTime).not.toBe(
-      x.lastCommute.transitPaths[0].departureTime
-    );
+    expect(child!.lastCommute.transitPaths).not.toBe(x.lastCommute.transitPaths);
+    expect(child!.lastCommute.transitPaths[0].departureTime).toBe(30_517);
+    expect(child!.lastCommute.transitPaths[0].arrivalTime).toBe(31_417);
+    expect(child!.lastCommute.transitPaths[0].routeId).toBe('r');
+  });
+
+  it('does not leave split children in transit mode without a cached path', () => {
+    const P = point('P', 0, 200, ['x']);
+    const Q = point('Q', 200, 0, []);
+    const x = pop('x', 'P', 'Q', 200);
+    x.lastCommute.modeChoice = { walking: 0, driving: 4, transit: 196, unknown: 0 };
+    const demand = fixture([P, Q], [x]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    m.applyDensityDelta('P', { residents: 400 }, 'deals');
+
+    const child = [...demand.popsMap.values()].find((p) => p.id.startsWith(SPLIT_POP_PREFIX));
+    expect(child).toBeDefined();
+    expect(child!.lastCommute.transitPaths).toEqual([]);
+    expect(child!.lastCommute.modeChoice.transit).toBe(0);
+    expect(child!.lastCommute.modeChoice.driving).toBeCloseTo(200, 8);
+  });
+
+  it('drops malformed cached transit paths before split children inherit them', () => {
+    const P = point('P', 0, 200, ['x']);
+    const Q = point('Q', 200, 0, []);
+    const x = pop('x', 'P', 'Q', 200);
+    x.lastCommute.modeChoice = { walking: 0, driving: 3, transit: 197, unknown: 0 };
+    x.lastCommute.transitPaths = [
+      {
+        fromStopCoords: [-122, 37],
+        toStopCoords: [-122.1, 37.1],
+        fromStopId: 'a',
+        toStopId: 'b',
+        isDriving: false,
+        isWalking: false,
+        routeId: '',
+      } as any,
+    ];
+    const demand = fixture([P, Q], [x]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    m.applyDensityDelta('P', { residents: 400 }, 'deals');
+
+    const child = [...demand.popsMap.values()].find((p) => p.id.startsWith(SPLIT_POP_PREFIX));
+    expect(child).toBeDefined();
+    expect(child!.lastCommute.transitPaths).toEqual([]);
+    expect(child!.lastCommute.modeChoice.transit).toBe(0);
+    expect(child!.lastCommute.modeChoice.driving).toBeCloseTo(200, 8);
+  });
+
+  it('wraps split-child staggered departures around midnight instead of clamping', () => {
+    const P = point('P', 0, 200, ['38']);
+    const Q = point('Q', 200, 0, []);
+    const x = pop('38', 'P', 'Q', 200);
+    x.homeDepartureTime = 300;
+    x.workDepartureTime = 300;
+    x.lastCommute.transitPaths = [
+      {
+        departureTime: 100,
+        arrivalTime: 500,
+        fromStopCoords: [-122, 37],
+        toStopCoords: [-122.1, 37.1],
+        fromStopId: 'a',
+        toStopId: 'b',
+        isDriving: false,
+        isWalking: false,
+        routeId: 'r',
+      },
+    ];
+    const demand = fixture([P, Q], [x]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+
+    m.applyDensityDelta('P', { residents: 200 }, 'deals');
+
+    const child = demand.popsMap.get(`${SPLIT_POP_PREFIX}38:0`);
+    expect(child).toBeDefined();
+    expect(child!.homeDepartureTime).toBe(85_033);
+    expect(child!.workDepartureTime).toBe(85_033);
+    expect(child!.lastCommute.transitPaths[0].departureTime).toBe(84_833);
+    expect(child!.lastCommute.transitPaths[0].arrivalTime).toBe(85_233);
   });
 
   it('job deltas attach split children to the job endpoint only', () => {

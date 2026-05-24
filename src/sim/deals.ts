@@ -401,6 +401,41 @@ export function confirmProposal(input: ConfirmProposalInput): Deal {
   };
 }
 
+export interface DevelopmentIdentity {
+  kind: DealKind;
+  tier: DealTier;
+  centerStationGroupId: string;
+  startDay: number;
+  durationDays: number;
+  totalDensity: DealTotalDensity;
+  totalCost: number;
+}
+
+export function developmentIdentityKey(input: DevelopmentIdentity): string {
+  return [
+    input.centerStationGroupId,
+    input.kind,
+    input.tier,
+    input.startDay,
+    input.durationDays,
+    input.totalDensity.residents,
+    input.totalDensity.jobs,
+    input.totalCost,
+  ].join('|');
+}
+
+export function findDuplicateDevelopment(
+  deals: Iterable<Deal>,
+  candidate: DevelopmentIdentity
+): Deal | null {
+  const key = developmentIdentityKey(candidate);
+  for (const deal of deals) {
+    if (deal.state === 'cancelled') continue;
+    if (developmentIdentityKey(deal) === key) return deal;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Daily tick — distribute today's portion across walkshed points
 // ---------------------------------------------------------------------------

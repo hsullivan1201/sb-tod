@@ -40,7 +40,7 @@ function fixture(points: DemandPoint[], pops: Pop[]): DemandData {
   };
 }
 
-function makeStorage(): StorageLike & { _data: Map<string, unknown> } {
+function makeStorage(): StorageLike & { _data: Map<string, unknown>; keys(): Promise<string[]> } {
   const data = new Map<string, unknown>();
   return {
     _data: data,
@@ -53,6 +53,9 @@ function makeStorage(): StorageLike & { _data: Map<string, unknown> } {
     },
     async delete(key) {
       data.delete(key);
+    },
+    async keys() {
+      return [...data.keys()];
     },
   };
 }
@@ -324,7 +327,7 @@ describe('mod state — lifecycle hooks', () => {
     expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(false);
   });
 
-  it('persists on day tick when dirty (configurable cadence)', async () => {
+  it('defers dirty day-tick persistence until the game save hook', async () => {
     const storage = makeStorage();
     const A = point('P', 100, 1000);
     const x = pop('x', 'P', 'P', 50);
@@ -332,19 +335,24 @@ describe('mod state — lifecycle hooks', () => {
       mutatorOptions: {},
       storage,
       getDemand: () => fixture([A], [x]),
-      persistEveryNDays: 1,
     });
     await state.ensureInit();
     state.applyDensityDelta('P', { residents: 50 }, 'deals');
     expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(false);
 
     state.onDayTick(5);
-    // tick is sync but persist is async — wait a microtask.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(false);
+    expect(state.stats().lastDay).toBe(5);
+    expect(state.stats().dayTicks).toBe(1);
+    expect(state.stats().dirty).toBe(true);
+
+    state.onGameSavedFired('_unsaved');
     await Promise.resolve();
     await Promise.resolve();
     expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(true);
-    expect(state.stats().lastDay).toBe(5);
-    expect(state.stats().dayTicks).toBe(1);
+    expect(state.stats().dirty).toBe(false);
   });
 
   it('does not persist when not dirty', async () => {
@@ -406,6 +414,39 @@ describe('mod state — lifecycle hooks', () => {
     expect(freshPoint.residents).toBe(2000);
     expect(stalePoint.residents).toBe(1000);
     expect(state.stats().lastTickReports[0].applied.residents).toBe(1000);
+  });
+
+  it('does not replay preserved old deltas during a routine DemandData rebind', async () => {
+    const storage = makeStorage();
+    const P = point('P', 0, 600);
+    let liveDemand = fixture(
+      [P],
+      [pop('a', 'P', 'P', 200), pop('b', 'P', 'P', 200), pop('c', 'P', 'P', 200)]
+    );
+    const state = createModState({
+      storage,
+      getDemand: () => liveDemand,
+    });
+    await state.ensureInit();
+    state.applyDensityDelta('P', { residents: 200 }, 'deals');
+    expect(liveDemand.popsMap.size).toBe(4);
+
+    // The game handed the mod a fresh DemandData object where the point
+    // aggregate is preserved but split children are absent. A normal day
+    // tick should rebuild internal tracking without rematerializing every
+    // old persisted split child in the hot path.
+    const freshPoint = point('P', 0, 800);
+    liveDemand = fixture(
+      [freshPoint],
+      [pop('a', 'P', 'P', 200), pop('b', 'P', 'P', 200), pop('c', 'P', 'P', 200)]
+    );
+
+    state.onDayTick(7);
+
+    expect(state.stats().lastHydrate?.preserved).toBe(1);
+    expect(freshPoint.residents).toBe(800);
+    expect(liveDemand.popsMap.size).toBe(3);
+    expect(state.mutator().getCumulativeDeltaTotal('P')).toEqual({ jobs: 0, residents: 200 });
   });
 
   it('cancels and refunds a zero-progress active deal when it loads with negative budget', async () => {
@@ -482,6 +523,12 @@ describe('mod state — applyDensityDelta + revert', () => {
     state.onDayTick(1);
     await Promise.resolve();
     await Promise.resolve();
+    expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(false);
+    expect(state.stats().dirty).toBe(true);
+
+    state.onGameEndFired();
+    await Promise.resolve();
+    await Promise.resolve();
     expect(storage._data.has('sb-tod:state:v1:_unsaved')).toBe(true);
   });
 
@@ -553,6 +600,159 @@ describe('mod state — applyDensityDelta + revert', () => {
     expect(state.mutator().getCumulativeDeltaTotal('P')).toEqual({ jobs: 0, residents: 0 });
   });
 
+  it('migrates richer legacy _unsaved state when the named save slot is skinny', async () => {
+    const storage = makeStorage();
+    const legacyDeal = deal('legacy-deal', { state: 'completed' });
+    const namedOnlyDeal = deal('named-deal', {
+      centerStationGroupId: 'Q',
+      centerStationGroupName: 'Q',
+    });
+    const legacyState: PersistedState = {
+      version: 1,
+      savedAt: Date.now() - 10_000,
+      baselineDemand: [['P', { jobs: 100, residents: 1000 }]],
+      baselinePopSizes: [['x', 50]],
+      cumulativeDeltas: [
+        [
+          'P',
+          {
+            jobs: { fromDeals: 0, fromOrganic: 0 },
+            residents: { fromDeals: 200, fromOrganic: 0 },
+          },
+        ],
+      ],
+      deals: [legacyDeal],
+    };
+    const skinnyNamedState: PersistedState = {
+      version: 1,
+      savedAt: Date.now(),
+      baselineDemand: [],
+      baselinePopSizes: [],
+      cumulativeDeltas: [],
+      deals: [namedOnlyDeal],
+    };
+    await storage.set('sb-tod:state:v1:_unsaved', legacyState);
+    await storage.set('sb-tod:state:v1:alpha', skinnyNamedState);
+
+    const P = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => fixture([P], [x]),
+    });
+    await state.ensureInit();
+    expect(P.residents).toBe(1200);
+
+    await state.setCurrentSaveName('alpha');
+
+    expect(state.getCurrentSaveName()).toBe('alpha');
+    expect(state.mutator().getCumulativeDeltaTotal('P')).toEqual({ jobs: 0, residents: 200 });
+    expect(state.getDeals().map((d) => d.id)).toEqual(['legacy-deal', 'named-deal']);
+    expect(state.stats().dirty).toBe(true);
+
+    state.onGameSavedFired('alpha');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const stored = storage._data.get('sb-tod:state:v1:alpha') as PersistedState;
+    expect(stored.cumulativeDeltas).toHaveLength(1);
+    expect(stored.deals?.map((d) => d.id)).toEqual(['legacy-deal', 'named-deal']);
+  });
+
+  it('chooses the richest compatible existing slot when a new save name has no TOD key yet', async () => {
+    const storage = makeStorage();
+    const fallbackDeal = deal('fallback-deal', { state: 'completed' });
+    const richDealA = deal('rich-deal-a', {
+      state: 'completed',
+      centerStationGroupId: 'P',
+      centerStationGroupName: 'P',
+      totalDensity: { residents: 200, jobs: 0 },
+    });
+    const richDealB = deal('rich-deal-b', {
+      state: 'completed',
+      centerStationGroupId: 'Q',
+      centerStationGroupName: 'Q',
+      totalDensity: { residents: 800, jobs: 0 },
+    });
+    const fallbackState: PersistedState = {
+      version: 1,
+      savedAt: Date.now() - 10_000,
+      baselineDemand: [['P', { jobs: 100, residents: 1000 }]],
+      baselinePopSizes: [],
+      cumulativeDeltas: [
+        [
+          'P',
+          {
+            jobs: { fromDeals: 0, fromOrganic: 0 },
+            residents: { fromDeals: 200, fromOrganic: 0 },
+          },
+        ],
+      ],
+      deals: [fallbackDeal],
+    };
+    const richState: PersistedState = {
+      version: 1,
+      savedAt: Date.now() - 5_000,
+      baselineDemand: [
+        ['P', { jobs: 100, residents: 1000 }],
+        ['Q', { jobs: 100, residents: 1000 }],
+      ],
+      baselinePopSizes: [],
+      cumulativeDeltas: [
+        [
+          'P',
+          {
+            jobs: { fromDeals: 0, fromOrganic: 0 },
+            residents: { fromDeals: 200, fromOrganic: 0 },
+          },
+        ],
+        [
+          'Q',
+          {
+            jobs: { fromDeals: 0, fromOrganic: 0 },
+            residents: { fromDeals: 800, fromOrganic: 0 },
+          },
+        ],
+      ],
+      deals: [richDealA, richDealB],
+    };
+    await storage.set('sb-tod:state:v1:_unsaved', fallbackState);
+    await storage.set('sb-tod:state:v1:old-save', richState);
+
+    let liveName: string | null = null;
+    let liveDemand = fixture([point('P', 100, 1000), point('Q', 100, 1000)], []);
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => liveDemand,
+      getSaveName: () => liveName,
+    });
+    await state.ensureInit();
+    expect(state.getDeals().map((d) => d.id)).toEqual(['fallback-deal']);
+
+    // The game announces a just-created save name after the old save has
+    // loaded. Its TOD key does not exist yet, but the live city matches
+    // the richer old slot, not the fallback _unsaved payload.
+    liveName = 'new-copy';
+    liveDemand = fixture([point('P', 100, 1200), point('Q', 100, 1800)], []);
+    await state.ensureInit();
+
+    expect(state.getCurrentSaveName()).toBe('new-copy');
+    expect(state.mutator().getCumulativeDeltaTotal('P')).toEqual({ jobs: 0, residents: 200 });
+    expect(state.mutator().getCumulativeDeltaTotal('Q')).toEqual({ jobs: 0, residents: 800 });
+    expect(state.getDeals().map((d) => d.id)).toEqual(['rich-deal-a', 'rich-deal-b']);
+    expect(state.stats().dirty).toBe(true);
+
+    state.onGameSavedFired('new-copy');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const stored = storage._data.get('sb-tod:state:v1:new-copy') as PersistedState;
+    expect(stored.cumulativeDeltas.map(([id]) => id).sort()).toEqual(['P', 'Q']);
+    expect(stored.deals?.map((d) => d.id)).toEqual(['rich-deal-a', 'rich-deal-b']);
+  });
+
   it('onGameSavedFired with a new name updates the slot before persisting (save-as)', async () => {
     const storage = makeStorage();
     const A = point('P', 100, 1000);
@@ -598,7 +798,7 @@ describe('mod state — applyDensityDelta + revert', () => {
     expect(storage._data.has('sb-tod:state:v1:alpha-copy')).toBe(true);
   });
 
-  it('rejects new deals when persistence cannot round-trip', async () => {
+  it('accepts new deals before storage round-trip and reports save failure later', async () => {
     const A = point('P', 100, 1000);
     const state = createModState({
       mutatorOptions: {},
@@ -607,12 +807,66 @@ describe('mod state — applyDensityDelta + revert', () => {
     });
     await state.ensureInit();
 
-    expect(await state.addDeal(deal())).toBe(false);
-    expect(state.getDeals()).toHaveLength(0);
+    expect(await state.addDeal(deal())).toBe(true);
+    expect(state.getDeals()).toHaveLength(1);
+    expect(state.stats().dirty).toBe(true);
+
+    state.onGameSavedFired('_unsaved');
+    await Promise.resolve();
+    await Promise.resolve();
     expect(state.stats().storageRoundTripOk).toBe(false);
+    expect(state.stats().dirty).toBe(true);
   });
 
-  it('returns false and removes the pending deal if demand refresh throws during addDeal persist', async () => {
+  it('rejects duplicate same-day development deals before they enter state', async () => {
+    const A = point('P', 100, 1000);
+    const state = createModState({
+      mutatorOptions: {},
+      storage: makeStorage(),
+      getDemand: () => fixture([A], []),
+    });
+    await state.ensureInit();
+
+    expect(await state.addDeal(deal('deal-a'))).toBe(true);
+    expect(await state.addDeal(deal('deal-b'))).toBe(false);
+    expect(state.getDeals().map((d) => d.id)).toEqual(['deal-a']);
+  });
+
+  it('suppresses persisted duplicate active deals before applying a day tick', async () => {
+    const storage = makeStorage();
+    const duplicateA = deal('deal-a', { startDay: 1, totalCost: 250_000 });
+    const duplicateB = deal('deal-b', { startDay: 1, totalCost: 250_000 });
+    const persisted: PersistedState = {
+      version: 1,
+      savedAt: Date.now(),
+      baselineDemand: [['P', { jobs: 100, residents: 1000 }]],
+      baselinePopSizes: [['x', 200]],
+      cumulativeDeltas: [],
+      deals: [duplicateA, duplicateB],
+    };
+    await storage.set('sb-tod:state:v1:_unsaved', persisted);
+
+    const refunds: number[] = [];
+    const P = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 200);
+    const state = createModState({
+      storage,
+      getDemand: () => fixture([P], [x]),
+      addMoney: (amount) => refunds.push(amount),
+    });
+    await state.ensureInit();
+
+    state.onDayTick(1);
+
+    expect(state.stats().lastTickReports.map((r) => r.dealId)).toEqual(['deal-a']);
+    expect(state.getDeals().map((d) => [d.id, d.state])).toEqual([
+      ['deal-a', 'completed'],
+      ['deal-b', 'cancelled'],
+    ]);
+    expect(refunds).toEqual([250_000]);
+  });
+
+  it('does not refresh demand while accepting a new deal', async () => {
     const A = point('P', 100, 1000);
     const demand = fixture([A], []);
     const storage = makeStorage();
@@ -628,10 +882,10 @@ describe('mod state — applyDensityDelta + revert', () => {
     await state.ensureInit();
 
     throwOnDemand = true;
-    await expect(state.addDeal(deal())).resolves.toBe(false);
+    await expect(state.addDeal(deal())).resolves.toBe(true);
 
-    expect(state.getDeals()).toHaveLength(0);
-    expect(state.stats().lastPersistOk).toBe(false);
+    expect(state.getDeals()).toHaveLength(1);
+    expect(state.stats().dirty).toBe(true);
   });
 
   it('does not mark dirty on failed mutation (ghost-town reject)', async () => {

@@ -27,9 +27,13 @@
  * mega-development (3 pops of size ~1967 on one point).
  *
  * Solution: when a pop's scaled size exceeds `splitThreshold`, clone
- * the pop N times (same residenceId, jobId, timing, mode share, etc.),
- * each with size = target / N. All N units board independently. The
- * original pop stays in popsMap as one of the N units; we track the
+ * the pop N times (same residenceId, jobId, mode share, etc.), each
+ * with size = target / N and staggered departure times. Synthetic
+ * children inherit a lightweight copy of the original cached transit
+ * path with times shifted to their staggered departure, so the game
+ * doesn't need to pathfind every child at commute time. All N units
+ * board independently. The original pop stays in popsMap as one of
+ * the N units; we track the
  * derived children in `splitChildren`.
  *
  * Reversal: setting the cumulative delta back to zero yields a target
@@ -44,6 +48,7 @@
  */
 
 import type { DemandData, DemandPoint, Pop, PointDelta } from '../types';
+import { recordFlightEvent } from '../diagnostics/flightRecorder';
 
 export type DeltaSourceKind = 'deals' | 'organic';
 
@@ -502,9 +507,10 @@ export function createMutator(
     }
   }
 
-  function clampDaySecond(value: number): number {
+  function wrapDaySecond(value: number): number {
     if (!Number.isFinite(value)) return 0;
-    return Math.max(0, Math.min(86_399, value));
+    const daySeconds = 86_400;
+    return ((value % daySeconds) + daySeconds) % daySeconds;
   }
 
   function hashString(s: string): number {
@@ -524,49 +530,196 @@ export function createMutator(
     return (hashString(childId) % 3601) - 1800;
   }
 
-  function deepClone<T>(value: T): T {
-    return JSON.parse(JSON.stringify(value)) as T;
+  function numberField(value: unknown, field: string): number {
+    if (!value || typeof value !== 'object') return 0;
+    const v = (value as Record<string, unknown>)[field];
+    return typeof v === 'number' && Number.isFinite(v) ? v : 0;
   }
 
-  function shiftCommuteTimes(value: unknown, offsetSeconds: number): void {
-    if (!value || typeof value !== 'object') return;
-    if (Array.isArray(value)) {
-      for (const item of value) shiftCommuteTimes(item, offsetSeconds);
-      return;
-    }
-    const obj = value as Record<string, unknown>;
-    for (const key of Object.keys(obj)) {
-      const v = obj[key];
-      if ((key === 'departureTime' || key === 'arrivalTime') && typeof v === 'number') {
-        obj[key] = clampDaySecond(v + offsetSeconds);
-      } else {
-        shiftCommuteTimes(v, offsetSeconds);
+  function finiteNumberField(value: unknown, field: string): number | null {
+    if (!value || typeof value !== 'object') return null;
+    const v = (value as Record<string, unknown>)[field];
+    return typeof v === 'number' && Number.isFinite(v) ? v : null;
+  }
+
+  function stringField(value: unknown, field: string): string {
+    if (!value || typeof value !== 'object') return '';
+    const v = (value as Record<string, unknown>)[field];
+    return typeof v === 'string' ? v : '';
+  }
+
+  function booleanField(value: unknown, field: string): boolean {
+    if (!value || typeof value !== 'object') return false;
+    return (value as Record<string, unknown>)[field] === true;
+  }
+
+  function coordinateField(value: unknown, field: string): [number, number] {
+    if (!value || typeof value !== 'object') return [0, 0];
+    const coord = (value as Record<string, unknown>)[field];
+    if (!Array.isArray(coord)) return [0, 0];
+    const lng = typeof coord[0] === 'number' && Number.isFinite(coord[0]) ? coord[0] : 0;
+    const lat = typeof coord[1] === 'number' && Number.isFinite(coord[1]) ? coord[1] : 0;
+    return [lng, lat];
+  }
+
+  function hasValidCoordinate(value: unknown, field: string): boolean {
+    if (!value || typeof value !== 'object') return false;
+    const coord = (value as Record<string, unknown>)[field];
+    return (
+      Array.isArray(coord) &&
+      typeof coord[0] === 'number' &&
+      Number.isFinite(coord[0]) &&
+      typeof coord[1] === 'number' &&
+      Number.isFinite(coord[1])
+    );
+  }
+
+  function cloneTransitPathsForSplit(
+    originalCommute: Pop['lastCommute'] | undefined,
+    offsetSeconds: number,
+    context?: { originalPopId: string; childId: string }
+  ): Pop['lastCommute']['transitPaths'] {
+    const paths = Array.isArray(originalCommute?.transitPaths)
+      ? originalCommute.transitPaths
+      : [];
+    const cloned: Pop['lastCommute']['transitPaths'] = [];
+    let dropped = 0;
+    for (const path of paths) {
+      const departureTime = finiteNumberField(path, 'departureTime');
+      const arrivalTime = finiteNumberField(path, 'arrivalTime');
+      const routeId = stringField(path, 'routeId');
+      const fromStopId = stringField(path, 'fromStopId');
+      const toStopId = stringField(path, 'toStopId');
+      if (
+        departureTime == null ||
+        arrivalTime == null ||
+        arrivalTime < departureTime ||
+        routeId.length === 0 ||
+        fromStopId.length === 0 ||
+        toStopId.length === 0 ||
+        !hasValidCoordinate(path, 'fromStopCoords') ||
+        !hasValidCoordinate(path, 'toStopCoords')
+      ) {
+        dropped++;
+        continue;
       }
+      const shiftedDeparture = wrapDaySecond(departureTime + offsetSeconds);
+      const shiftedArrival = wrapDaySecond(arrivalTime + offsetSeconds);
+      if (shiftedArrival < shiftedDeparture) {
+        dropped++;
+        continue;
+      }
+      cloned.push({
+        departureTime: shiftedDeparture,
+        arrivalTime: shiftedArrival,
+        fromStopCoords: coordinateField(path, 'fromStopCoords'),
+        fromStopId,
+        isDriving: booleanField(path, 'isDriving'),
+        isWalking: booleanField(path, 'isWalking'),
+        routeId,
+        toStopCoords: coordinateField(path, 'toStopCoords'),
+        toStopId,
+      });
     }
+    if (dropped > 0) {
+      recordFlightEvent(
+        'mutate.transit-paths.filtered',
+        context
+          ? {
+              ...context,
+              sourcePaths: paths.length,
+              clonedPaths: cloned.length,
+              dropped,
+              offsetSeconds,
+            }
+          : {
+              sourcePaths: paths.length,
+              clonedPaths: cloned.length,
+              dropped,
+              offsetSeconds,
+            },
+        { includeGame: false }
+      );
+    }
+    return cloned;
   }
 
-  function clonePopForSplit(originalPop: Pop, childId: string): Pop {
+  function cachedModeChoiceForSplit(
+    originalCommute: Pop['lastCommute'] | undefined,
+    targetSize: number,
+    transitPaths: Pop['lastCommute']['transitPaths']
+  ): Pop['lastCommute']['modeChoice'] {
+    const modeChoice = normalizeModeBreakdown(originalCommute?.modeChoice, targetSize);
+    if (modeChoice.transit > 0 && transitPaths.length === 0) {
+      // A synthetic pop with transit riders but no cached path asks the game
+      // to pathfind that new commute at departure time. On large saves those
+      // pathless split departures correlate with main-thread freezes, so fall
+      // back to the already-authored driving commute when no safe path exists.
+      modeChoice.driving += modeChoice.transit;
+      modeChoice.transit = 0;
+      modeChoice.unknown = Math.max(
+        0,
+        targetSize - modeChoice.walking - modeChoice.driving - modeChoice.transit
+      );
+    }
+    return modeChoice;
+  }
+
+  function cloneLastCommuteForSplit(
+    originalPop: Pop,
+    childId: string,
+    targetSize: number,
+    offsetSeconds: number
+  ): Pop['lastCommute'] {
+    const originalCommute = originalPop.lastCommute;
+    const safeSize = Number.isFinite(targetSize) && targetSize > 0 ? targetSize : originalPop.size;
+    const transitPaths = cloneTransitPathsForSplit(originalCommute, offsetSeconds, {
+      originalPopId: originalPop.id,
+      childId,
+    });
+    const hadTransit = (originalCommute?.modeChoice?.transit ?? 0) > 0;
+    if (hadTransit && transitPaths.length === 0) {
+      recordFlightEvent(
+        'mutate.transit-mode-fallback',
+        {
+          originalPopId: originalPop.id,
+          childId,
+          targetSize: safeSize,
+        },
+        { includeGame: false }
+      );
+    }
+    return {
+      modeChoice: cachedModeChoiceForSplit(originalCommute, safeSize, transitPaths),
+      // Copy only the typed TransitPath fields, shifted to the child
+      // departure. Avoid deep-cloning arbitrary cached commute payloads.
+      transitPaths,
+      walking: {
+        time: numberField(originalCommute?.walking, 'time'),
+        distance: numberField(originalCommute?.walking, 'distance'),
+      },
+    };
+  }
+
+  function clonePopForSplit(originalPop: Pop, childId: string, size: number): Pop {
     const offsetSeconds = childTimeOffsetSeconds(childId);
-    const lastCommute = deepClone(originalPop.lastCommute);
-    shiftCommuteTimes(lastCommute, offsetSeconds);
     return {
       ...originalPop,
       id: childId,
-      size: 0,
-      homeDepartureTime: clampDaySecond(originalPop.homeDepartureTime + offsetSeconds),
-      workDepartureTime: clampDaySecond(originalPop.workDepartureTime + offsetSeconds),
-      lastCommute,
+      size,
+      homeDepartureTime: wrapDaySecond(originalPop.homeDepartureTime + offsetSeconds),
+      workDepartureTime: wrapDaySecond(originalPop.workDepartureTime + offsetSeconds),
+      lastCommute: cloneLastCommuteForSplit(originalPop, childId, size, offsetSeconds),
     };
   }
 
   function normalizeSplitChild(originalPop: Pop, childId: string, size: number): void {
     let child = demand.popsMap.get(childId);
     if (!child) {
-      child = clonePopForSplit(originalPop, childId);
+      child = clonePopForSplit(originalPop, childId, size);
       demand.popsMap.set(childId, child);
     }
-    const normalized = clonePopForSplit(originalPop, childId);
-    normalized.size = size;
+    const normalized = clonePopForSplit(originalPop, childId, size);
     Object.assign(child, normalized);
   }
 
@@ -726,17 +879,40 @@ export function createMutator(
     delta: DemandDelta,
     source: DeltaSourceKind
   ): ApplyResult {
-    return applyDensityDeltaInternal(pointId, delta, source, buildOriginalPopIndex());
+    recordFlightEvent('mutate.apply-density-delta.start', { pointId, delta, source }, { includeGame: false });
+    const result = applyDensityDeltaInternal(pointId, delta, source, buildOriginalPopIndex());
+    recordFlightEvent(
+      'mutate.apply-density-delta.end',
+      {
+        pointId,
+        source,
+        ok: result.ok,
+        reason: result.ok ? null : result.reason,
+      },
+      { includeGame: false }
+    );
+    return result;
   }
 
   function applyDensityDeltas(
     targets: Array<{ pointId: string; delta: DemandDelta }>,
     source: DeltaSourceKind
   ): ApplyResult[] {
+    recordFlightEvent(
+      'mutate.apply-density-deltas.start',
+      { targets: targets.length, source },
+      { includeGame: false }
+    );
     const index = buildOriginalPopIndex();
-    return targets.map((target) =>
+    const results = targets.map((target) =>
       applyDensityDeltaInternal(target.pointId, target.delta, source, index)
     );
+    recordFlightEvent(
+      'mutate.apply-density-deltas.end',
+      { targets: targets.length, results: results.length, source },
+      { includeGame: false }
+    );
+    return results;
   }
 
   function applyDensityDeltaInternal(

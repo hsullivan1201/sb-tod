@@ -207,6 +207,8 @@ export function createAdaptiveStorage(): AdaptiveStorage {
       try {
         const apiVal = await apiStorage.get<T>(key, defaultValue as T);
         if (apiVal !== defaultValue && apiVal !== null && apiVal !== undefined) {
+          mode = 'api';
+          lastSuccessful = 'api';
           return apiVal;
         }
       } catch {
@@ -214,10 +216,17 @@ export function createAdaptiveStorage(): AdaptiveStorage {
       }
       const electronVal = await electronGet<T>(key, defaultValue as T);
       if (electronVal !== defaultValue && electronVal !== null && electronVal !== undefined) {
+        mode = 'electron';
+        lastSuccessful = 'electron';
         return electronVal;
       }
       if (LS_AVAILABLE) {
-        return localGet(key, defaultValue);
+        const localVal = localGet(key, defaultValue);
+        if (localVal !== defaultValue && localVal !== null && localVal !== undefined) {
+          mode = 'local';
+          lastSuccessful = 'local';
+        }
+        return localVal;
       }
       return defaultValue;
     },

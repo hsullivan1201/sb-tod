@@ -8,22 +8,25 @@
  */
 
 import { hooks, ui, apiVersion } from './api';
+import { recordFlightEvent } from './diagnostics/flightRecorder';
 import { ensureRuntimeTraceSampler } from './diagnostics/runtimeTrace';
 import { TodPanel } from './ui/TodPanel';
 import { initMapHighlight } from './ui/mapHighlight';
 import { getModState } from './state/mod-state';
 
 const MOD_ID = 'dev.hazel.sb-tod';
-const MOD_VERSION = '0.2.3';
+const MOD_VERSION = '0.2.4';
 const TAG = '[sb-tod]';
 
 console.log(`${TAG} v${MOD_VERSION} loading | API v${apiVersion}`);
+recordFlightEvent('main.load', { modVersion: MOD_VERSION, apiVersion }, { includeGame: false });
 
 let uiInitialized = false;
 
 hooks.onMapReady(() => {
   if (uiInitialized) return;
   uiInitialized = true;
+  recordFlightEvent('main.map-ready', { modVersion: MOD_VERSION, apiVersion }, { includeGame: false });
 
   try {
     // Floating panel (not a toolbar panel) so the player can pan the map
@@ -45,16 +48,21 @@ hooks.onMapReady(() => {
     getModState()
       .ensureInit()
       .then((ok) => {
+        recordFlightEvent('main.ensure-init.resolved', { ok }, { includeGame: true });
         if (!ok) return;
         const s = getModState().stats();
         console.log(
           `${TAG} Mod state initialized (${s.pointsTracked} baselines, ${s.popsTracked} pops, ${s.pointsWithDeltas} with deltas).`
         );
       })
-      .catch((e) => console.warn(`${TAG} Initial mod-state init deferred:`, e));
+      .catch((e) => {
+        recordFlightEvent('main.ensure-init.throw', { error: String(e) }, { includeGame: true });
+        console.warn(`${TAG} Initial mod-state init deferred:`, e);
+      });
 
     console.log(`${TAG} Initialized.`);
   } catch (err) {
+    recordFlightEvent('main.init.throw', { error: String(err) }, { includeGame: false });
     console.error(`${TAG} Init failed:`, err);
     try {
       ui.showNotification(`${MOD_ID} failed to load — check console.`, 'error');
