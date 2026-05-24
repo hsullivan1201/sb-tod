@@ -413,7 +413,7 @@ describe('mod state — lifecycle hooks', () => {
     const rescueDeal = deal('deal-rescue', {
       tier: 'L',
       totalDensity: { residents: 8000, jobs: 0 },
-      totalCost: 250_000_000,
+      totalCost: 600_000_000,
       durationDays: 3,
       startDay: 34,
     });
@@ -441,7 +441,7 @@ describe('mod state — lifecycle hooks', () => {
 
     await state.ensureInit();
 
-    expect(refunds).toEqual([250_000_000]);
+    expect(refunds).toEqual([600_000_000]);
     expect(state.getDeals()[0].state).toBe('cancelled');
     const stored = storage._data.get('sb-tod:state:v1:_unsaved') as PersistedState;
     expect(stored.deals?.[0].state).toBe('cancelled');

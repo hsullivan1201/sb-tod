@@ -52,38 +52,97 @@ export interface TierConfig {
  *
  * Housing/S of 500 → 600 (+100, slight bump), Commercial/S of 1500 →
  * 1600 (+100). Mixed = 70% of housing + 70% of commercial, then
- * rounded to nearest 200 per dimension. Costs unchanged.
+ * rounded to nearest 200 per dimension.
+ *
+ * Costs are keyed to dense East Asian rail-adjacent development orders
+ * of magnitude: housing lands at about $75k per resident ($45M for the
+ * 600-resident S tier), commercial is slightly lighter at $60k per job,
+ * and mixed deals use the same blended basis with a modest coordination
+ * premium.
  *
  * Durations are tuned for the game's quick day cadence: S/M/L deals
  * complete in 1/2/3 days.
  */
+export const DEVELOPMENT_COST_PER_RESIDENT = 75_000;
+export const DEVELOPMENT_COST_PER_JOB = 60_000;
+export const MIXED_DEVELOPMENT_COMPLEXITY_MULTIPLIER = 1.08;
+export const DEVELOPMENT_COST_ROUNDING = 1_000_000;
+
+function developmentCost(
+  totalDensity: DealTotalDensity,
+  multiplier = 1
+): number {
+  const raw =
+    (totalDensity.residents * DEVELOPMENT_COST_PER_RESIDENT +
+      totalDensity.jobs * DEVELOPMENT_COST_PER_JOB) *
+    multiplier;
+  return Math.round(raw / DEVELOPMENT_COST_ROUNDING) * DEVELOPMENT_COST_ROUNDING;
+}
+
 export const DEFAULT_TIER_TABLE: Record<DealKind, Record<DealTier, TierConfig>> = {
   housing: {
-    S: { totalDensity: { residents: 600, jobs: 0 }, cost: 25_000_000, duration: 1 },
-    M: { totalDensity: { residents: 2000, jobs: 0 }, cost: 80_000_000, duration: 2 },
-    L: { totalDensity: { residents: 8000, jobs: 0 }, cost: 250_000_000, duration: 3 },
-  },
-  commercial: {
-    S: { totalDensity: { residents: 0, jobs: 1600 }, cost: 30_000_000, duration: 1 },
-    M: { totalDensity: { residents: 0, jobs: 6000 }, cost: 100_000_000, duration: 2 },
-    L: { totalDensity: { residents: 0, jobs: 25_000 }, cost: 320_000_000, duration: 3 },
-  },
-  // Mixed: 70% of housing residents + 70% of commercial jobs, rounded
-  // to nearest 200 per dimension (so it stays pop-clean).
-  mixed: {
     S: {
-      totalDensity: { residents: 400, jobs: 1200 }, // 70% × 600 = 420 → 400; 70% × 1600 = 1120 → 1200
-      cost: Math.round((25_000_000 + 30_000_000) * 0.7),
+      totalDensity: { residents: 600, jobs: 0 },
+      cost: developmentCost({ residents: 600, jobs: 0 }),
       duration: 1,
     },
     M: {
-      totalDensity: { residents: 1400, jobs: 4200 }, // 70% × 2000 = 1400; 70% × 6000 = 4200
-      cost: Math.round((80_000_000 + 100_000_000) * 0.7),
+      totalDensity: { residents: 2000, jobs: 0 },
+      cost: developmentCost({ residents: 2000, jobs: 0 }),
       duration: 2,
     },
     L: {
-      totalDensity: { residents: 5600, jobs: 17_600 }, // 70% × 8000 = 5600; 70% × 25000 = 17500 → 17600
-      cost: Math.round((250_000_000 + 320_000_000) * 0.7),
+      totalDensity: { residents: 8000, jobs: 0 },
+      cost: developmentCost({ residents: 8000, jobs: 0 }),
+      duration: 3,
+    },
+  },
+  commercial: {
+    S: {
+      totalDensity: { residents: 0, jobs: 1600 },
+      cost: developmentCost({ residents: 0, jobs: 1600 }),
+      duration: 1,
+    },
+    M: {
+      totalDensity: { residents: 0, jobs: 6000 },
+      cost: developmentCost({ residents: 0, jobs: 6000 }),
+      duration: 2,
+    },
+    L: {
+      totalDensity: { residents: 0, jobs: 25_000 },
+      cost: developmentCost({ residents: 0, jobs: 25_000 }),
+      duration: 3,
+    },
+  },
+  // Mixed: 70% of housing residents + 70% of commercial jobs, rounded
+  // to nearest 200 per dimension (so it stays pop-clean), then priced
+  // from the blended residential/job units with an 8% complexity premium.
+  mixed: {
+    S: {
+      // 70% × 600 = 420 → 400; 70% × 1600 = 1120 → 1200
+      totalDensity: { residents: 400, jobs: 1200 },
+      cost: developmentCost(
+        { residents: 400, jobs: 1200 },
+        MIXED_DEVELOPMENT_COMPLEXITY_MULTIPLIER
+      ),
+      duration: 1,
+    },
+    M: {
+      // 70% × 2000 = 1400; 70% × 6000 = 4200
+      totalDensity: { residents: 1400, jobs: 4200 },
+      cost: developmentCost(
+        { residents: 1400, jobs: 4200 },
+        MIXED_DEVELOPMENT_COMPLEXITY_MULTIPLIER
+      ),
+      duration: 2,
+    },
+    L: {
+      // 70% × 8000 = 5600; 70% × 25000 = 17500 → 17600
+      totalDensity: { residents: 5600, jobs: 17_600 },
+      cost: developmentCost(
+        { residents: 5600, jobs: 17_600 },
+        MIXED_DEVELOPMENT_COMPLEXITY_MULTIPLIER
+      ),
       duration: 3,
     },
   },

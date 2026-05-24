@@ -166,6 +166,10 @@ export const ui = {
   showNotification(message: string, level: 'info' | 'success' | 'warning' | 'error'): void {
     getRaw().ui.showNotification(message, level);
   },
+  getResolvedTheme(): string {
+    const themeApi = getRaw().ui as any;
+    return themeApi.getResolvedTheme?.() ?? themeApi.getTheme?.() ?? 'dark';
+  },
 };
 
 export const map = {

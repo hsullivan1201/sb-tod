@@ -5,6 +5,10 @@ import {
   confirmProposal,
   computeDailyApply,
   DEFAULT_TIER_TABLE,
+  DEVELOPMENT_COST_PER_JOB,
+  DEVELOPMENT_COST_PER_RESIDENT,
+  DEVELOPMENT_COST_ROUNDING,
+  MIXED_DEVELOPMENT_COMPLEXITY_MULTIPLIER,
   type Deal,
 } from './deals';
 
@@ -44,11 +48,11 @@ describe('validateProposal', () => {
       centerLngLat: CENTER,
       radiusMeters: 500,
       walkshedPoints: points,
-      budget: 100_000_000,
+      budget: 1_000_000_000,
     });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.totalCost).toBe(25_000_000);
+    expect(r.totalCost).toBe(45_000_000);
     expect(r.totalDensity.residents).toBe(600);
     expect(r.totalDensity.jobs).toBe(0);
     expect(r.eligiblePoints.length).toBe(2);
@@ -64,7 +68,7 @@ describe('validateProposal', () => {
       centerLngLat: CENTER,
       radiusMeters: 500,
       walkshedPoints: points,
-      budget: 100_000_000,
+      budget: 1_000_000_000,
     });
     expect(r.ok).toBe(false);
     if (r.ok) return;
@@ -94,7 +98,7 @@ describe('validateProposal', () => {
       centerLngLat: CENTER,
       radiusMeters: 500,
       walkshedPoints: points,
-      budget: 100_000_000,
+      budget: 1_000_000_000,
     });
     expect(r.ok).toBe(false);
     if (r.ok) return;
@@ -133,7 +137,7 @@ describe('validateProposal', () => {
 
   it('applies costMultiplier to totalCost and the funds check', () => {
     const points = [point('p1', 100, 200, 0, 0.001)];
-    // Housing/L is normally $250M; at 1% it's $2.5M. Budget of $5M
+    // Housing/L is normally $600M; at 1% it's $6M. Budget of $7M
     // wouldn't cover the original but easily covers the discounted.
     const r = validateProposal({
       kind: 'housing',
@@ -141,12 +145,12 @@ describe('validateProposal', () => {
       centerLngLat: CENTER,
       radiusMeters: 500,
       walkshedPoints: points,
-      budget: 5_000_000,
+      budget: 7_000_000,
       costMultiplier: 0.01,
     });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.totalCost).toBe(2_500_000);
+    expect(r.totalCost).toBe(6_000_000);
   });
 
   it('honors residentsEligibilityThreshold (matches mutator ghostTownThreshold)', () => {
@@ -208,7 +212,30 @@ describe('default tier table', () => {
       const c = DEFAULT_TIER_TABLE.commercial[tier];
       expect(Math.abs(m.totalDensity.residents - h.totalDensity.residents * 0.7)).toBeLessThan(200);
       expect(Math.abs(m.totalDensity.jobs - c.totalDensity.jobs * 0.7)).toBeLessThan(200);
-      expect(m.cost).toBe(Math.round((h.cost + c.cost) * 0.7));
+    }
+  });
+
+  it('prices tiers around the residential $75k-per-person baseline', () => {
+    expect(DEFAULT_TIER_TABLE.housing.S.cost).toBe(45_000_000);
+
+    for (const tier of ['S', 'M', 'L'] as const) {
+      const h = DEFAULT_TIER_TABLE.housing[tier];
+      const c = DEFAULT_TIER_TABLE.commercial[tier];
+      expect(h.cost / h.totalDensity.residents).toBe(DEVELOPMENT_COST_PER_RESIDENT);
+      expect(c.cost / c.totalDensity.jobs).toBe(DEVELOPMENT_COST_PER_JOB);
+    }
+  });
+
+  it('prices mixed tiers from blended residents/jobs plus the mixed complexity premium', () => {
+    for (const tier of ['S', 'M', 'L'] as const) {
+      const m = DEFAULT_TIER_TABLE.mixed[tier];
+      const raw =
+        (m.totalDensity.residents * DEVELOPMENT_COST_PER_RESIDENT +
+          m.totalDensity.jobs * DEVELOPMENT_COST_PER_JOB) *
+        MIXED_DEVELOPMENT_COMPLEXITY_MULTIPLIER;
+      expect(m.cost).toBe(
+        Math.round(raw / DEVELOPMENT_COST_ROUNDING) * DEVELOPMENT_COST_ROUNDING
+      );
     }
   });
 });
@@ -264,7 +291,7 @@ describe('confirmProposal', () => {
     if (!v.ok) return;
     expect(v.durationDays).toBe(7);
     // Cost and density stay tied to the tier — only pacing changed.
-    expect(v.totalCost).toBe(250_000_000);
+    expect(v.totalCost).toBe(600_000_000);
     expect(v.totalDensity.residents).toBe(8000);
   });
 });
@@ -283,7 +310,7 @@ describe('computeDailyApply', () => {
       centerLngLat: CENTER,
       radiusMeters: 500,
       totalDensity: { residents: 600, jobs: 0 },
-      totalCost: 80_000_000,
+      totalCost: 150_000_000,
       startDay: 1,
       durationDays: 60,
       state: 'active',

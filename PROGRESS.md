@@ -24,7 +24,8 @@ based on station performance is still future work.
   sizing. Ranking-row build buttons prepare that station, and clicking a
   station on the live map while the panel is open selects it for the
   same builder.
-- Deal costs are back at full tier price; S/M/L deals complete in
+- Deal costs are balanced around $75k per resident; commercial and
+  mixed deals use the same per-unit ballpark. S/M/L deals complete in
   1/2/3 game days. The visible debug "Finish" shortcut is removed.
 - Deals persist per save through `mod-state`, `storage-adapter`, and the
   real `DemandMutator`. On load, persisted deltas are either rehydrated

@@ -536,11 +536,48 @@ export function TodPanel() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [dealVersion, setDealVersion] = useState(0);
   const [buildPending, setBuildPending] = useState(false);
+  const [themeStyle, setThemeStyle] = useState<TodThemeStyle>(() => readTodThemeStyle());
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const buildInFlightRef = useRef(false);
 
   useEffect(() => {
     ensureRuntimeTraceSampler();
     sampleRuntimeTrace('panel-open');
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const syncTheme = () => {
+      if (!disposed) setThemeStyle(readTodThemeStyle(panelRef.current));
+    };
+    syncTheme();
+
+    const doc = panelRef.current?.ownerDocument;
+    const observer =
+      typeof MutationObserver !== 'undefined' ? new MutationObserver(syncTheme) : null;
+    const observeOptions: MutationObserverInit = {
+      attributes: true,
+      attributeFilter: ['class', 'style', 'data-theme', 'data-color-mode'],
+    };
+    const observed = [
+      doc?.documentElement,
+      doc?.body,
+      panelRef.current?.parentElement,
+      panelRef.current?.parentElement?.parentElement,
+    ].filter((node): node is HTMLElement => !!node);
+
+    for (const node of observed) observer?.observe(node, observeOptions);
+
+    const media = window.matchMedia?.('(prefers-color-scheme: light)');
+    media?.addEventListener?.('change', syncTheme);
+    const retry = window.setTimeout(syncTheme, 50);
+
+    return () => {
+      disposed = true;
+      observer?.disconnect();
+      media?.removeEventListener?.('change', syncTheme);
+      window.clearTimeout(retry);
+    };
   }, []);
 
   const selectedStation = useMemo(
@@ -819,7 +856,7 @@ export function TodPanel() {
   );
 
   return (
-    <div className="text-sm" style={panelStyle}>
+    <div ref={panelRef} className="text-sm" style={{ ...panelStyle, ...themeStyle }}>
       <header style={headerStyle}>
         <div style={{ minWidth: 0 }}>
           <div style={eyebrowStyle}>Transit-Oriented Development</div>
@@ -1260,8 +1297,8 @@ function ScoreRow({
 }) {
   const meta = SECTION_META[kind];
   const score = clamp01(metric.score);
-  const backgroundColor = isHighlighted ? meta.softColor : 'rgba(255,255,255,0.025)';
-  const borderColor = isHighlighted ? meta.color : 'rgba(255,255,255,0.07)';
+  const backgroundColor = isHighlighted ? meta.softColor : ROW_BG_COLOR;
+  const borderColor = isHighlighted ? meta.color : BORDER_COLOR;
 
   return (
     <div
@@ -1282,12 +1319,12 @@ function ScoreRow({
       }}
       onMouseEnter={(e) => {
         if (!isHighlighted) {
-          (e.currentTarget as HTMLDivElement).style.backgroundColor = 'rgba(255,255,255,0.05)';
+          (e.currentTarget as HTMLDivElement).style.setProperty('background-color', ROW_HOVER_BG_COLOR);
         }
       }}
       onMouseLeave={(e) => {
         if (!isHighlighted) {
-          (e.currentTarget as HTMLDivElement).style.backgroundColor = 'rgba(255,255,255,0.025)';
+          (e.currentTarget as HTMLDivElement).style.setProperty('background-color', ROW_BG_COLOR);
         }
       }}
     >
@@ -1534,9 +1571,127 @@ function clamp01(x: number): number {
   return x;
 }
 
-const TEXT_COLOR = 'rgba(255,255,255,0.92)';
-const MUTED_COLOR = 'rgba(255,255,255,0.58)';
-const FAINT_COLOR = 'rgba(255,255,255,0.38)';
+type TodThemeStyle = React.CSSProperties & Record<`--sb-tod-${string}`, string>;
+
+const DARK_THEME_STYLE: TodThemeStyle = {
+  '--sb-tod-text': 'rgba(255,255,255,0.92)',
+  '--sb-tod-muted': 'rgba(255,255,255,0.58)',
+  '--sb-tod-faint': 'rgba(255,255,255,0.38)',
+  '--sb-tod-border': 'rgba(255,255,255,0.07)',
+  '--sb-tod-border-strong': 'rgba(255,255,255,0.08)',
+  '--sb-tod-surface': 'rgba(255,255,255,0.03)',
+  '--sb-tod-surface-strong': 'rgba(255,255,255,0.035)',
+  '--sb-tod-control': 'rgba(0,0,0,0.18)',
+  '--sb-tod-control-strong': 'rgba(0,0,0,0.2)',
+  '--sb-tod-row-bg': 'rgba(255,255,255,0.025)',
+  '--sb-tod-row-hover-bg': 'rgba(255,255,255,0.05)',
+  '--sb-tod-bar-track': 'rgba(255,255,255,0.11)',
+};
+
+const LIGHT_THEME_STYLE: TodThemeStyle = {
+  '--sb-tod-text': 'rgba(15,23,42,0.92)',
+  '--sb-tod-muted': 'rgba(51,65,85,0.72)',
+  '--sb-tod-faint': 'rgba(71,85,105,0.58)',
+  '--sb-tod-border': 'rgba(15,23,42,0.13)',
+  '--sb-tod-border-strong': 'rgba(15,23,42,0.16)',
+  '--sb-tod-surface': 'rgba(15,23,42,0.035)',
+  '--sb-tod-surface-strong': 'rgba(15,23,42,0.05)',
+  '--sb-tod-control': 'rgba(15,23,42,0.06)',
+  '--sb-tod-control-strong': 'rgba(15,23,42,0.08)',
+  '--sb-tod-row-bg': 'rgba(15,23,42,0.025)',
+  '--sb-tod-row-hover-bg': 'rgba(15,23,42,0.055)',
+  '--sb-tod-bar-track': 'rgba(15,23,42,0.12)',
+};
+
+function readTodThemeStyle(root?: HTMLElement | null): TodThemeStyle {
+  const hostLightMode = readHostLightMode(root);
+  if (hostLightMode !== null) return hostLightMode ? LIGHT_THEME_STYLE : DARK_THEME_STYLE;
+
+  try {
+    const theme = ui.getResolvedTheme();
+    if (theme === 'light') return LIGHT_THEME_STYLE;
+    if (theme === 'dark') return DARK_THEME_STYLE;
+    if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: light)').matches) {
+      return LIGHT_THEME_STYLE;
+    }
+  } catch {
+    /* fall through to dark default */
+  }
+  return DARK_THEME_STYLE;
+}
+
+function readHostLightMode(root?: HTMLElement | null): boolean | null {
+  if (typeof window === 'undefined') return null;
+  const doc = root?.ownerDocument ?? window.document;
+  let node: HTMLElement | null = root?.parentElement ?? null;
+  let depth = 0;
+
+  while (node && depth < 8) {
+    const lightMode = elementBackgroundIsLight(node);
+    if (lightMode !== null) return lightMode;
+    node = node.parentElement;
+    depth++;
+  }
+
+  return elementBackgroundIsLight(doc.body) ?? elementBackgroundIsLight(doc.documentElement);
+}
+
+function elementBackgroundIsLight(element: Element | null): boolean | null {
+  if (!element) return null;
+  const view = element.ownerDocument.defaultView;
+  if (!view) return null;
+  const background = parseCssRgb(view.getComputedStyle(element).backgroundColor);
+  if (!background || background.alpha < 0.2) return null;
+  return relativeLuminance(background.red, background.green, background.blue) > 0.62;
+}
+
+function parseCssRgb(value: string): { red: number; green: number; blue: number; alpha: number } | null {
+  const match = value.match(/^rgba?\((.+)\)$/i);
+  if (!match) return null;
+  const parts = match[1]
+    .trim()
+    .replace(/\s*\/\s*/, ' ')
+    .split(/[\s,]+/)
+    .filter(Boolean);
+  if (parts.length < 3) return null;
+  const [red, green, blue] = parts.slice(0, 3).map(parseCssColorChannel);
+  const alpha = parts[3] === undefined ? 1 : parseCssAlpha(parts[3]);
+  if ([red, green, blue, alpha].some((part) => !Number.isFinite(part))) return null;
+  return { red, green, blue, alpha };
+}
+
+function parseCssColorChannel(value: string): number {
+  if (value.endsWith('%')) return (Number.parseFloat(value) / 100) * 255;
+  return Number.parseFloat(value);
+}
+
+function parseCssAlpha(value: string): number {
+  if (value.endsWith('%')) return Number.parseFloat(value) / 100;
+  return Number.parseFloat(value);
+}
+
+function relativeLuminance(red: number, green: number, blue: number): number {
+  const [r, g, b] = [red, green, blue].map((channel) => {
+    const normalized = channel / 255;
+    return normalized <= 0.03928
+      ? normalized / 12.92
+      : Math.pow((normalized + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+const TEXT_COLOR = 'var(--sb-tod-text)';
+const MUTED_COLOR = 'var(--sb-tod-muted)';
+const FAINT_COLOR = 'var(--sb-tod-faint)';
+const BORDER_COLOR = 'var(--sb-tod-border)';
+const BORDER_STRONG_COLOR = 'var(--sb-tod-border-strong)';
+const SURFACE_COLOR = 'var(--sb-tod-surface)';
+const SURFACE_STRONG_COLOR = 'var(--sb-tod-surface-strong)';
+const CONTROL_COLOR = 'var(--sb-tod-control)';
+const CONTROL_STRONG_COLOR = 'var(--sb-tod-control-strong)';
+const ROW_BG_COLOR = 'var(--sb-tod-row-bg)';
+const ROW_HOVER_BG_COLOR = 'var(--sb-tod-row-hover-bg)';
+const BAR_TRACK_COLOR = 'var(--sb-tod-bar-track)';
 
 const panelStyle: React.CSSProperties = {
   display: 'flex',
@@ -1555,7 +1710,7 @@ const headerStyle: React.CSSProperties = {
   justifyContent: 'space-between',
   gap: 12,
   paddingBottom: 4,
-  borderBottom: '1px solid rgba(255,255,255,0.08)',
+  borderBottom: `1px solid ${BORDER_STRONG_COLOR}`,
 };
 
 const headerActionsStyle: React.CSSProperties = {
@@ -1597,8 +1752,8 @@ const statStyle: React.CSSProperties = {
   minWidth: 0,
   padding: '7px 8px',
   borderRadius: 6,
-  border: '1px solid rgba(255,255,255,0.07)',
-  backgroundColor: 'rgba(255,255,255,0.03)',
+  border: `1px solid ${BORDER_COLOR}`,
+  backgroundColor: SURFACE_COLOR,
 };
 
 const statLabelStyle: React.CSSProperties = {
@@ -1630,8 +1785,8 @@ const buildPanelStyle: React.CSSProperties = {
   gap: 8,
   padding: 9,
   borderRadius: 6,
-  border: '1px solid rgba(255,255,255,0.08)',
-  backgroundColor: 'rgba(255,255,255,0.035)',
+  border: `1px solid ${BORDER_STRONG_COLOR}`,
+  backgroundColor: SURFACE_STRONG_COLOR,
 };
 
 const sectionHeaderStyle: React.CSSProperties = {
@@ -1702,8 +1857,8 @@ const segmentedStyle: React.CSSProperties = {
   minWidth: 0,
   padding: 2,
   borderRadius: 6,
-  border: '1px solid rgba(255,255,255,0.07)',
-  backgroundColor: 'rgba(0,0,0,0.18)',
+  border: `1px solid ${BORDER_COLOR}`,
+  backgroundColor: CONTROL_COLOR,
 };
 
 const segmentButtonStyle: React.CSSProperties = {
@@ -1725,7 +1880,7 @@ const confirmButtonStyle: React.CSSProperties = {
   minWidth: 58,
   border: '1px solid currentColor',
   borderRadius: 5,
-  backgroundColor: 'rgba(0,0,0,0.2)',
+  backgroundColor: CONTROL_STRONG_COLOR,
   padding: '5px 8px',
   fontSize: 11,
   lineHeight: 1.2,
@@ -1737,7 +1892,7 @@ const rowButtonStyle: React.CSSProperties = {
   minHeight: 48,
   padding: '7px 8px',
   borderRadius: 6,
-  border: '1px solid rgba(255,255,255,0.07)',
+  border: `1px solid ${BORDER_COLOR}`,
   cursor: 'pointer',
   outline: 'none',
 };
@@ -1788,7 +1943,7 @@ const buildButtonStyle: React.CSSProperties = {
   appearance: 'none',
   border: '1px solid currentColor',
   borderRadius: 5,
-  backgroundColor: 'rgba(0,0,0,0.18)',
+  backgroundColor: CONTROL_COLOR,
   padding: '3px 6px',
   color: TEXT_COLOR,
   cursor: 'pointer',
@@ -1820,7 +1975,7 @@ const barTrackStyle: React.CSSProperties = {
   minWidth: 74,
   overflow: 'hidden',
   borderRadius: 4,
-  backgroundColor: 'rgba(255,255,255,0.11)',
+  backgroundColor: BAR_TRACK_COLOR,
 };
 
 const barFillStyle: React.CSSProperties = {
@@ -1857,7 +2012,7 @@ const footnoteStyle: React.CSSProperties = {
 };
 
 const diagnosticsStyle: React.CSSProperties = {
-  borderTop: '1px solid rgba(255,255,255,0.08)',
+  borderTop: `1px solid ${BORDER_STRONG_COLOR}`,
   paddingTop: 8,
 };
 
@@ -1889,8 +2044,8 @@ const calibrationGridStyle: React.CSSProperties = {
   gap: 3,
   padding: '7px 8px',
   borderRadius: 6,
-  border: '1px solid rgba(255,255,255,0.07)',
-  backgroundColor: 'rgba(255,255,255,0.025)',
+  border: `1px solid ${BORDER_COLOR}`,
+  backgroundColor: ROW_BG_COLOR,
 };
 
 const diagnosticRowStyle: React.CSSProperties = {

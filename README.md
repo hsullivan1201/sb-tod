@@ -15,7 +15,8 @@ Stage 2 is the playable dashboard plus persisted developer deals:
 - Residential and commercial growth rankings
 - Captured-value and TOD-risk rankings
 - New Development card with Housing / Jobs / Mixed and S / M / L deal sizing
-- Full-price S / M / L deals complete over 1 / 2 / 3 game days
+- S / M / L deal costs are balanced around $75k per resident, with
+  commercial and mixed deals in the same per-unit ballpark
 - Build buttons on rows prepare the selected station for a deal
 - Clicking a station on the map while the panel is open selects it for building
 - 500m walkshed pin on the map when a row is selected
