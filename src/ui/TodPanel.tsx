@@ -763,7 +763,7 @@ export function TodPanel() {
           traceId: enterTraceId,
           alreadyReady: state.isReady(),
         });
-        const ready = state.isReady() || (await state.ensureInit(demand));
+        const ready = await state.ensureInit(demand);
         recordFlightEvent('build.ensure-init.end', { traceId: enterTraceId, ready });
 
         if (!ready) {
@@ -2289,7 +2289,7 @@ function downloadDebug(snapshot: Snapshot) {
   const flightRecorder = flightRecorderSnapshot();
   const payload = {
     timestamp: new Date().toISOString(),
-    bundleVersion: 'panel-v45-save-sync-loop-guard',
+    bundleVersion: 'panel-v46-deal-save-sync-guard',
     counts: {
       stations: snapshot.stations,
       demandPoints: snapshot.demandPoints,

@@ -41,7 +41,7 @@ import {
   findDuplicateDevelopment,
   type Deal,
 } from '../sim/deals';
-import { createWalkshedIndex } from '../scoring/walkshed';
+import { createWalkshedIndex, findWalkshed } from '../scoring/walkshed';
 import {
   createAdaptiveStorage,
   type AdaptiveStorage,
@@ -57,6 +57,7 @@ const STORAGE_KEY_PREFIX = 'sb-tod:state:v1:';
 const LEGACY_UNSEGMENTED_KEY = 'sb-tod:state:v1'; // pre-per-save key, cleaned up on init
 const UNSAVED_SLOT = '_unsaved';
 const APPROX_TOLERANCE = 1.0;
+const RECENT_DEAL_ONLY_BOOTSTRAP_MS = 48 * 60 * 60 * 1000;
 
 function makeStorageKey(saveName: string | null): string {
   return STORAGE_KEY_PREFIX + (saveName ?? UNSAVED_SLOT);
@@ -374,6 +375,10 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     return (total?.jobs ?? 0) === 0 && (total?.residents ?? 0) === 0;
   }
 
+  function isUnappliedActiveDeal(deal: Deal): boolean {
+    return deal.state === 'active' && isZeroDensity(deal.appliedSoFar) && isZeroDensity(deal.pending);
+  }
+
   function cloneDeal(d: Deal): Deal {
     return {
       ...d,
@@ -430,6 +435,45 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       return true;
     }
     return false;
+  }
+
+  function dealMatchesLiveDemand(deal: Deal, liveDemand: DemandData): boolean {
+    if (!isUnappliedActiveDeal(deal)) return false;
+    const [lng, lat] = deal.centerLngLat ?? [];
+    if (
+      !Number.isFinite(lng) ||
+      !Number.isFinite(lat) ||
+      !Number.isFinite(deal.radiusMeters) ||
+      deal.radiusMeters <= 0
+    ) {
+      return false;
+    }
+    const hits = findWalkshed([lng, lat], liveDemand.points.values(), {
+      radiusMeters: deal.radiusMeters,
+    });
+    if (hits.length === 0) return false;
+    const wantsResidents = (deal.totalDensity?.residents ?? 0) > 0;
+    const wantsJobs = (deal.totalDensity?.jobs ?? 0) > 0;
+    return (
+      (!wantsResidents || hits.some((h) => h.point.residents > 0)) &&
+      (!wantsJobs || hits.some((h) => h.point.jobs > 0))
+    );
+  }
+
+  function hasRecentChargedUnappliedDealOnlyPayload(persisted: PersistedState): boolean {
+    const counts = persistedCounts(persisted);
+    if (counts.deltas > 0 || counts.deals <= 0) return false;
+    const now = Date.now();
+    return (persisted.deals ?? []).some((deal) => {
+      if (!isUnappliedActiveDeal(deal)) return false;
+      const chargedAt = deal.chargeAudit?.chargedAt;
+      return (
+        typeof chargedAt === 'number' &&
+        Number.isFinite(chargedAt) &&
+        chargedAt <= now &&
+        now - chargedAt <= RECENT_DEAL_ONLY_BOOTSTRAP_MS
+      );
+    });
   }
 
   function isPersistedState(value: unknown): value is PersistedState {
@@ -508,6 +552,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     missing: number;
     baselineShift: number;
     dealCount: number;
+    unappliedActiveDeals: number;
+    liveCompatibleUnappliedActiveDeals: number;
     splitChildren: number;
     rank: number;
   } {
@@ -536,6 +582,13 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     const deltaCount = persisted.cumulativeDeltas.length;
     const matchedDeltas = preserved + reset;
     const dealCount = persisted.deals?.length ?? 0;
+    let unappliedActiveDeals = 0;
+    let liveCompatibleUnappliedActiveDeals = 0;
+    for (const deal of persisted.deals ?? []) {
+      if (!isUnappliedActiveDeal(deal)) continue;
+      unappliedActiveDeals++;
+      if (dealMatchesLiveDemand(deal, liveDemand)) liveCompatibleUnappliedActiveDeals++;
+    }
     const splitChildren = persisted.splitChildren?.length ?? 0;
     return {
       deltaCount,
@@ -545,13 +598,30 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       missing,
       baselineShift,
       dealCount,
+      unappliedActiveDeals,
+      liveCompatibleUnappliedActiveDeals,
       splitChildren,
-      rank: matchedDeltas * 1_000_000 + deltaCount * 10_000 + dealCount * 100 + splitChildren,
+      rank:
+        matchedDeltas * 1_000_000 +
+        deltaCount * 10_000 +
+        liveCompatibleUnappliedActiveDeals * 1_000 +
+        dealCount * 100 +
+        splitChildren,
     };
   }
 
-  function bootstrapScoreIsCompatible(score: ReturnType<typeof scoreBootstrapCompatibility>): boolean {
-    if (score.deltaCount <= 0 || score.matchedDeltas <= 0) return false;
+  function bootstrapScoreIsCompatible(
+    score: ReturnType<typeof scoreBootstrapCompatibility>,
+    options: { allowDealOnly?: boolean } = {}
+  ): boolean {
+    if (score.deltaCount <= 0 || score.matchedDeltas <= 0) {
+      return (
+        options.allowDealOnly === true &&
+        score.deltaCount === 0 &&
+        score.unappliedActiveDeals > 0 &&
+        score.liveCompatibleUnappliedActiveDeals === score.unappliedActiveDeals
+      );
+    }
     const requiredMatches = Math.max(1, Math.ceil(score.deltaCount * 0.5));
     return score.matchedDeltas >= requiredMatches && score.baselineShift <= Math.max(2, score.matchedDeltas);
   }
@@ -561,7 +631,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     targetStorageKey: string,
     targetPayload: PersistedState | null,
     previousPayload: PersistedState | null,
-    previousSource: string | null
+    previousSource: string | null,
+    options: { allowPreviousDealOnly?: boolean; allowRecentUnsavedDealOnly?: boolean } = {}
   ): Promise<
     | {
         payload: PersistedState;
@@ -587,13 +658,19 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       seenSources.add(source);
       if (!shouldBootstrapNamedSlot(payload, targetPayload)) return;
       const score = scoreBootstrapCompatibility(payload, liveDemand);
+      const allowDealOnly =
+        (options.allowPreviousDealOnly === true && source === previousSource) ||
+        (options.allowRecentUnsavedDealOnly === true &&
+          source === makeStorageKey(null) &&
+          hasRecentChargedUnappliedDealOnlyPayload(payload));
       recordFlightEvent('mod-state.save-slot.bootstrap-candidate', {
         targetStorageKey,
         source,
         shape: describeShape(payload),
         score,
+        allowDealOnly,
       });
-      if (!bootstrapScoreIsCompatible(score)) return;
+      if (!bootstrapScoreIsCompatible(score, { allowDealOnly })) return;
       candidates.push({ payload, source, score });
     };
 
@@ -733,7 +810,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         initialized,
         dirty,
       });
-      saveNameSyncPromise = setCurrentSaveName(liveName)
+      saveNameSyncPromise = setCurrentSaveName(liveName, { allowPreviousDealOnly: true })
         .then(() => {
           recordFlightEvent('mod-state.save-slot.live-sync.end', {
             reason,
@@ -748,6 +825,14 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     }
     await saveNameSyncPromise;
     return true;
+  }
+
+  async function settleLiveSaveNameSync(reason: string): Promise<boolean> {
+    if (saveNameSyncPromise) {
+      await saveNameSyncPromise;
+      return true;
+    }
+    return syncLiveSaveName(reason);
   }
 
   function syncLiveSaveNameSoon(reason: string): boolean {
@@ -833,7 +918,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         storageKey,
         persisted,
         null,
-        null
+        null,
+        { allowRecentUnsavedDealOnly: true }
       );
       if (selected) {
         recordFlightEvent('mod-state.init.named-slot-bootstrap-selected', {
@@ -1447,7 +1533,10 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     if (initialized && dirty) void persist();
   }
 
-  async function setCurrentSaveName(name: string | null): Promise<void> {
+  async function setCurrentSaveName(
+    name: string | null,
+    options: { allowPreviousDealOnly?: boolean } = {}
+  ): Promise<void> {
     if (name === currentSaveName) return;
     const previousSaveName = currentSaveName;
     const previousPayload = initialized ? buildPersistedPayload(Date.now()) : null;
@@ -1487,7 +1576,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
           targetStorageKey,
           targetPayload,
           previousPayload,
-          previousSaveName == null ? makeStorageKey(null) : makeStorageKey(previousSaveName)
+          previousSaveName == null ? makeStorageKey(null) : makeStorageKey(previousSaveName),
+          options
         );
         if (selected) {
           slotBootstrap = {
@@ -1543,6 +1633,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       return deals;
     },
     async addDeal(deal) {
+      await settleLiveSaveNameSync('add-deal');
       recordFlightEvent('mod-state.add-deal', {
         dealId: deal.id,
         kind: deal.kind,

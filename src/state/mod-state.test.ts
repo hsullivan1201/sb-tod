@@ -622,6 +622,105 @@ describe('mod state — applyDensityDelta + revert', () => {
     expect(storage._data.has('sb-tod:state:v1:old')).toBe(true);
   });
 
+  it('carries an unstarted active deal through live save-name sync before first tick', async () => {
+    const storage = makeStorage();
+    const P = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const demand = fixture([P], [x]);
+    let liveName: string | null = null;
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => demand,
+      getSaveName: () => liveName,
+    });
+    await state.ensureInit();
+
+    expect(
+      await state.addDeal(
+        deal('pending-deal', {
+          chargeAudit: {
+            budgetBefore: 500_000,
+            expectedBudgetAfter: 250_000,
+            budgetAfter: 250_000,
+            chargedAt: Date.now(),
+          },
+        })
+      )
+    ).toBe(true);
+
+    liveName = 'fresh-save';
+    await state.ensureInit();
+
+    expect(state.getCurrentSaveName()).toBe('fresh-save');
+    expect(state.getDeals().map((d) => d.id)).toEqual(['pending-deal']);
+
+    state.onGameSavedFired('fresh-save');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const stored = storage._data.get('sb-tod:state:v1:fresh-save') as PersistedState;
+    expect(stored.deals?.map((d) => d.id)).toEqual(['pending-deal']);
+  });
+
+  it('waits for pending live save-name sync before accepting a new deal', async () => {
+    const storage = makeStorage();
+    const P = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const demand = fixture([P], [x]);
+    let liveName = 'old';
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => demand,
+      getSaveName: () => liveName,
+    });
+    await state.ensureInit();
+
+    liveName = 'new';
+    state.getDeals();
+    expect(await state.addDeal(deal('late-deal'))).toBe(true);
+
+    expect(state.getCurrentSaveName()).toBe('new');
+    expect(state.getDeals().map((d) => d.id)).toEqual(['late-deal']);
+  });
+
+  it('recovers a recent charged deal-only _unsaved slot for an empty named save', async () => {
+    const storage = makeStorage();
+    const orphanDeal = deal('orphan-deal', {
+      chargeAudit: {
+        budgetBefore: 500_000,
+        expectedBudgetAfter: 250_000,
+        budgetAfter: 250_000,
+        chargedAt: Date.now(),
+      },
+    });
+    const orphanState: PersistedState = {
+      version: 1,
+      savedAt: Date.now(),
+      baselineDemand: [],
+      baselinePopSizes: [],
+      cumulativeDeltas: [],
+      deals: [orphanDeal],
+    };
+    await storage.set('sb-tod:state:v1:_unsaved', orphanState);
+
+    const P = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => fixture([P], [x]),
+      getSaveName: () => 'fresh-save',
+    });
+
+    await state.ensureInit();
+
+    expect(state.getCurrentSaveName()).toBe('fresh-save');
+    expect(state.getDeals().map((d) => d.id)).toEqual(['orphan-deal']);
+    expect(state.stats().dirty).toBe(true);
+  });
+
   it('migrates richer legacy _unsaved state when the named save slot is skinny', async () => {
     const storage = makeStorage();
     const legacyDeal = deal('legacy-deal', { state: 'completed' });
