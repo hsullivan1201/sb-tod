@@ -140,8 +140,40 @@ stay pure and unit-tested. Live game API access is isolated in
 ## Mod Metadata
 
 - Manifest id: `tod`
+- Package/repo name: `sb-tod`
+- Railyard display name: `Transit-Oriented Development[beta]`
+- Release manifest author: `hsullivan1201`
+- GitHub update repo: `hsullivan1201/sb-tod`
 - Main bundle: `dist/index.js`
 - Game dependency: Subway Builder modding API `>=1.0.0`
+
+## Railyard Publishing
+
+For a normal version release, do not open a Railyard "Update Mod" issue.
+The registry entry for `tod` already points at GitHub Releases for
+`hsullivan1201/sb-tod`, so Railyard should discover new complete
+semver releases from GitHub.
+
+Release checklist:
+
+1. Update the version in `package.json`, `manifest.json`, and
+   `src/main.ts`.
+2. Confirm `manifest.json` keeps `id: "tod"` and
+   `author.name: "hsullivan1201"`.
+3. Run `pnpm typecheck`, `pnpm test`, and `pnpm build`.
+4. Create `sb-tod-vX.Y.Z.zip` with top-level `manifest.json` and
+   `dist/index.js`.
+5. Tag and push `vX.Y.Z`.
+6. Create a GitHub Release with the changelog in the release notes.
+7. Upload both `sb-tod-vX.Y.Z.zip` and standalone `manifest.json` as
+   release assets.
+
+Only use a Railyard "Update Mod" issue when changing registry metadata,
+such as display name, description, tags, source URL, gallery, or update
+source. A no-op issue with only `Mod ID = tod` can validate the fields
+but fail when the bot has nothing to commit. If an update issue fails
+because a field was wrong, edit the issue body, then comment
+`revalidate`.
 
 ## Notes
 
