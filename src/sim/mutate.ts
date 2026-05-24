@@ -144,6 +144,15 @@ export interface DemandMutator {
     source: DeltaSourceKind
   ): ApplyResult;
 
+  /**
+   * Apply several deltas with one shared original-pop index. This keeps a
+   * day tick from re-scanning the whole city for every walkshed point.
+   */
+  applyDensityDeltas(
+    targets: Array<{ pointId: string; delta: DemandDelta }>,
+    source: DeltaSourceKind
+  ): ApplyResult[];
+
   getBaseline(pointId: string): { jobs: number; residents: number } | undefined;
   getCumulativeDelta(pointId: string): PointDelta | undefined;
   getCumulativeDeltaTotal(pointId: string): { jobs: number; residents: number };
@@ -157,6 +166,12 @@ export interface DemandMutator {
    * load before any mutation.
    */
   captureBaselines(): void;
+
+  /**
+   * Capture only point aggregate baselines. Used when compact persisted state
+   * hydrates and we want lazy pop baselines without O(points²) map copying.
+   */
+  capturePointBaselines(points: Iterable<DemandPoint>): void;
 
   /**
    * Restore every touched point and pop to its captured baseline AND
@@ -187,6 +202,17 @@ export interface DemandMutator {
 
   /** Read-only view for persistence and tests. */
   snapshot(): MutatorSnapshot;
+
+  /** Compact persistence view: only changed points and their original pops. */
+  compactSnapshot(): MutatorSnapshot;
+
+  /** Cheap counts that do not copy the tracking maps. */
+  trackingCounts(): {
+    baselineDemand: number;
+    baselinePopSizes: number;
+    cumulativeDeltas: number;
+    splitChildren: number;
+  };
 
   /**
    * Hydrate tracking state (baselines + cumulative deltas + split
@@ -223,6 +249,14 @@ const sourceField: Record<DeltaSourceKind, 'fromDeals' | 'fromOrganic'> = {
   deals: 'fromDeals',
   organic: 'fromOrganic',
 };
+
+type AllocationDimension = 'residents' | 'jobs';
+
+interface PopIndex {
+  byResidence: Map<string, Pop[]>;
+  byJob: Map<string, Pop[]>;
+  originalsById: Map<string, Pop>;
+}
 
 function isSplitChildId(id: string): boolean {
   return id.startsWith(SPLIT_POP_PREFIX);
@@ -325,6 +359,8 @@ export function createMutator(
   const cumulativeDeltas = new Map<string, PointDelta>();
   const splitChildren = new Map<string, string[]>();
   const tagged = new WeakSet<DemandPoint>();
+  const touchedPointIds = new Set<string>();
+  const touchedPopIds = new Set<string>();
 
   function ensurePointBaseline(point: DemandPoint): { jobs: number; residents: number } {
     let baseline = baselineDemand.get(point.id);
@@ -354,6 +390,63 @@ export function createMutator(
     if (Math.abs(workerTotal - point.jobs) > 1e-6) {
       point.workerModeShare = normalizeModeBreakdown(point.workerModeShare, point.jobs);
       tagged.add(point);
+    }
+  }
+
+  function isZeroCumulativeDelta(delta: PointDelta): boolean {
+    return (
+      delta.jobs.fromDeals === 0 &&
+      delta.jobs.fromOrganic === 0 &&
+      delta.residents.fromDeals === 0 &&
+      delta.residents.fromOrganic === 0
+    );
+  }
+
+  function addIndexed(map: Map<string, Pop[]>, key: string, pop: Pop): void {
+    const existing = map.get(key);
+    if (existing) existing.push(pop);
+    else map.set(key, [pop]);
+  }
+
+  function buildOriginalPopIndex(): PopIndex {
+    const index: PopIndex = {
+      byResidence: new Map(),
+      byJob: new Map(),
+      originalsById: new Map(),
+    };
+    for (const pop of demand.popsMap.values()) {
+      if (isSplitChildId(pop.id)) continue;
+      index.originalsById.set(pop.id, pop);
+      addIndexed(index.byResidence, pop.residenceId, pop);
+      addIndexed(index.byJob, pop.jobId, pop);
+    }
+    return index;
+  }
+
+  function originalsForPoint(pointId: string, index: PopIndex): Pop[] {
+    const byId = new Map<string, Pop>();
+    for (const pop of index.byResidence.get(pointId) ?? []) byId.set(pop.id, pop);
+    for (const pop of index.byJob.get(pointId) ?? []) byId.set(pop.id, pop);
+    return [...byId.values()];
+  }
+
+  function originalsForDimension(
+    pointId: string,
+    dimension: AllocationDimension,
+    index: PopIndex
+  ): Pop[] {
+    return dimension === 'residents'
+      ? index.byResidence.get(pointId) ?? []
+      : index.byJob.get(pointId) ?? [];
+  }
+
+  function markTouchedPopsForPoints(pointIds: Set<string>): void {
+    if (pointIds.size === 0) return;
+    for (const pop of demand.popsMap.values()) {
+      if (isSplitChildId(pop.id)) continue;
+      if (pointIds.has(pop.residenceId) || pointIds.has(pop.jobId)) {
+        touchedPopIds.add(pop.id);
+      }
     }
   }
 
@@ -502,8 +595,14 @@ export function createMutator(
 
     let removed = 0;
     for (const id of splitIds) {
+      const child = demand.popsMap.get(id);
       if (demand.popsMap.delete(id)) removed++;
-      removePopIdFromAllPoints(id);
+      if (child) {
+        removePopIdFromPoint(child.residenceId, id);
+        if (child.jobId !== child.residenceId) removePopIdFromPoint(child.jobId, id);
+      } else {
+        removePopIdFromAllPoints(id);
+      }
     }
     splitChildren.clear();
 
@@ -627,6 +726,25 @@ export function createMutator(
     delta: DemandDelta,
     source: DeltaSourceKind
   ): ApplyResult {
+    return applyDensityDeltaInternal(pointId, delta, source, buildOriginalPopIndex());
+  }
+
+  function applyDensityDeltas(
+    targets: Array<{ pointId: string; delta: DemandDelta }>,
+    source: DeltaSourceKind
+  ): ApplyResult[] {
+    const index = buildOriginalPopIndex();
+    return targets.map((target) =>
+      applyDensityDeltaInternal(target.pointId, target.delta, source, index)
+    );
+  }
+
+  function applyDensityDeltaInternal(
+    pointId: string,
+    delta: DemandDelta,
+    source: DeltaSourceKind,
+    index: PopIndex
+  ): ApplyResult {
     const point = demand.points.get(pointId);
     if (!point) {
       return {
@@ -717,14 +835,7 @@ export function createMutator(
     // First find the ORIGINAL pops affected by this mutation. Snapshot
     // to an array so we don't reprocess split children we create during
     // the loop (Map iteration includes entries added mid-iteration).
-    const affectedOriginals: Pop[] = [];
-    for (const pop of demand.popsMap.values()) {
-      if (isSplitChildId(pop.id)) continue;
-      const homeAtP = pop.residenceId === pointId;
-      const jobAtP = pop.jobId === pointId;
-      if (!homeAtP && !jobAtP) continue;
-      affectedOriginals.push(pop);
-    }
+    const affectedOriginals = originalsForPoint(pointId, index);
     // Capture baselines for affected pops up front so the apportionment
     // weights have access to them whether we go strict or fractional.
     for (const pop of affectedOriginals) ensurePopBaseline(pop);
@@ -738,7 +849,7 @@ export function createMutator(
       // changed, so housing does not create phantom jobs at the work
       // endpoint and commercial does not create phantom residents at the
       // home endpoint.
-      const r = reconcilePointStrict(pointId, affectedOriginals);
+      const r = reconcilePointStrict(pointId, index);
       totalCreated += r.created;
       totalRemoved += r.removed;
     } else {
@@ -761,6 +872,8 @@ export function createMutator(
     point.residents = nextRes;
     normalizePointModeShares(point);
     tagged.add(point);
+    touchedPointIds.add(pointId);
+    for (const pop of affectedOriginals) touchedPopIds.add(pop.id);
 
     return {
       ok: true,
@@ -773,11 +886,10 @@ export function createMutator(
     };
   }
 
-  type AllocationDimension = 'residents' | 'jobs';
-
   function allocationForPoint(
     pointId: string,
-    dimension: AllocationDimension
+    dimension: AllocationDimension,
+    index: PopIndex
   ): Map<string, number> {
     if (strictUnitSize === undefined || strictUnitSize <= 0) return new Map();
 
@@ -786,12 +898,7 @@ export function createMutator(
 
     const cum = cumulativeDeltas.get(pointId);
     const totals = cum ? totalOf(cum) : { jobs: 0, residents: 0 };
-    const origins: Pop[] = [];
-    for (const p of demand.popsMap.values()) {
-      if (isSplitChildId(p.id)) continue;
-      if (dimension === 'residents' && p.residenceId === pointId) origins.push(p);
-      if (dimension === 'jobs' && p.jobId === pointId) origins.push(p);
-    }
+    const origins = originalsForDimension(pointId, dimension, index);
 
     const cumulativeDelta = dimension === 'residents' ? totals.residents : totals.jobs;
     // Additions are materialized in strictUnitSize chunks. Do NOT derive
@@ -817,17 +924,14 @@ export function createMutator(
    */
   function reconcilePointStrict(
     pointId: string,
-    _affected: Pop[]
+    index: PopIndex = buildOriginalPopIndex()
   ): { created: number; removed: number } {
     if (strictUnitSize === undefined || strictUnitSize <= 0) {
       return { created: 0, removed: 0 };
     }
 
     const allTouching = new Set<string>();
-    for (const p of demand.popsMap.values()) {
-      if (isSplitChildId(p.id)) continue;
-      if (p.residenceId === pointId || p.jobId === pointId) allTouching.add(p.id);
-    }
+    for (const p of originalsForPoint(pointId, index)) allTouching.add(p.id);
 
     let created = 0;
     let removed = 0;
@@ -836,7 +940,7 @@ export function createMutator(
       const key = `${point}:${dimension}`;
       let cached = allocations.get(key);
       if (!cached) {
-        cached = allocationForPoint(point, dimension);
+        cached = allocationForPoint(point, dimension, index);
         allocations.set(key, cached);
       }
       return cached;
@@ -853,6 +957,8 @@ export function createMutator(
       created += r.created;
       removed += r.removed;
     }
+    const point = demand.points.get(pointId);
+    if (point) normalizePointModeShares(point);
     return { created, removed };
   }
 
@@ -906,6 +1012,10 @@ export function createMutator(
     }
   }
 
+  function capturePointBaselines(points: Iterable<DemandPoint>): void {
+    for (const point of points) ensurePointBaseline(point);
+  }
+
   function revertAll(): void {
     // Tear down all split children first. We walk splitChildren rather
     // than popsMap so we know which IDs are ours to delete.
@@ -936,10 +1046,13 @@ export function createMutator(
       pop.size = baseline;
     }
     cumulativeDeltas.clear();
+    touchedPointIds.clear();
+    touchedPopIds.clear();
   }
 
   return {
     applyDensityDelta,
+    applyDensityDeltas,
     getBaseline(pointId) {
       const b = baselineDemand.get(pointId);
       return b ? { jobs: b.jobs, residents: b.residents } : undefined;
@@ -955,13 +1068,14 @@ export function createMutator(
       return tagged.has(point);
     },
     captureBaselines,
+    capturePointBaselines,
     revertAll,
     canonicalizeSplits,
     reconcilePoint(pointId) {
       if (strictUnitSize === undefined || strictUnitSize <= 0) {
         return { created: 0, removed: 0 };
       }
-      return reconcilePointStrict(pointId, []);
+      return reconcilePointStrict(pointId);
     },
     snapshot() {
       // IMPORTANT: return shallow copies, not refs. snapshot() is often
@@ -978,6 +1092,68 @@ export function createMutator(
         splitChildren: new Map(splitChildren),
       };
     },
+    compactSnapshot() {
+      const compactPointIds = new Set<string>();
+      for (const [id, delta] of cumulativeDeltas) {
+        if (!isZeroCumulativeDelta(delta)) compactPointIds.add(id);
+      }
+      for (const id of touchedPointIds) {
+        const delta = cumulativeDeltas.get(id);
+        if (delta && !isZeroCumulativeDelta(delta)) compactPointIds.add(id);
+      }
+
+      const compactPopIds = new Set(touchedPopIds);
+      for (const [originId, children] of splitChildren) {
+        if (children.length > 0) compactPopIds.add(originId);
+      }
+
+      const compactBaselines = new Map<string, { jobs: number; residents: number }>();
+      for (const id of compactPointIds) {
+        const baseline = baselineDemand.get(id);
+        if (baseline) compactBaselines.set(id, { jobs: baseline.jobs, residents: baseline.residents });
+      }
+
+      const compactPopSizes = new Map<string, number>();
+      for (const id of compactPopIds) {
+        const size = baselinePopSizes.get(id);
+        if (size !== undefined) compactPopSizes.set(id, size);
+      }
+
+      const compactDeltas = new Map<string, PointDelta>();
+      for (const id of compactPointIds) {
+        const d = cumulativeDeltas.get(id);
+        if (!d || isZeroCumulativeDelta(d)) continue;
+        compactDeltas.set(id, {
+          jobs: { fromDeals: d.jobs.fromDeals, fromOrganic: d.jobs.fromOrganic },
+          residents: {
+            fromDeals: d.residents.fromDeals,
+            fromOrganic: d.residents.fromOrganic,
+          },
+        });
+      }
+
+      const compactSplits = new Map<string, string[]>();
+      for (const [id, children] of splitChildren) {
+        if (children.length > 0 && compactPopIds.has(id)) {
+          compactSplits.set(id, [...children]);
+        }
+      }
+
+      return {
+        baselineDemand: compactBaselines,
+        baselinePopSizes: compactPopSizes,
+        cumulativeDeltas: compactDeltas,
+        splitChildren: compactSplits,
+      };
+    },
+    trackingCounts() {
+      return {
+        baselineDemand: baselineDemand.size,
+        baselinePopSizes: baselinePopSizes.size,
+        cumulativeDeltas: cumulativeDeltas.size,
+        splitChildren: splitChildren.size,
+      };
+    },
     hydrateTracking(persisted) {
       // Materialize ALL inputs to arrays first, BEFORE we clear any
       // live map. If a caller passed in a ref to one of our live
@@ -992,6 +1168,8 @@ export function createMutator(
       baselinePopSizes.clear();
       cumulativeDeltas.clear();
       splitChildren.clear();
+      touchedPointIds.clear();
+      touchedPopIds.clear();
       for (const [id, b] of baselines) {
         baselineDemand.set(id, { jobs: b.jobs, residents: b.residents });
       }
@@ -1003,10 +1181,15 @@ export function createMutator(
           jobs: { fromDeals: d.jobs.fromDeals, fromOrganic: d.jobs.fromOrganic },
           residents: { fromDeals: d.residents.fromDeals, fromOrganic: d.residents.fromOrganic },
         });
+        if (!isZeroCumulativeDelta(d)) touchedPointIds.add(id);
       }
       for (const [id, children] of splits) {
-        if (children.length > 0) splitChildren.set(id, [...children]);
+        if (children.length > 0) {
+          splitChildren.set(id, [...children]);
+          touchedPopIds.add(id);
+        }
       }
+      markTouchedPopsForPoints(touchedPointIds);
     },
   };
 }

@@ -19,7 +19,7 @@ import { gameState } from '../api';
 import type { LngLat, StationGroup } from '../types';
 import type { AccessScore, ScoreOptions, StationScore } from './todScore';
 import { scoreAccess, scoreFromWalkshed } from './todScore';
-import { findWalkshed, totalsFromHits, type WalkshedTotals } from './walkshed';
+import { createWalkshedIndex, totalsFromHits, type WalkshedTotals } from './walkshed';
 
 export interface ScoredStation {
   /** Group id when grouped, station id when ungrouped fallback. */
@@ -72,6 +72,9 @@ export function scoreAllStationsDetailed(options: ScoreAllOptions = {}): ScoreRe
   const groups = gameState.getStationGroups();
   const points = gameState.getDemandData().points;
   const pointList = Array.from(points.values());
+  const walkshedIndex = createWalkshedIndex(pointList, {
+    cellSizeMeters: options.radiusMeters ?? 500,
+  });
 
   // Build a stationId → station lookup for ridership + coord fallback.
   const stationById = new Map(stations.map((s) => [s.id, s] as const));
@@ -101,7 +104,7 @@ export function scoreAllStationsDetailed(options: ScoreAllOptions = {}): ScoreRe
     const center = pickGroupCenter(group, memberIds, stationById);
     if (!center) continue;
 
-    const hits = findWalkshed([center[0], center[1]], pointList, {
+    const hits = walkshedIndex.find([center[0], center[1]], {
       radiusMeters: options.radiusMeters,
     });
     const totals = totalsFromHits(hits);
@@ -128,7 +131,7 @@ export function scoreAllStationsDetailed(options: ScoreAllOptions = {}): ScoreRe
   // Fallback: stations not in any group get scored individually.
   for (const station of stations) {
     if (coveredStationIds.has(station.id)) continue;
-    const hits = findWalkshed(station.coords, pointList, {
+    const hits = walkshedIndex.find(station.coords, {
       radiusMeters: options.radiusMeters,
     });
     const totals = totalsFromHits(hits);

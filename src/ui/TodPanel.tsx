@@ -2072,7 +2072,10 @@ const diagnosticValueStyle: React.CSSProperties = {
 };
 
 function downloadDebug(snapshot: Snapshot) {
-  sampleRuntimeTrace('debug-download');
+  sampleRuntimeTrace('debug-download', {
+    includeCompletedCommutes: true,
+    fullScan: true,
+  });
   const dump = (s: ScoredStation) => ({
     id: s.id,
     name: s.name,

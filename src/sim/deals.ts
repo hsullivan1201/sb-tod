@@ -14,7 +14,7 @@
 
 import type { DemandPoint } from '../types';
 import type { LngLat } from '../types';
-import { findWalkshed, type WalkshedHit } from '../scoring/walkshed';
+import { findWalkshed, type WalkshedHit, type WalkshedIndex } from '../scoring/walkshed';
 
 export type DealKind = 'housing' | 'commercial' | 'mixed';
 export type DealTier = 'S' | 'M' | 'L';
@@ -433,6 +433,8 @@ export interface ComputeDailyApplyInput {
   currentDay: number;
   /** Live DemandPoints in the deal's walkshed (for re-deriving weights). */
   walkshedPoints: Iterable<DemandPoint>;
+  /** Optional shared spatial index for day ticks with multiple active deals. */
+  walkshedIndex?: WalkshedIndex;
   residentsEligibilityThreshold?: number;
   jobsEligibilityThreshold?: number;
   /**
@@ -528,11 +530,10 @@ export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan
   // Re-derive walkshed weights against current live demand. Eligibility
   // can shift over the deal's lifetime as density grows; we honor that
   // (a point that becomes eligible mid-deal joins the distribution).
-  const hits = findWalkshed(
-    [deal.centerLngLat[0], deal.centerLngLat[1]],
-    input.walkshedPoints,
-    { radiusMeters: deal.radiusMeters }
-  );
+  const center: [number, number] = [deal.centerLngLat[0], deal.centerLngLat[1]];
+  const hits = input.walkshedIndex
+    ? input.walkshedIndex.find(center, { radiusMeters: deal.radiusMeters })
+    : findWalkshed(center, input.walkshedPoints, { radiusMeters: deal.radiusMeters });
   const resThreshold = input.residentsEligibilityThreshold ?? 0;
   const jobThreshold = input.jobsEligibilityThreshold ?? 0;
   const resEligible = hits.filter((h) => h.point.residents > resThreshold);

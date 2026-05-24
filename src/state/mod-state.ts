@@ -39,6 +39,7 @@ import {
   computeDailyApply,
   type Deal,
 } from '../sim/deals';
+import { createWalkshedIndex } from '../scoring/walkshed';
 import {
   createAdaptiveStorage,
   type AdaptiveStorage,
@@ -503,8 +504,9 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         fromStorage: false,
       };
       deals = [];
+      const counts = mutator.trackingCounts();
       console.log(
-        `[sb-tod] No persisted state found at "${storageKey}". Captured ${mutator.snapshot().baselineDemand.size} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install or different save slot).`
+        `[sb-tod] No persisted state found at "${storageKey}". Captured ${counts.baselineDemand} fresh baselines from live demand. Storage keys present: [${storageKeys.join(', ')}] (empty=backend not working, non-empty=just a fresh install or different save slot).`
       );
     }
 
@@ -548,7 +550,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
 
   function buildPersistedPayload(savedAt: number): PersistedState | null {
     if (!mutator) return null;
-    const snap = mutator.snapshot();
+    const snap = mutator.compactSnapshot();
     return {
       version: 1,
       savedAt,
@@ -585,7 +587,9 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     demand = live;
     mutator = createMutator(live, mutatorOptions);
     if (persisted) {
-      lastHydrate = applyPersisted(mutator, live, persisted);
+      lastHydrate = applyPersisted(mutator, live, persisted, {
+        canonicalizeSplits: false,
+      });
       console.log(
         `[sb-tod] Rebound mutator to refreshed DemandData: preserved=${lastHydrate.preserved}, replayed=${lastHydrate.replayed}, baselineShift=${lastHydrate.baselineShift}, missingPoint=${lastHydrate.missingPoint}`
       );
@@ -683,7 +687,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
 
       if (dirty && dayTicks % persistEveryNDays === 0) {
         dayTickPhase = 'persist';
-        void persist();
+        schedulePersist();
       }
     } catch (err) {
       lastTickError = err instanceof Error ? err.message : String(err);
@@ -703,8 +707,10 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   function applyActiveDealsForDay(day: number): DealTickReport[] {
     if (!mutator || !demand) return [];
     const reports: DealTickReport[] = [];
-    for (const deal of deals) {
-      if (deal.state !== 'active') continue;
+    const activeDeals = deals.filter((deal) => deal.state === 'active');
+    const walkshedIndex =
+      activeDeals.length > 0 ? createWalkshedIndex(demand.points.values()) : null;
+    for (const deal of activeDeals) {
       lastTickActiveDealId = deal.id;
       // Don't tick on a day before the deal started (defensive against
       // weird load ordering — shouldn't normally happen).
@@ -713,12 +719,15 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         deal,
         currentDay: day,
         walkshedPoints: demand.points.values(),
+        walkshedIndex: walkshedIndex ?? undefined,
       });
       let applied = { jobs: 0, residents: 0 };
       let pointsAffected = 0;
       let rejections = 0;
-      for (const target of plan.targets) {
-        const r = mutator.applyDensityDelta(target.pointId, target.delta, 'deals');
+      const results = plan.targets.length > 0 ? mutator.applyDensityDeltas(plan.targets, 'deals') : [];
+      for (let i = 0; i < plan.targets.length; i++) {
+        const target = plan.targets[i];
+        const r = results[i];
         if (r.ok) {
           applied.jobs += target.delta.jobs ?? 0;
           applied.residents += target.delta.residents ?? 0;
@@ -806,6 +815,16 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     if (initialized && dirty) void persist();
   }
 
+  function schedulePersist(): void {
+    if (typeof window !== 'undefined') {
+      window.setTimeout(() => {
+        void persist();
+      }, 0);
+      return;
+    }
+    void Promise.resolve().then(() => persist());
+  }
+
   async function setCurrentSaveName(name: string | null): Promise<void> {
     if (name === currentSaveName) return;
     // Persist current state under the OLD name before switching, so any
@@ -884,7 +903,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     debugResetCurrentSave() {
       if (!mutator) return { dealsCleared: 0, pointsReverted: 0 };
       const dealsCleared = deals.length;
-      const pointsReverted = mutator.snapshot().baselineDemand.size;
+      const pointsReverted = mutator.trackingCounts().baselineDemand;
       mutator.revertAll();
       deals = [];
       lastTickReports = [];
@@ -920,8 +939,10 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         currentDay: d.startDay + d.durationDays - 1,
         walkshedPoints: demand.points.values(),
       });
-      for (const target of plan.targets) {
-        const r = mutator.applyDensityDelta(target.pointId, target.delta, 'deals');
+      const results = plan.targets.length > 0 ? mutator.applyDensityDeltas(plan.targets, 'deals') : [];
+      for (let i = 0; i < plan.targets.length; i++) {
+        const target = plan.targets[i];
+        const r = results[i];
         if (r.ok) {
           d.appliedSoFar.residents += target.delta.residents ?? 0;
           d.appliedSoFar.jobs += target.delta.jobs ?? 0;
@@ -945,7 +966,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     onGameLoadedFired,
     onGameEndFired,
     stats() {
-      const snap = mutator?.snapshot();
+      const counts = mutator?.trackingCounts();
       const storageBackend: StorageBackendKind =
         (backend as Partial<AdaptiveStorage>).lastBackend?.() ?? 'api';
       let activeDealsCount = 0;
@@ -968,9 +989,9 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         storageRoundTripOk,
         storageBackend,
         initProbe,
-        pointsTracked: snap?.baselineDemand.size ?? 0,
-        popsTracked: snap?.baselinePopSizes.size ?? 0,
-        pointsWithDeltas: snap?.cumulativeDeltas.size ?? 0,
+        pointsTracked: counts?.baselineDemand ?? 0,
+        popsTracked: counts?.baselinePopSizes ?? 0,
+        pointsWithDeltas: counts?.cumulativeDeltas ?? 0,
         lastHydrate,
         activeDeals: activeDealsCount,
         completedDeals: completedDealsCount,
@@ -999,7 +1020,8 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
 function applyPersisted(
   mutator: DemandMutator,
   demand: DemandData,
-  persisted: PersistedState
+  persisted: PersistedState,
+  options: { canonicalizeSplits?: boolean } = {}
 ): HydrateReport {
   const report: HydrateReport = {
     perPoint: new Map(),
@@ -1023,9 +1045,11 @@ function applyPersisted(
   // baseline + cumulative deltas instead of trusting preserved child
   // objects. DemandPoint aggregates are left untouched for the
   // preserved/reset checks below.
-  const canonical = mutator.canonicalizeSplits();
-  report.splitChildrenRemoved = canonical.removed;
-  report.originalPopsReset = canonical.originalsReset;
+  if (options.canonicalizeSplits !== false) {
+    const canonical = mutator.canonicalizeSplits();
+    report.splitChildrenRemoved = canonical.removed;
+    report.originalPopsReset = canonical.originalsReset;
+  }
 
   // Now walk each persisted point and decide.
   for (const [pointId, delta] of persisted.cumulativeDeltas) {
@@ -1095,13 +1119,10 @@ function applyPersisted(
     }
   }
 
-  // Also capture baselines for any currently-live point we didn't
-  // persist (new points in the city data since last save).
-  for (const point of demand.points.values()) {
-    if (!mutator.getBaseline(point.id)) {
-      rebaselineTo(mutator, point);
-    }
-  }
+  // Compact persisted state stores only changed points. Capture live
+  // point aggregate baselines in one linear pass; pop baselines remain
+  // lazy and are captured only for points we actually mutate.
+  mutator.capturePointBaselines(demand.points.values());
 
   return report;
 }

@@ -15,6 +15,24 @@ import type { DemandData } from '../types';
 
 const RUNTIME_TRACE_INTERVAL_MS = 2500;
 const RUNTIME_TRACE_LIMIT = 240;
+const RUNTIME_TRACE_DEMAND_SCAN_LIMIT = 2000;
+const RUNTIME_TRACE_COMMUTE_SCAN_LIMIT = 1000;
+
+export interface RuntimeTraceSampleOptions {
+  /** Expensive: calls and scans the completed-commutes array. */
+  includeCompletedCommutes?: boolean;
+  /** Expensive: scans complete demand/commute collections instead of bounded samples. */
+  fullScan?: boolean;
+}
+
+export interface RuntimeTraceSamplerOptions {
+  /**
+   * Off by default. The sampler used to run every 2.5s in normal play,
+   * which made the freeze diagnostic path a potential freeze source.
+   */
+  interval?: boolean;
+  intervalMs?: number;
+}
 
 export interface RuntimeTraceEntry {
   at: number;
@@ -33,6 +51,8 @@ export interface RuntimeTraceEntry {
     pops: number;
     splitPops: number;
     splitSize: number;
+    popsScanned: number;
+    scanTruncated: boolean;
   } | null;
   modState: {
     initialized: boolean;
@@ -52,6 +72,8 @@ export interface RuntimeTraceEntry {
     count: number;
     splitPopCount: number;
     splitPopIdsSample: string[];
+    commutesScanned: number;
+    scanTruncated: boolean;
   } | null;
   demandEventsSinceLastSample: number;
   lastDemandEventAt: number | null;
@@ -100,11 +122,22 @@ function secondOfDay(elapsedSeconds: number | null): number | null {
   return ((elapsedSeconds % 86_400) + 86_400) % 86_400;
 }
 
-function summarizeDemand(demand: DemandData | null): RuntimeTraceEntry['demand'] {
+function summarizeDemand(
+  demand: DemandData | null,
+  options: RuntimeTraceSampleOptions
+): RuntimeTraceEntry['demand'] {
   if (!demand || !demand.points || !demand.popsMap) return null;
   let splitPops = 0;
   let splitSize = 0;
+  let popsScanned = 0;
+  let scanTruncated = false;
+  const limit = options.fullScan ? Infinity : RUNTIME_TRACE_DEMAND_SCAN_LIMIT;
   for (const pop of demand.popsMap.values() as Iterable<any>) {
+    if (popsScanned >= limit) {
+      scanTruncated = true;
+      break;
+    }
+    popsScanned++;
     if (typeof pop?.id === 'string' && pop.id.startsWith(SPLIT_POP_PREFIX)) {
       splitPops++;
       if (typeof pop.size === 'number' && Number.isFinite(pop.size)) {
@@ -117,6 +150,8 @@ function summarizeDemand(demand: DemandData | null): RuntimeTraceEntry['demand']
     pops: demand.popsMap.size,
     splitPops,
     splitSize,
+    popsScanned,
+    scanTruncated,
   };
 }
 
@@ -138,12 +173,22 @@ function summarizeModState(): RuntimeTraceEntry['modState'] {
   }, null);
 }
 
-function summarizeCompletedCommutes(): RuntimeTraceEntry['completedCommutes'] {
+function summarizeCompletedCommutes(
+  options: RuntimeTraceSampleOptions
+): RuntimeTraceEntry['completedCommutes'] {
   return safe(() => {
     const commutes = gameState.getCompletedCommutes();
     let splitPopCount = 0;
+    let commutesScanned = 0;
+    let scanTruncated = false;
     const splitPopIdsSample: string[] = [];
+    const limit = options.fullScan ? Infinity : RUNTIME_TRACE_COMMUTE_SCAN_LIMIT;
     for (const commute of commutes as any[]) {
+      if (commutesScanned >= limit) {
+        scanTruncated = true;
+        break;
+      }
+      commutesScanned++;
       const popId = typeof commute?.popId === 'string' ? commute.popId : '';
       if (popId.startsWith(SPLIT_POP_PREFIX)) {
         splitPopCount++;
@@ -154,11 +199,16 @@ function summarizeCompletedCommutes(): RuntimeTraceEntry['completedCommutes'] {
       count: commutes.length,
       splitPopCount,
       splitPopIdsSample,
+      commutesScanned,
+      scanTruncated,
     };
   }, null);
 }
 
-export function sampleRuntimeTrace(reason: string): RuntimeTraceEntry {
+export function sampleRuntimeTrace(
+  reason: string,
+  options: RuntimeTraceSampleOptions = {}
+): RuntimeTraceEntry {
   const state = getRuntimeTraceState();
   const elapsedSeconds = finite(safe(() => gameState.getElapsedSeconds(), NaN));
   const demand = safe(() => gameState.getDemandData(), null);
@@ -174,11 +224,13 @@ export function sampleRuntimeTrace(reason: string): RuntimeTraceEntry {
       paused: safe(() => gameState.isPaused(), null),
       budget: finite(safe(() => gameState.getBudget(), NaN)),
     },
-    demand: summarizeDemand(demand),
+    demand: summarizeDemand(demand, options),
     modState: summarizeModState(),
     ridershipStats: safe(() => gameState.getRidershipStats(), null),
     modeChoiceStats: safe(() => gameState.getModeChoiceStats(), null),
-    completedCommutes: summarizeCompletedCommutes(),
+    completedCommutes: options.includeCompletedCommutes
+      ? summarizeCompletedCommutes(options)
+      : null,
     demandEventsSinceLastSample: state.demandEventsSinceLastSample,
     lastDemandEventAt: state.lastDemandEventAt,
   };
@@ -192,35 +244,36 @@ export function sampleRuntimeTrace(reason: string): RuntimeTraceEntry {
   return entry;
 }
 
-export function ensureRuntimeTraceSampler(): void {
+export function ensureRuntimeTraceSampler(options: RuntimeTraceSamplerOptions = {}): void {
   const state = getRuntimeTraceState();
-  if (state.hookRegistered) return;
-  state.hookRegistered = true;
+  if (!state.hookRegistered) {
+    state.hookRegistered = true;
 
-  try {
-    hooks.onDayChange((day) => {
-      sampleRuntimeTrace(`day-change:${day}`);
-    });
-  } catch (err) {
-    console.warn('[sb-tod] runtime trace day hook failed:', err);
+    try {
+      hooks.onDayChange((day) => {
+        sampleRuntimeTrace(`day-change:${day}`);
+      });
+    } catch (err) {
+      console.warn('[sb-tod] runtime trace day hook failed:', err);
+    }
+
+    try {
+      hooks.onDemandChange(() => {
+        state.demandEventsSinceLastSample++;
+        state.lastDemandEventAt = Date.now();
+      });
+    } catch (err) {
+      console.warn('[sb-tod] runtime trace demand hook failed:', err);
+    }
+
+    sampleRuntimeTrace('start');
   }
 
-  try {
-    hooks.onDemandChange(() => {
-      state.demandEventsSinceLastSample++;
-      state.lastDemandEventAt = Date.now();
-    });
-  } catch (err) {
-    console.warn('[sb-tod] runtime trace demand hook failed:', err);
-  }
-
-  if (typeof window !== 'undefined') {
+  if (options.interval && typeof window !== 'undefined' && state.intervalId == null) {
     state.intervalId = window.setInterval(() => {
       sampleRuntimeTrace('interval');
-    }, RUNTIME_TRACE_INTERVAL_MS);
+    }, options.intervalMs ?? RUNTIME_TRACE_INTERVAL_MS);
   }
-
-  sampleRuntimeTrace('start');
 }
 
 export function runtimeTraceSnapshot(): RuntimeTraceEntry[] {

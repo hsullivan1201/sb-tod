@@ -55,6 +55,13 @@ export interface WalkshedOptions {
 }
 
 const DEFAULT_RADIUS_M = 500;
+const METERS_PER_DEGREE_LAT = 110_574;
+const METERS_PER_DEGREE_LNG_AT_EQUATOR = 111_320;
+
+export interface WalkshedIndex {
+  pointCount: number;
+  find(center: Coordinate, options?: WalkshedOptions): WalkshedHit[];
+}
 
 export function linearDecay(d: number, r: number): number {
   if (d <= 0) return 1;
@@ -81,6 +88,66 @@ export function findWalkshed(
     });
   }
   return hits;
+}
+
+export function createWalkshedIndex(
+  points: Iterable<DemandPoint>,
+  options: { cellSizeMeters?: number } = {}
+): WalkshedIndex {
+  const cellSizeDegrees = Math.max(
+    0.0005,
+    (options.cellSizeMeters ?? DEFAULT_RADIUS_M) / METERS_PER_DEGREE_LNG_AT_EQUATOR
+  );
+  const cells = new Map<string, DemandPoint[]>();
+  let pointCount = 0;
+
+  const keyFor = (lng: number, lat: number): string =>
+    `${Math.floor(lng / cellSizeDegrees)}:${Math.floor(lat / cellSizeDegrees)}`;
+
+  for (const point of points) {
+    const [lng, lat] = point.location;
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) continue;
+    const key = keyFor(lng, lat);
+    const bucket = cells.get(key);
+    if (bucket) bucket.push(point);
+    else cells.set(key, [point]);
+    pointCount++;
+  }
+
+  return {
+    pointCount,
+    find(center: Coordinate, findOptions: WalkshedOptions = {}) {
+      const radius = findOptions.radiusMeters ?? DEFAULT_RADIUS_M;
+      const decay = findOptions.decay ?? linearDecay;
+      const [lng, lat] = center;
+      const lngCos = Math.max(0.01, Math.abs(Math.cos(toRad(lat))));
+      const latDelta = radius / METERS_PER_DEGREE_LAT;
+      const lngDelta = radius / (METERS_PER_DEGREE_LNG_AT_EQUATOR * lngCos);
+      const minX = Math.floor((lng - lngDelta) / cellSizeDegrees);
+      const maxX = Math.floor((lng + lngDelta) / cellSizeDegrees);
+      const minY = Math.floor((lat - latDelta) / cellSizeDegrees);
+      const maxY = Math.floor((lat + latDelta) / cellSizeDegrees);
+      const hits: WalkshedHit[] = [];
+
+      for (let x = minX; x <= maxX; x++) {
+        for (let y = minY; y <= maxY; y++) {
+          const bucket = cells.get(`${x}:${y}`);
+          if (!bucket) continue;
+          for (const point of bucket) {
+            const distanceMeters = haversineMeters(center, point.location);
+            if (distanceMeters > radius) continue;
+            hits.push({
+              point,
+              distanceMeters,
+              weight: decay(distanceMeters, radius),
+            });
+          }
+        }
+      }
+
+      return hits;
+    },
+  };
 }
 
 export function totalsFromHits(hits: WalkshedHit[]): WalkshedTotals {
