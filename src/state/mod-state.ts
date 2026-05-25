@@ -1520,7 +1520,21 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       return;
     }
     // Same save name (or undefined — game didn't tell us): just re-init
-    // to pick up whatever the game put in live demand.
+    // to pick up whatever the game put in live demand. If we have dirty
+    // in-memory deals/deltas, carry them through the re-init instead of
+    // replacing them with older storage.
+    const pendingDirtyPayload = initialized && dirty ? buildPersistedPayload(Date.now()) : null;
+    if (pendingDirtyPayload) {
+      slotBootstrap = {
+        storageKey: makeStorageKey(currentSaveName),
+        payload: pendingDirtyPayload,
+        reason: 'same-save-reinit-dirty-state',
+      };
+      recordFlightEvent('mod-state.game-loaded.same-save-dirty-bootstrap', {
+        storageKey: slotBootstrap.storageKey,
+        shape: describeShape(pendingDirtyPayload),
+      });
+    }
     initialized = false;
     initPromise = null;
     mutator = null;

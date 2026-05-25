@@ -721,6 +721,44 @@ describe('mod state — applyDensityDelta + revert', () => {
     expect(state.stats().dirty).toBe(true);
   });
 
+  it('carries dirty unsaved deals through same-save game-loaded reinit', async () => {
+    const storage = makeStorage();
+    const oldDeal = deal('old-deal', {
+      state: 'completed',
+      centerStationGroupId: 'old-station',
+      centerStationGroupName: 'Old Station',
+    });
+    const persisted: PersistedState = {
+      version: 1,
+      savedAt: Date.now() - 10_000,
+      baselineDemand: [],
+      baselinePopSizes: [],
+      cumulativeDeltas: [],
+      deals: [oldDeal],
+    };
+    await storage.set('sb-tod:state:v1:alpha', persisted);
+
+    const P = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => fixture([P], [x]),
+      getSaveName: () => 'alpha',
+    });
+    await state.ensureInit();
+    expect(state.getDeals().map((d) => d.id)).toEqual(['old-deal']);
+
+    expect(await state.addDeal(deal('new-unsaved-deal'))).toBe(true);
+    state.onGameLoadedFired('alpha');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(state.getCurrentSaveName()).toBe('alpha');
+    expect(state.getDeals().map((d) => d.id)).toEqual(['old-deal', 'new-unsaved-deal']);
+    expect(state.stats().dirty).toBe(true);
+  });
+
   it('migrates richer legacy _unsaved state when the named save slot is skinny', async () => {
     const storage = makeStorage();
     const legacyDeal = deal('legacy-deal', { state: 'completed' });
