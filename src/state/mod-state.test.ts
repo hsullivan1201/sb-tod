@@ -74,6 +74,10 @@ function makeNoopStorage(): StorageLike {
   };
 }
 
+async function flushAsync(turns = 8): Promise<void> {
+  for (let i = 0; i < turns; i++) await Promise.resolve();
+}
+
 function deal(id = 'deal-1', overrides: Partial<Deal> = {}): Deal {
   return {
     id,
@@ -930,6 +934,58 @@ describe('mod state — applyDensityDelta + revert', () => {
     await Promise.resolve();
     expect(state.getCurrentSaveName()).toBe('alpha-copy');
     expect(storage._data.has('sb-tod:state:v1:alpha-copy')).toBe(true);
+  });
+
+  it('save-as trusts the hook name while the live save name is stale', async () => {
+    const storage = makeStorage();
+    const A = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const liveName = 'alpha';
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => fixture([A], [x]),
+      getSaveName: () => liveName,
+      initialSaveName: 'alpha',
+    });
+    await state.ensureInit();
+    state.applyDensityDelta('P', { residents: 100 }, 'deals');
+
+    state.onGameSavedFired('alpha-copy');
+    await flushAsync();
+
+    expect(state.getCurrentSaveName()).toBe('alpha-copy');
+    expect(state.stats().lastPersistOk).toBe(true);
+    expect(storage._data.has('sb-tod:state:v1:alpha-copy')).toBe(true);
+
+    state.applyDensityDelta('P', { residents: 50 }, 'deals');
+    await flushAsync();
+
+    expect(state.getCurrentSaveName()).toBe('alpha-copy');
+    expect(storage._data.has('sb-tod:state:v1:alpha-copy')).toBe(true);
+  });
+
+  it('autosave hook persists under the live save instead of an Autosave slot', async () => {
+    const storage = makeStorage();
+    const A = point('P', 100, 1000);
+    const x = pop('x', 'P', 'P', 50);
+    const state = createModState({
+      mutatorOptions: {},
+      storage,
+      getDemand: () => fixture([A], [x]),
+      getSaveName: () => 'alpha',
+      initialSaveName: 'alpha',
+    });
+    await state.ensureInit();
+    state.applyDensityDelta('P', { residents: 100 }, 'deals');
+
+    state.onGameSavedFired('Autosave');
+    await flushAsync();
+
+    expect(state.getCurrentSaveName()).toBe('alpha');
+    expect(storage._data.has('sb-tod:state:v1:alpha')).toBe(true);
+    expect(storage._data.has('sb-tod:state:v1:Autosave')).toBe(false);
+    expect(state.stats().lastPersistOk).toBe(true);
   });
 
   it('save-as copies clean state into the new slot too', async () => {

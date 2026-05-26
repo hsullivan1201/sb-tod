@@ -775,6 +775,53 @@ describe('strict unit-size mode', () => {
     expect(normalized.homeDepartureTime).not.toBe(x.homeDepartureTime);
   });
 
+  it('sanitizes tracked split-child commute caches without changing split counts', () => {
+    const P = point('P', 0, 400, ['x', `${SPLIT_POP_PREFIX}x:0`]);
+    const Q = point('Q', 400, 0, ['x']);
+    const x = pop('x', 'P', 'Q', 200);
+    x.lastCommute.modeChoice = { walking: 0, driving: 3, transit: 197, unknown: 0 };
+    x.lastCommute.transitPaths = [
+      {
+        fromStopCoords: [-122, 37],
+        toStopCoords: [-122.1, 37.1],
+        fromStopId: 'a',
+        toStopId: 'b',
+        isDriving: false,
+        isWalking: false,
+        routeId: '',
+      } as any,
+    ];
+    const staleChild = {
+      ...x,
+      id: `${SPLIT_POP_PREFIX}x:0`,
+      size: 200,
+      lastCommute: {
+        modeChoice: { walking: 0, driving: 0, transit: 200, unknown: 0 },
+        transitPaths: [{ segments: [], totalTime: 0 } as any],
+        walking: { time: 0, distance: 0 },
+      },
+    };
+    const demand = fixture([P, Q], [x, staleChild]);
+    const m = createMutator(demand, { strictUnitSize: 200 });
+    m.hydrateTracking({
+      baselineDemand: [['P', { jobs: 0, residents: 200 }]],
+      baselinePopSizes: [['x', 200]],
+      cumulativeDeltas: [
+        ['P', { jobs: { fromDeals: 0, fromOrganic: 0 }, residents: { fromDeals: 200, fromOrganic: 0 } }],
+      ],
+      splitChildren: [['x', [staleChild.id]]],
+    });
+
+    const result = m.sanitizeSplitChildren();
+    const normalized = demand.popsMap.get(staleChild.id)!;
+
+    expect(result).toEqual({ normalized: 1, removed: 0 });
+    expect([...demand.popsMap.keys()].filter((id) => id.startsWith(SPLIT_POP_PREFIX))).toHaveLength(1);
+    expect(normalized.lastCommute.transitPaths).toEqual([]);
+    expect(normalized.lastCommute.modeChoice.transit).toBe(0);
+    expect(normalized.lastCommute.modeChoice.driving).toBeCloseTo(200, 8);
+  });
+
   it('does not let job-endpoint reconcile delete home-endpoint split children', () => {
     const P = point('P', 0, 200, ['x']);
     const Q = point('Q', 200, 0, ['x']);

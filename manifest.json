@@ -2,7 +2,7 @@
   "id": "tod",
   "name": "SB TOD",
   "description": "Transit-Oriented Development for Subway Builder. Adds a feedback loop from transit service to land use: a floating dashboard scores every station area, and you can start housing, jobs, or mixed-use development deals at the stations you serve well.",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "author": {
     "name": "hsullivan1201"
   },

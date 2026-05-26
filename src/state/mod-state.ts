@@ -370,6 +370,12 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   let slotBootstrap: { storageKey: string; payload: PersistedState; reason: string } | null = null;
   let saveNameSyncPromise: Promise<void> | null = null;
   let saveNameSwitchDepth = 0;
+  let pendingDayTickDay: number | null = null;
+  let saveHookLiveNameGuard: {
+    currentName: string;
+    staleLiveName: string;
+    reported: boolean;
+  } | null = null;
 
   function isZeroDensity(total: { jobs?: number; residents?: number } | undefined): boolean {
     return (total?.jobs ?? 0) === 0 && (total?.residents ?? 0) === 0;
@@ -793,8 +799,36 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     }
   }
 
+  function resolveSavedSlotName(saveName?: string): {
+    hookName: string | null;
+    liveName: string | null;
+    nextName: string | null;
+    usedLiveNameForAutosave: boolean;
+  } {
+    const hookName = typeof saveName === 'string' && saveName.length > 0 ? saveName : null;
+    const liveName = readLiveSaveName();
+    if (hookName === 'Autosave' && liveName != null) {
+      return { hookName, liveName, nextName: liveName, usedLiveNameForAutosave: true };
+    }
+    return { hookName, liveName, nextName: hookName ?? liveName, usedLiveNameForAutosave: false };
+  }
+
   function liveSaveNameNeedingSync(): string | null {
     const liveName = readLiveSaveName();
+    if (saveHookLiveNameGuard) {
+      if (liveName === currentSaveName || currentSaveName !== saveHookLiveNameGuard.currentName) {
+        saveHookLiveNameGuard = null;
+      } else if (liveName === saveHookLiveNameGuard.staleLiveName) {
+        if (!saveHookLiveNameGuard.reported) {
+          recordFlightEvent('mod-state.save-slot.live-sync.ignored-stale-save-hook-name', {
+            currentSaveName,
+            liveName,
+          });
+          saveHookLiveNameGuard.reported = true;
+        }
+        return null;
+      }
+    }
     return liveName != null && liveName !== currentSaveName ? liveName : null;
   }
 
@@ -1238,6 +1272,20 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
   }
 
   function onDayTick(day: number): void {
+    if (pendingDayTickDay === day) {
+      recordFlightEventLazy('mod-state.day-tick.schedule.skip-duplicate', () => ({ day }));
+      return;
+    }
+    pendingDayTickDay = day;
+    recordFlightEventLazy('mod-state.day-tick.schedule', () => ({ day }));
+    setTimeout(() => {
+      if (pendingDayTickDay !== day) return;
+      pendingDayTickDay = null;
+      runDayTick(day);
+    }, 0);
+  }
+
+  function runDayTick(day: number): void {
     if (liveSaveNameNeedingSync() != null) {
       recordFlightEventLazy('mod-state.day-tick.defer-live-save-sync', () => ({
         day,
@@ -1245,7 +1293,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         liveName: readLiveSaveName(),
       }));
       void syncLiveSaveName('day-tick')
-        .then(() => onDayTick(day))
+        .then(() => runDayTick(day))
         .catch((e) => console.warn('[sb-tod] live save-name sync on day tick failed:', e));
       return;
     }
@@ -1276,6 +1324,13 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         recordFlightEventLazy('mod-state.day-tick.refresh-demand.failed', () => ({ day }));
         return;
       }
+      const preSanitize = mutator?.sanitizeSplitChildren() ?? { normalized: 0, removed: 0 };
+      if (preSanitize.normalized > 0 || preSanitize.removed > 0) {
+        recordFlightEventLazy('mod-state.day-tick.sanitize-splits.pre', () => ({
+          day,
+          ...preSanitize,
+        }));
+      }
 
       // Apply each active deal's daily delta. Done before the persist below
       // so the saved state reflects today's progress.
@@ -1287,6 +1342,13 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         reports: lastTickReports,
         dirty,
       }));
+      const postSanitize = mutator?.sanitizeSplitChildren() ?? { normalized: 0, removed: 0 };
+      if (postSanitize.normalized > 0 || postSanitize.removed > 0) {
+        recordFlightEventLazy('mod-state.day-tick.sanitize-splits.post', () => ({
+          day,
+          ...postSanitize,
+        }));
+      }
 
       // Storage writes are intentionally save-hook driven. Persisting
       // automatically from the sim/day/build paths has repeatedly lined
@@ -1485,23 +1547,35 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     // If the player did "save as" with a new name, the in-memory state
     // applies to the NEW save (it's what they were just playing). Switch
     // the key without dropping in-memory; persist immediately.
-    const nextName = typeof saveName === 'string' && saveName.length > 0 ? saveName : readLiveSaveName();
+    const { hookName, liveName, nextName, usedLiveNameForAutosave } = resolveSavedSlotName(saveName);
     const nameChanged = nextName !== null && nextName !== currentSaveName;
     recordFlightEvent('mod-state.game-saved', {
-      saveName,
+      saveName: hookName,
+      liveName,
       nextName,
       currentSaveName,
       nameChanged,
+      usedLiveNameForAutosave,
       initialized,
       dirty,
     });
     if (nameChanged) {
       currentSaveName = nextName;
+      if (liveName != null && liveName !== nextName) {
+        saveHookLiveNameGuard = {
+          currentName: nextName,
+          staleLiveName: liveName,
+          reported: false,
+        };
+      } else {
+        saveHookLiveNameGuard = null;
+      }
     }
-    if (initialized && (dirty || nameChanged)) void persist();
+    if (initialized && (dirty || nameChanged)) void persist({ allowLiveSaveSync: !nameChanged });
   }
 
   function onGameLoadedFired(saveName?: string): void {
+    saveHookLiveNameGuard = null;
     const nextName = typeof saveName === 'string' && saveName.length > 0 ? saveName : readLiveSaveName();
     recordFlightEvent('mod-state.game-loaded', {
       saveName,
@@ -1552,6 +1626,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
     options: { allowPreviousDealOnly?: boolean } = {}
   ): Promise<void> {
     if (name === currentSaveName) return;
+    saveHookLiveNameGuard = null;
     const previousSaveName = currentSaveName;
     const previousPayload = initialized ? buildPersistedPayload(Date.now()) : null;
     recordFlightEvent('mod-state.save-slot.switch.start', {

@@ -144,25 +144,12 @@ export function createAdaptiveStorage(): AdaptiveStorage {
     }
   }
 
-  return {
-    async set(key, value) {
-      if (mode === 'local') {
-        localSet(key, value);
-        lastSuccessful = 'local';
-        return;
-      }
-      if (mode === 'api') {
-        // Locked to API. Trust it (we already verified once).
-        await apiStorage.set(key, value);
-        lastSuccessful = 'api';
-        return;
-      }
-      if (mode === 'electron') {
-        await electronSet(key, value);
-        lastSuccessful = 'electron';
-        return;
-      }
-      // mode === 'auto': probe official storage.
+  async function writeWithFallback(
+    key: string,
+    value: unknown,
+    options: { skipApi?: boolean; skipElectron?: boolean } = {}
+  ): Promise<void> {
+    if (!options.skipApi) {
       const apiOk = await tryApiSet(key, value);
       if (apiOk) {
         mode = 'api';
@@ -170,6 +157,8 @@ export function createAdaptiveStorage(): AdaptiveStorage {
         console.log('[sb-tod] storage backend: api.storage (round-trip verified)');
         return;
       }
+    }
+    if (!options.skipElectron) {
       const electronOk = await tryElectronSet(key, value);
       if (electronOk) {
         mode = 'electron';
@@ -179,20 +168,51 @@ export function createAdaptiveStorage(): AdaptiveStorage {
         );
         return;
       }
-      if (LS_AVAILABLE) {
+    }
+    if (LS_AVAILABLE) {
+      localSet(key, value);
+      mode = 'local';
+      lastSuccessful = 'local';
+      console.warn(
+        '[sb-tod] storage round-trip failed — using localStorage fallback. Deals will still persist on this install.'
+      );
+      return;
+    }
+    mode = 'none';
+    lastSuccessful = 'none';
+    throw new Error(
+      '[sb-tod] no working storage backend (api.storage no-ops, localStorage unavailable)'
+    );
+  }
+
+  return {
+    async set(key, value) {
+      if (mode === 'local') {
         localSet(key, value);
-        mode = 'local';
         lastSuccessful = 'local';
-        console.warn(
-          '[sb-tod] api.storage round-trip failed — using localStorage fallback. Deals will still persist on this install.'
-        );
         return;
       }
-      mode = 'none';
-      lastSuccessful = 'none';
-      throw new Error(
-        '[sb-tod] no working storage backend (api.storage no-ops, localStorage unavailable)'
-      );
+      if (mode === 'api') {
+        const apiOk = await tryApiSet(key, value);
+        if (apiOk) {
+          lastSuccessful = 'api';
+          return;
+        }
+        console.warn('[sb-tod] api.storage lost round-trip verification — falling back.');
+        await writeWithFallback(key, value, { skipApi: true });
+        return;
+      }
+      if (mode === 'electron') {
+        const electronOk = await tryElectronSet(key, value);
+        if (electronOk) {
+          lastSuccessful = 'electron';
+          return;
+        }
+        console.warn('[sb-tod] Electron storage lost round-trip verification — falling back.');
+        await writeWithFallback(key, value, { skipApi: true, skipElectron: true });
+        return;
+      }
+      await writeWithFallback(key, value);
     },
 
     async get<T>(key: string, defaultValue: T): Promise<T> {

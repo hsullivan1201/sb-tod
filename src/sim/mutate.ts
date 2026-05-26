@@ -205,6 +205,14 @@ export interface DemandMutator {
    */
   reconcilePoint(pointId: string): { created: number; removed: number };
 
+  /**
+   * Rebuild tracked synthetic children in place from their original pops.
+   * The game can rewrite cached commute/path objects while simulating; this
+   * lets day-boundary code scrub stale split-child commute state without
+   * changing aggregate demand or split counts.
+   */
+  sanitizeSplitChildren(): { normalized: number; removed: number };
+
   /** Read-only view for persistence and tests. */
   snapshot(): MutatorSnapshot;
 
@@ -1181,6 +1189,34 @@ export function createMutator(
     return { created, removed };
   }
 
+  function sanitizeSplitChildren(): { normalized: number; removed: number } {
+    let normalized = 0;
+    let removed = 0;
+    for (const [originId, childIds] of [...splitChildren.entries()]) {
+      const origin = demand.popsMap.get(originId);
+      const kept: string[] = [];
+      for (const childId of childIds) {
+        if (!demand.popsMap.has(childId)) {
+          removed++;
+          continue;
+        }
+        if (!origin) {
+          demand.popsMap.delete(childId);
+          removePopIdFromAllPoints(childId);
+          removed++;
+          continue;
+        }
+        const child = demand.popsMap.get(childId)!;
+        normalizeSplitChild(origin, childId, child.size);
+        kept.push(childId);
+        normalized++;
+      }
+      if (kept.length > 0) splitChildren.set(originId, kept);
+      else splitChildren.delete(originId);
+    }
+    return { normalized, removed };
+  }
+
   function captureBaselines(): void {
     for (const point of demand.points.values()) {
       ensurePointBaseline(point);
@@ -1258,6 +1294,7 @@ export function createMutator(
       }
       return reconcilePointStrict(pointId);
     },
+    sanitizeSplitChildren,
     snapshot() {
       // IMPORTANT: return shallow copies, not refs. snapshot() is often
       // called with the intent of feeding the result back into
