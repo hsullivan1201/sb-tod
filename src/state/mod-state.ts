@@ -1324,13 +1324,6 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         recordFlightEventLazy('mod-state.day-tick.refresh-demand.failed', () => ({ day }));
         return;
       }
-      const preSanitize = mutator?.sanitizeSplitChildren() ?? { normalized: 0, removed: 0 };
-      if (preSanitize.normalized > 0 || preSanitize.removed > 0) {
-        recordFlightEventLazy('mod-state.day-tick.sanitize-splits.pre', () => ({
-          day,
-          ...preSanitize,
-        }));
-      }
 
       // Apply each active deal's daily delta. Done before the persist below
       // so the saved state reflects today's progress.
@@ -1342,13 +1335,6 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
         reports: lastTickReports,
         dirty,
       }));
-      const postSanitize = mutator?.sanitizeSplitChildren() ?? { normalized: 0, removed: 0 };
-      if (postSanitize.normalized > 0 || postSanitize.removed > 0) {
-        recordFlightEventLazy('mod-state.day-tick.sanitize-splits.post', () => ({
-          day,
-          ...postSanitize,
-        }));
-      }
 
       // Storage writes are intentionally save-hook driven. Persisting
       // automatically from the sim/day/build paths has repeatedly lined
@@ -1717,10 +1703,7 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       dirty = true;
     },
     persist,
-    getDeals: () => {
-      syncLiveSaveNameSoon('get-deals');
-      return deals;
-    },
+    getDeals: () => deals,
     async addDeal(deal) {
       await settleLiveSaveNameSync('add-deal');
       recordFlightEvent('mod-state.add-deal', {
@@ -1849,17 +1832,13 @@ export function createModState(options: CreateModStateOptions = {}): ModState {
       return true;
     },
     setCurrentSaveName,
-    getCurrentSaveName: () => {
-      syncLiveSaveNameSoon('get-current-save-name');
-      return currentSaveName;
-    },
+    getCurrentSaveName: () => currentSaveName,
     onDayTick,
     onDemandChangeFired,
     onGameSavedFired,
     onGameLoadedFired,
     onGameEndFired,
     stats() {
-      syncLiveSaveNameSoon('stats');
       const counts = mutator?.trackingCounts();
       const storageBackend: StorageBackendKind =
         (backend as Partial<AdaptiveStorage>).lastBackend?.() ?? 'api';
@@ -1946,6 +1925,8 @@ function applyPersisted(
     report.originalPopsReset = canonical.originalsReset;
   }
 
+  const replayQueue: Array<readonly [string, PointDelta]> = [];
+
   // Now walk each persisted point and decide.
   for (const [pointId, delta] of persisted.cumulativeDeltas) {
     const point = demand.points.get(pointId);
@@ -1977,13 +1958,13 @@ function applyPersisted(
         // children. Routine live DemandData rebinds run with canonicalization
         // disabled, so they trust preserved aggregates and avoid rewriting
         // hundreds of already-authored split pops during the hot day tick.
-        replayPersistedDelta(mutator, pointId, delta);
+        replayQueue.push([pointId, delta]);
       }
     } else if (matchesReset) {
       // Game reset our mutations. Replay per-source so the delta
       // buckets remain correctly attributed. We must clear the seeded
       // cumulative first or applyDensityDelta will double it.
-      replayPersistedDelta(mutator, pointId, delta);
+      replayQueue.push([pointId, delta]);
       report.replayed++;
       report.perPoint.set(pointId, 'replayed');
     } else {
@@ -1999,6 +1980,8 @@ function applyPersisted(
     }
   }
 
+  replayPersistedDeltas(mutator, replayQueue);
+
   // Compact persisted state stores only changed points. Capture live
   // point aggregate baselines in one linear pass; pop baselines remain
   // lazy and are captured only for points we actually mutate.
@@ -2007,23 +1990,58 @@ function applyPersisted(
   return report;
 }
 
-function replayPersistedDelta(
+function replayPersistedDeltas(
   mutator: DemandMutator,
-  pointId: string,
-  delta: PointDelta
+  deltas: Array<readonly [string, PointDelta]>
 ): void {
-  resetCumulativeFor(mutator, pointId);
-  const sources: Array<[DeltaSourceKind, DemandDelta]> = [
-    ['deals', { jobs: delta.jobs.fromDeals, residents: delta.residents.fromDeals }],
-    ['organic', { jobs: delta.jobs.fromOrganic, residents: delta.residents.fromOrganic }],
+  if (deltas.length === 0) return;
+
+  const replayIds = new Set(deltas.map(([pointId]) => pointId));
+  const snap = mutator.snapshot();
+  const nextDeltas = new Map(snap.cumulativeDeltas);
+  for (const pointId of replayIds) nextDeltas.delete(pointId);
+  mutator.hydrateTracking({
+    baselineDemand: snap.baselineDemand,
+    baselinePopSizes: snap.baselinePopSizes,
+    cumulativeDeltas: nextDeltas,
+    splitChildren: snap.splitChildren,
+  });
+
+  const dealTargets: Array<{ pointId: string; delta: DemandDelta }> = [];
+  const organicTargets: Array<{ pointId: string; delta: DemandDelta }> = [];
+  for (const [pointId, delta] of deltas) {
+    const fromDeals = {
+      jobs: delta.jobs.fromDeals,
+      residents: delta.residents.fromDeals,
+    };
+    if ((fromDeals.jobs ?? 0) !== 0 || (fromDeals.residents ?? 0) !== 0) {
+      dealTargets.push({ pointId, delta: fromDeals });
+    }
+
+    const fromOrganic = {
+      jobs: delta.jobs.fromOrganic,
+      residents: delta.residents.fromOrganic,
+    };
+    if ((fromOrganic.jobs ?? 0) !== 0 || (fromOrganic.residents ?? 0) !== 0) {
+      organicTargets.push({ pointId, delta: fromOrganic });
+    }
+  }
+
+  const batches: Array<[DeltaSourceKind, Array<{ pointId: string; delta: DemandDelta }>]> = [
+    ['deals', dealTargets],
+    ['organic', organicTargets],
   ];
-  for (const [source, d] of sources) {
-    if ((d.jobs ?? 0) === 0 && (d.residents ?? 0) === 0) continue;
-    const r = mutator.applyDensityDelta(pointId, d, source);
-    if (!r.ok) {
-      console.warn(
-        `[sb-tod] replay of persisted delta on point "${pointId}" failed (${source}): ${r.reason}`
-      );
+  for (const [source, targets] of batches) {
+    if (targets.length === 0) continue;
+    const results = mutator.applyDensityDeltas(targets, source);
+    for (let i = 0; i < targets.length; i++) {
+      const target = targets[i];
+      const r = results[i];
+      if (!r.ok) {
+        console.warn(
+          `[sb-tod] replay of persisted delta on point "${target.pointId}" failed (${source}): ${r.reason}`
+        );
+      }
     }
   }
 }

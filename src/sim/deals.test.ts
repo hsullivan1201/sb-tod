@@ -436,6 +436,20 @@ describe('computeDailyApply', () => {
     expect(plan.targets[0].delta.residents).toBe(200); // overshoots paid 100
   });
 
+  it('keeps final-day pending open if no eligible point can receive the chunk', () => {
+    const points = [point('ghost', 0, 0, 0, 0.001)];
+    const plan = computeDailyApply({
+      deal: activeDeal({ totalDensity: { residents: 100, jobs: 0 }, durationDays: 1 }),
+      currentDay: 1,
+      walkshedPoints: points,
+    });
+
+    expect(plan.targets.length).toBe(0);
+    expect(plan.aggregateDelta.residents).toBe(0);
+    expect(plan.newPending.residents).toBe(100);
+    expect(plan.marksCompletion).toBe(false);
+  });
+
   it('handles mixed deals: chunks of residents and jobs route independently to eligible points', () => {
     const points = [
       point('residential', 0, 500, 0, 0.001),

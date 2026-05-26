@@ -560,7 +560,7 @@ export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan
   let pendingR = deal.pending.residents + todayAccrueResidents;
   let pendingJ = deal.pending.jobs + todayAccrueJobs;
 
-  const marksCompletion = currentDay >= deal.startDay + deal.durationDays - 1;
+  const isFinalScheduledDay = currentDay >= deal.startDay + deal.durationDays - 1;
 
   // Re-derive walkshed weights against current live demand. Eligibility
   // can shift over the deal's lifetime as density grows; we honor that
@@ -574,10 +574,11 @@ export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan
   const resEligible = hits.filter((h) => h.point.residents > resThreshold);
   const jobsEligible = hits.filter((h) => h.point.jobs > jobThreshold);
 
-  // Number of chunks to materialize this tick. On non-final days, floor
-  // (carry the remainder). On the final day, ceil the remainder so the
-  // player gets at least what they paid for.
-  const chunksRoundFn = marksCompletion ? Math.ceil : Math.floor;
+  // Number of chunks to try to materialize this tick. On non-final days,
+  // floor (carry the remainder). On the final scheduled day, ceil the
+  // remainder so the player gets at least what they paid for when eligible
+  // receiving points still exist.
+  const chunksRoundFn = isFinalScheduledDay ? Math.ceil : Math.floor;
   const chunksR =
     deal.totalDensity.residents > 0 ? Math.max(0, chunksRoundFn(pendingR / chunkSize)) : 0;
   const chunksJ =
@@ -598,26 +599,31 @@ export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan
         )
       : new Map<string, number>();
 
-  // Subtract what we materialized from pending. (May go negative on the
-  // final-day kicker; that's fine, it just signals "fully delivered.")
-  pendingR -= chunksR * chunkSize;
-  pendingJ -= chunksJ * chunkSize;
-
   // Build per-point targets, merging residence and jobs chunks for the
   // same point into a single mutator call.
   const perPoint = new Map<string, { jobs: number; residents: number }>();
+  let materializedChunksR = 0;
+  let materializedChunksJ = 0;
   for (const [id, count] of apportionedR) {
     if (count <= 0) continue;
     const slot = perPoint.get(id) ?? { jobs: 0, residents: 0 };
     slot.residents += count * chunkSize;
+    materializedChunksR += count;
     perPoint.set(id, slot);
   }
   for (const [id, count] of apportionedJ) {
     if (count <= 0) continue;
     const slot = perPoint.get(id) ?? { jobs: 0, residents: 0 };
     slot.jobs += count * chunkSize;
+    materializedChunksJ += count;
     perPoint.set(id, slot);
   }
+
+  // Subtract only what actually found an eligible target. If a deal loses
+  // every receiving point before its final day, keep pending and do not
+  // mark it complete; otherwise we can silently finish with no delivery.
+  pendingR -= materializedChunksR * chunkSize;
+  pendingJ -= materializedChunksJ * chunkSize;
 
   const targets: DailyApplyTarget[] = [];
   let aggR = 0;
@@ -636,6 +642,13 @@ export function computeDailyApply(input: ComputeDailyApplyInput): DailyApplyPlan
       targets.push({ pointId, delta });
     }
   }
+
+  const marksCompletion =
+    isFinalScheduledDay &&
+    (deal.totalDensity.residents <= 0 ||
+      deal.appliedSoFar.residents + aggR >= deal.totalDensity.residents) &&
+    (deal.totalDensity.jobs <= 0 ||
+      deal.appliedSoFar.jobs + aggJ >= deal.totalDensity.jobs);
 
   return {
     targets,

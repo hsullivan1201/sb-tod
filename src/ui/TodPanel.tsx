@@ -24,7 +24,6 @@ import {
   confirmProposal,
   DEFAULT_TIER_TABLE,
   DEAL_COST_MULTIPLIER,
-  dealProgressFraction,
   findDuplicateDevelopment,
   validateProposal,
   type Deal,
@@ -666,6 +665,12 @@ export function TodPanel() {
   const clearSelection = useCallback(() => {
     clearHighlight();
     setHighlighted(null);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearHighlight();
+    };
   }, []);
 
   const selectStation = useCallback(
@@ -1350,7 +1355,8 @@ function DealRow({
   onCancel: (deal: Deal) => void;
 }) {
   const color = dealColor(deal.kind);
-  const progress = deal.state === 'active' ? dealProgressFraction(deal, currentDay) : 1;
+  const elapsedDays = dealElapsedDisplayDays(deal, currentDay);
+  const progress = deal.state === 'active' ? elapsedDays / deal.durationDays : 1;
   const delivered = dealDeliveryFraction(deal);
   const fraction = clamp01(Math.max(progress, delivered));
 
@@ -1360,7 +1366,7 @@ function DealRow({
         <span style={stationNameStyle}>
           {dealKindLabel(deal.kind)}/{deal.tier}
           <span style={transferBadgeStyle}>
-            {deal.state === 'active' ? `day ${Math.max(1, currentDay - deal.startDay + 1)}/${deal.durationDays}` : deal.state}
+            {deal.state === 'active' ? `day ${elapsedDays}/${deal.durationDays}` : deal.state}
           </span>
         </span>
         <span style={rowActionStyle}>
@@ -1719,6 +1725,10 @@ function dealDeliveryFraction(deal: Deal): number {
   }
   if (parts.length === 0) return 0;
   return parts.reduce((sum, part) => sum + part, 0) / parts.length;
+}
+
+function dealElapsedDisplayDays(deal: Deal, currentDay: number): number {
+  return Math.max(0, Math.min(deal.durationDays, currentDay - deal.startDay));
 }
 
 function displayName(name: string | undefined, id: string): string {
