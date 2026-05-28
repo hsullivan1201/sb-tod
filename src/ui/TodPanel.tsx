@@ -1733,7 +1733,6 @@ function dealElapsedDisplayDays(deal: Deal, currentDay: number): number {
 
 function displayName(name: string | undefined, id: string): string {
   if (!name || name === id) return `#${id.slice(0, 6)}`;
-  if (name.length >= 32 && name.includes('-')) return `#${id.slice(0, 6)}`;
   if (name.length > 20) return name.slice(0, 19) + '...';
   return name;
 }
